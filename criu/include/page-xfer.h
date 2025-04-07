@@ -74,4 +74,7 @@ extern int request_remote_pages(unsigned long img_id, unsigned long addr, int nr
 typedef int (*ps_async_read_complete)(unsigned long img_id, unsigned long vaddr, int nr_pages, void *);
 extern int page_server_start_read(void *buf, int nr_pages, ps_async_read_complete complete, void *priv, unsigned flags);
 
+/* Maybe read implementation for Object Storage */
+extern int maybe_read_page_object_storage(struct page_read *pr, unsigned long vaddr, int nr, void *buf, unsigned flags);
+
 #endif /* __CR_PAGE_XFER__H__ */

@@ -46,6 +46,7 @@
 
 #include "setproctitle.h"
 #include "sysctl.h"
+#include "object-storage.h"
 
 void flush_early_log_to_stderr(void) __attribute__((destructor));
 
@@ -176,6 +177,15 @@ int main(int argc, char *argv[], char *envp[])
 	 * different pid namespaces are sharing the same network namespace.
 	 */
 	util_init();
+
+	/* Initialize object storage client if enabled */
+	if (opts.enable_object_storage) {
+		if (object_storage_init()) {
+			pr_err("Failed to initialize object storage client\n");
+			return 1;
+		}
+	}
+
 	if (opts.mode == CR_SWRK) {
 		if (argc != optind + 2) {
 			fprintf(stderr, "Usage: criu swrk <fd>\n");
@@ -355,6 +365,11 @@ int main(int argc, char *argv[], char *envp[])
 		pr_err("The \"show\" action is deprecated by the CRIT utility.\n");
 		pr_err("To view an image use the \"crit decode -i $name --pretty\" command.\n");
 		return -1;
+	}
+
+	/* Cleanup object storage client if initialized */
+	if (opts.enable_object_storage) {
+		object_storage_cleanup();
 	}
 
 	pr_err("unknown command: %s\n", argv[optind]);

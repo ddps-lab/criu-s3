@@ -431,6 +431,14 @@ void init_opts(void)
 	opts.file_validation_method = FILE_VALIDATION_DEFAULT;
 	opts.network_lock_method = NETWORK_LOCK_DEFAULT;
 	opts.ghost_fiemap = FIEMAP_DEFAULT;
+
+	/* Initialize Object Storage options */
+	opts.enable_object_storage = false;
+	opts.object_storage_endpoint_url = NULL;
+	opts.object_storage_bucket = NULL;
+	opts.object_storage_access_key = NULL;
+	opts.object_storage_secret_key = NULL;
+	opts.object_storage_object_prefix = NULL;
 }
 
 bool deprecated_ok(char *what)
@@ -703,6 +711,12 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		BOOL_OPT("mntns-compat-mode", &opts.mntns_compat_mode),
 		BOOL_OPT("unprivileged", &opts.unprivileged),
 		BOOL_OPT("ghost-fiemap", &opts.ghost_fiemap),
+		{ "enable-object-storage", no_argument, NULL, 1106 },
+		{ "object-storage-endpoint-url", required_argument, 0, 1101 },
+		{ "object-storage-bucket", required_argument, 0, 1102 },
+		{ "object-storage-access-key", required_argument, 0, 1103 },
+		{ "object-storage-secret-key", required_argument, 0, 1104 },
+		{ "object-storage-object-prefix", required_argument, 0, 1105 },
 		{},
 	};
 
@@ -1051,6 +1065,24 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		case 'h':
 			*usage_error = false;
 			return 2;
+		case 1101:
+			SET_CHAR_OPTS(object_storage_endpoint_url, optarg);
+			break;
+		case 1102:
+			SET_CHAR_OPTS(object_storage_bucket, optarg);
+			break;
+		case 1103:
+			SET_CHAR_OPTS(object_storage_access_key, optarg);
+			break;
+		case 1104:
+			SET_CHAR_OPTS(object_storage_secret_key, optarg);
+			break;
+		case 1105:
+			SET_CHAR_OPTS(object_storage_object_prefix, optarg);
+			break;
+		case 1106:
+			opts.enable_object_storage = true;
+			break;
 		default:
 			return 2;
 		}
@@ -1073,6 +1105,15 @@ bad_arg:
 
 int check_options(void)
 {
+	if (opts.enable_object_storage) {
+		pr_info("Object Storage Enabled\n");
+		pr_info("  Endpoint URL: %s\n", opts.object_storage_endpoint_url ? opts.object_storage_endpoint_url : "(not set)");
+		pr_info("  Bucket: %s\n", opts.object_storage_bucket ? opts.object_storage_bucket : "(not set)");
+		pr_info("  Access Key: %s\n", opts.object_storage_access_key ? "(set)" : "(not set)"); /* Avoid logging keys */
+		pr_info("  Secret Key: %s\n", opts.object_storage_secret_key ? "(set)" : "(not set)"); /* Avoid logging keys */
+		pr_info("  Object Prefix: %s\n", opts.object_storage_object_prefix ? opts.object_storage_object_prefix : "(not set)");
+	}
+
 	if (opts.tcp_established_ok)
 		pr_info("Will dump/restore TCP connections\n");
 	if (opts.tcp_skip_in_flight)

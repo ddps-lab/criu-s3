@@ -245,6 +245,14 @@ struct cr_options {
 	 * explicitly request it as it comes with many limitations.
 	 */
 	int unprivileged;
+
+	/* Object Storage options */
+	bool enable_object_storage;
+	char *object_storage_endpoint_url;
+	char *object_storage_bucket;
+	char *object_storage_access_key;
+	char *object_storage_secret_key;
+	char *object_storage_object_prefix;
 };
 
 extern struct cr_options opts;
