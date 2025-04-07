@@ -830,14 +830,23 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->id = ids++;
 	pr->img_id = img_id;
 
-	if (remote)
+	/* Check and set the appropriate maybe_read_page function pointer */
+	if (opts.enable_object_storage) {
+		// If Object Storage is enabled, prioritize it for page reads.
+		// We assume the corresponding pagemap image (pmi) is already successfully opened.
+		pr_info("pr%lu-%u: Enabling Object Storage reader\n", pr->img_id, pr->id);
+		pr->maybe_read_page = maybe_read_page_object_storage;
+		pr->pieok = false;
+	} else if (remote) {
 		pr->maybe_read_page = maybe_read_page_remote;
-	else if (opts.stream)
+	} else if (opts.stream) {
 		pr->maybe_read_page = maybe_read_page_img_streamer;
-	else {
+	} else {
 		pr->maybe_read_page = maybe_read_page_local;
-		if (!pr->parent && !opts.lazy_pages)
+		// Local PIE optimization is only safe if not using lazy pages or pre-dump (parent exists)
+		if (!pr->parent && !opts.lazy_pages) {
 			pr->pieok = true;
+		}
 	}
 
 	pr_debug("Opened %s page read %u (parent %u)\n", remote ? "remote" : "local", pr->id,

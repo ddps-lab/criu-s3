@@ -22,6 +22,7 @@
 #include "criu-log.h"
 #include "criu-plugin.h"
 #include "pagemap.h"
+#include "page-xfer.h"
 #include "files-reg.h"
 #include "kerndat.h"
 #include "mem.h"
@@ -34,7 +35,6 @@
 #include "xmalloc.h"
 #include <compel/plugins/std/syscall-codes.h>
 #include "restorer.h"
-#include "page-xfer.h"
 #include "common/lock.h"
 #include "rst-malloc.h"
 #include "tls.h"
@@ -772,16 +772,27 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 		goto out;
 	}
 
+	lpi->total_pages = ret;
 	lpi->pr.io_complete = uffd_io_complete;
 
-	/*
-	 * Find the memory pages belonging to the restored process
-	 * so that it is trackable when all pages have been transferred.
-	 */
+	/* Set maybe_read_page based on object storage options - MOVED TO open_page_read_at */
+	// if (opts.enable_object_storage) {
+	// 	// If OS is enabled AND we successfully opened a pagemap image (pmi),
+	// 	// then assume any subsequent page reads should go through object storage.
+	// 	if (lpi->pr.pmi != NULL) { // Check pmi instead of pi
+	// 		pr_info("pid %d: Enabling Object Storage page reading (pages_img_id: %u)\n",
+	// 				lpi->pid, lpi->pr.pages_img_id); // pages_img_id might be 0 if local pages.img failed to open
+	// 		lpi->pr.maybe_read_page = maybe_read_page_object_storage;
+	// 		lpi->pr.pieok = false; // PIE optimization is not applicable for object storage
+	// 	} else {
+	// 		// This case might indicate an issue with opening the pagemap itself
+	// 		pr_warn("pid %d: Not enabling Object Storage reading because pr.pmi is NULL\n", lpi->pid);
+	// 	}
+	// }
+
 	ret = collect_iovs(lpi);
-	if (ret < 0)
+	if (ret)
 		goto out;
-	lpi->total_pages = ret;
 
 	lp_debug(lpi, "Found %ld pages to be handled by UFFD\n", lpi->total_pages);
 
