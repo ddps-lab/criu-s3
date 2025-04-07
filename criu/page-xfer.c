@@ -27,10 +27,6 @@
 #include "rst_info.h"
 #include "stats.h"
 #include "tls.h"
-#include "page.h"
-#include "pagemap.h"
-#include "img-streamer.h"
-#include "object-storage.h"
 
 static int page_server_sk = -1;
 
@@ -1704,58 +1700,4 @@ int page_server_start_read(void *buf, int nr, ps_async_read_complete complete, v
 		return page_server_start_async_read(buf, nr, complete, priv);
 	else
 		return page_server_start_sync_read(buf, nr, complete, priv);
-}
-
-/*
- * maybe_read_page implementation for Object Storage
- */
-int maybe_read_page_object_storage(struct page_read *pr, unsigned long vaddr, int nr, void *buf, unsigned flags)
-{
-	char object_key_buf[256];
-	// const char *object_key_prefix = opts.object_storage_object_prefix ? opts.object_storage_object_prefix : ""; // Prefix handling moved to fetch_range
-	unsigned long offset;
-	unsigned long length = (unsigned long)nr * page_size();
-	int ret;
-
-	// --- DEBUG --- Entry point check
-	pr_info("pr%lu-%u: Called maybe_read_page_object_storage for vaddr %lx (nr_pages: %d)\n", pr->img_id, pr->id, vaddr, nr);
-
-	pr_debug("pr%lu-%u: Object Storage read request for %lx (%d pages)\n", pr->img_id, pr->id, vaddr, nr);
-
-	// Construct BASE object key (filename only, e.g., "pages-1.img")
-	snprintf(object_key_buf, sizeof(object_key_buf), "pages-%u.img", // Removed prefix here
-		 pr->pages_img_id);
-
-	// Calculate offset within the object
-	// Assumes pr->pi_off is the base offset for this pagemap entry in the image file
-	// Cast decode_pointer result to unsigned long for arithmetic
-	offset = pr->pi_off + (vaddr - (unsigned long)decode_pointer(pr->pe->vaddr));
-
-	// --- DEBUG --- Calculated values check
-	pr_info("pr%lu-%u: Calculated Object Key: '%s', Offset: %lu, Length: %lu\n",
-			pr->img_id, pr->id, object_key_buf, offset, length);
-
-	// Fetch the data range from object storage
-	// --- DEBUG --- Calling fetch function
-	pr_info("pr%lu-%u: Calling object_storage_fetch_range...\n", pr->img_id, pr->id);
-	ret = object_storage_fetch_range(object_key_buf, offset, length, buf);
-	if (ret < 0) {
-		pr_err("pr%lu-%u: Failed to fetch range [%lu-%lu] from object %s\n",
-		       pr->img_id, pr->id, offset, offset + length -1, object_key_buf);
-		return -1;
-	}
-
-	// Notify completion to copy data to user space via UFFDIO_COPY
-	if (pr->io_complete) {
-		if (pr->io_complete(pr, vaddr, nr) < 0) {
-			pr_err("pr%lu-%u: io_complete callback failed after object storage fetch\n", pr->img_id, pr->id);
-			// Consider if fetch should be retried or if it's a fatal error
-			return -1;
-		}
-	} else {
-		pr_warn("pr%lu-%u: io_complete callback is NULL after object storage fetch\n", pr->img_id, pr->id);
-		// This case might not be expected in lazy-pages context
-	}
-
-	return 0; // Success
 }
