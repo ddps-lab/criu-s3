@@ -330,8 +330,10 @@ int main(int argc, char *argv[], char *envp[])
 		return ret != 0;
 	}
 
-	if (opts.mode == CR_LAZY_PAGES)
+	if (opts.mode == CR_LAZY_PAGES) {
+		opts.lazy_pages = true;
 		return cr_lazy_pages(opts.daemon_mode) != 0;
+	}
 
 	if (opts.mode == CR_CHECK)
 		return cr_check() != 0;

@@ -4,6 +4,7 @@
 #include <linux/falloc.h>
 #include <sys/uio.h>
 #include <limits.h>
+#include <string.h>
 
 #include "types.h"
 #include "image.h"
@@ -18,6 +19,7 @@
 #include "xmalloc.h"
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
+#include "object-storage.h"
 
 #ifndef SEEK_DATA
 #define SEEK_DATA 3
@@ -474,6 +476,53 @@ static int maybe_read_page_remote(struct page_read *pr, unsigned long vaddr, int
 	return ret;
 }
 
+// Function to read page data from Object Storage
+static int maybe_read_page_object_storage(struct page_read *pr, unsigned long vaddr, int nr, void *buf, unsigned flags)
+{
+	int ret;
+	unsigned long len = nr * PAGE_SIZE;
+	char object_key[PATH_MAX]; // Assuming PATH_MAX is sufficient for prefix + image name
+	char image_name[64];      // Buffer for dynamic image name (e.g., pages-1.img)
+
+	// Construct the dynamic image name using pages_img_id
+	snprintf(image_name, sizeof(image_name), "pages-%u.img", pr->pages_img_id);
+
+	pr_info("Object Storage: Reading %d pages (len: %lu) from %s at offset %lu for vaddr %lx\n", 
+	        nr, len, image_name, pr->pi_off, vaddr);
+
+	// Construct the object key with prefix if available
+	if (opts.object_storage_object_prefix && strlen(opts.object_storage_object_prefix) > 0) {
+		// Ensure prefix doesn't lead with '/' and ends with '/' (handled in fetch function, but double-check here if needed)
+		snprintf(object_key, sizeof(object_key), "%s%s", 
+		         opts.object_storage_object_prefix, image_name);
+	} else {
+		snprintf(object_key, sizeof(object_key), "%s", image_name);
+	}
+
+	// Fetch data from object storage
+	ret = object_storage_fetch_range(object_key, pr->pi_off, len, buf);
+
+	if (ret == 0) {
+		pr_debug("Object Storage: Fetch successful for offset %lu\n", pr->pi_off);
+		// Call io_complete callback if read was successful
+		if (pr->io_complete) {
+			ret = pr->io_complete(pr, vaddr, nr);
+			if (ret < 0) {
+				pr_err("Object Storage: io_complete callback failed for vaddr %lx\n", vaddr);
+			}
+		}
+	} else {
+		pr_err("Object Storage: Failed to fetch range for object '%s', offset %lu, len %lu (ret: %d)\n",
+		       object_key, pr->pi_off, len, ret);
+	}
+
+	// Always advance the offset, regardless of success or failure, 
+	// to maintain the correct position for subsequent reads.
+	pr->pi_off += len;
+
+	return ret; // Return the result of fetch/callback
+}
+
 static int read_pagemap_page(struct page_read *pr, unsigned long vaddr, int nr, void *buf, unsigned flags)
 {
 	pr_info("pr%lu-%u Read %lx %u pages\n", pr->img_id, pr->id, vaddr, nr);
@@ -810,8 +859,21 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 
 	pr->pi = open_pages_image_at(dfd, flags, pr->pmi, &pr->pages_img_id);
 	if (!pr->pi) {
-		close_page_read(pr);
-		return -1;
+		// If lazy pages from object storage is enabled, the lazy-pages daemon
+		// doesn't strictly need the local pages.img file descriptor.
+		// It only needs pagemap info (pmi) and the pages_img_id.
+		// The main restore process will handle fetching from object storage.
+		if (opts.lazy_pages && opts.enable_object_storage) {
+			pr_warn("Could not open local pages-%u.img, but proceeding in object storage lazy-pages mode.\n", 
+			        pr->pages_img_id);
+			// Set pr->pi to NULL explicitly, although open_pages_image_at likely did.
+			pr->pi = NULL; 
+		} else {
+			// Original error handling for other modes
+			pr_err("Failed to open pages image (id: %u)\n", pr->pages_img_id);
+			close_page_read(pr);
+			return -1; 
+		}
 	}
 
 	if (init_pagemaps(pr)) {
@@ -830,14 +892,30 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->id = ids++;
 	pr->img_id = img_id;
 
-	if (remote)
+	// Determine the correct page reading function
+	if (remote) {
 		pr->maybe_read_page = maybe_read_page_remote;
-	else if (opts.stream)
+	} else if (opts.stream) {
 		pr->maybe_read_page = maybe_read_page_img_streamer;
-	else {
+	} else if (opts.lazy_pages && opts.enable_object_storage) {
+		// Object Storage with Lazy Loading: 
+		// Both restore process and lazy-pages daemon use this.
+		// Restore process fetches data, daemon mainly manages metadata.
+		pr_info("Assigning maybe_read_page_object_storage (lazy_pages: %d, enable_object_storage: %d)\n", 
+		        opts.lazy_pages, opts.enable_object_storage);
+		pr->maybe_read_page = maybe_read_page_object_storage;
+		pr->pieok = false; // PIE probably not applicable/needed here
+	} else {
+		// Default to local file reading for non-remote, non-stream, 
+		// and non-object-storage-lazy-pages scenarios.
+		pr_info("Assigning maybe_read_page_local (lazy_pages: %d, enable_object_storage: %d)\n",
+		        opts.lazy_pages, opts.enable_object_storage);
 		pr->maybe_read_page = maybe_read_page_local;
+		// Set pieok only if NOT lazy loading (original logic)
 		if (!pr->parent && !opts.lazy_pages)
 			pr->pieok = true;
+		else
+			pr->pieok = false;
 	}
 
 	pr_debug("Opened %s page read %u (parent %u)\n", remote ? "remote" : "local", pr->id,
