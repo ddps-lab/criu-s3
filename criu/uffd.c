@@ -67,6 +67,8 @@
 #define DEFAULT_XFER_LEN (64 << 10)
 #define MAX_XFER_LEN	 (4 << 20)
 
+#define SEMI_SYNC_PAGES_AROUND 2048
+
 static mutex_t *lazy_sock_mutex;
 
 struct lazy_iov {
@@ -1158,30 +1160,194 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 	/* Align requested address to the next page boundary */
 	address = msg->arg.pagefault.address & ~(page_size() - 1);
-	lp_debug(lpi, "#PF at 0x%llx\n", address);
 
-	if (is_page_queued(lpi, address))
+	if (!(opts.lazy_pages && opts.enable_object_storage)) {
+		// Original single-page fault logic for non-object-storage or non-lazy cases
+		lp_debug(lpi, "#PF (non-OS): Handling single page at 0x%llx\n", address);
+		if (is_page_queued(lpi, address))
+			return 0;
+
+		iov = find_iov(lpi, address);
+		if (!iov)
+			return uffd_zero(lpi, address, 1);
+
+		/*
+		 * FIXME: Ensure extract_range correctly handles extracting exactly one page
+		 * starting at 'address'. The original extract_range might need adjustments
+		 * if it assumes extraction starts at iov->start.
+		 */
+		iov = extract_range(iov, address, address + PAGE_SIZE);
+		if (!iov) {
+			lp_err(lpi, "Failed to extract single page range [0x%llx, 0x%llx)\n", address, address + PAGE_SIZE);
+			return -1;
+		}
+
+		list_move(&iov->l, &lpi->reqs);
+		update_xfer_len(lpi, true);
+
+		ret = uffd_handle_pages(lpi, iov->img_start, 1, PR_ASYNC | PR_ASAP);
+		if (ret < 0) {
+			lp_err(lpi, "Error during regular page copy for 0x%llx\n", address);
+			// Attempt to move the iov back if handling failed
+			list_move(&iov->l, &lpi->iovs);
+			return -1;
+		}
 		return 0;
-
-	iov = find_iov(lpi, address);
-	if (!iov)
-		return uffd_zero(lpi, address, 1);
-
-	iov = extract_range(iov, address, address + PAGE_SIZE);
-	if (!iov)
-		return -1;
-
-	list_move(&iov->l, &lpi->reqs);
-
-	update_xfer_len(lpi, true);
-
-	ret = uffd_handle_pages(lpi, iov->img_start, 1, PR_ASYNC | PR_ASAP);
-	if (ret < 0) {
-		lp_err(lpi, "Error during regular page copy\n");
-		return -1;
 	}
 
-	return 0;
+	// --- Semi-synchronous logic for Object Storage Lazy Loading ---
+	{ // New block scope for C90 compatibility
+		// Variable declarations moved to the top of the block
+		unsigned long ps;
+		unsigned long req_start_addr;
+		unsigned long req_end_addr;
+		unsigned long clamped_start_addr;
+		unsigned long clamped_end_addr;
+		unsigned long fallback_end_addr;
+		int nr_total = 0; // Initialize nr_total
+		unsigned long max_nr_buf;
+		unsigned long img_start_addr;
+		struct lazy_iov *req_iov = NULL; // Initialize req_iov
+
+		lp_debug(lpi, "#PF (OS): Semi-synchronous handling for 0x%llx\n", address);
+
+		if (is_page_queued(lpi, address)) // Check if the faulting page itself is part of an ongoing request
+			return 0;
+
+		iov = find_iov(lpi, address);
+		if (!iov) {
+			lp_debug(lpi, "Address 0x%llx not in known IOVs, zeroing single page.\n", address);
+			return uffd_zero(lpi, address, 1); // Zero out only the faulting page
+		}
+
+		// Calculate semi-synchronous range, clamped by the IOV boundaries
+		ps = page_size();
+		// Potential start/end, avoid underflow for req_start_addr
+		req_start_addr = (address > iov->start && address - iov->start > SEMI_SYNC_PAGES_AROUND * ps) ?
+					 address - SEMI_SYNC_PAGES_AROUND * ps :
+					 iov->start;
+		req_end_addr = address + (SEMI_SYNC_PAGES_AROUND + 1) * ps;
+
+		// Clamp to the boundaries of the IOV containing the faulting address
+		// Replace max macro with ternary operator
+		clamped_start_addr = (req_start_addr > iov->start) ? req_start_addr : iov->start;
+		// Replace min macro with ternary operator
+		clamped_end_addr = (req_end_addr < iov->end) ? req_end_addr : iov->end;
+
+
+		// Ensure the clamped range is valid and aligned (start should be aligned by max)
+		clamped_start_addr &= ~(ps - 1);
+		// Align start, then calculate end based on nr_total later, ensuring it doesn't exceed iov->end.
+
+		if (clamped_start_addr >= iov->end) { // Check after aligning start
+			clamped_start_addr = address; // Fallback: Start at faulting page
+		}
+		// Calculate max potential end based on aligned start
+		// Replace min macro with ternary operator
+		clamped_end_addr = ( (clamped_start_addr + (2 * SEMI_SYNC_PAGES_AROUND + 1) * ps) < iov->end ) ? 
+					 (clamped_start_addr + (2 * SEMI_SYNC_PAGES_AROUND + 1) * ps) : 
+					 iov->end;
+
+
+		if (clamped_start_addr >= clamped_end_addr) {
+			lp_warn(lpi, "Cannot determine valid range for fault 0x%llx in iov [0x%lx, 0x%lx), falling back to single page\n",
+				address, iov->start, iov->end);
+			clamped_start_addr = address;
+			// Replace min macro with ternary operator
+			fallback_end_addr = address + ps;
+			clamped_end_addr = (fallback_end_addr < iov->end) ? fallback_end_addr : iov->end;
+
+			if (clamped_start_addr >= clamped_end_addr) {
+				lp_err(lpi, "Fallback single page range invalid [0x%lx, 0x%lx)\n", clamped_start_addr, clamped_end_addr);
+				return -1;
+			}
+		}
+
+		nr_total = (clamped_end_addr - clamped_start_addr) / ps;
+		if ((clamped_end_addr - clamped_start_addr) % ps != 0) {
+			lp_warn(lpi, "Non-page-aligned range calculated [0x%lx, 0x%lx), adjusting nr_total down.\n",
+					clamped_start_addr, clamped_end_addr);
+			// nr_total calculated by integer division is already correct (floor)
+			clamped_end_addr = clamped_start_addr + nr_total * ps; // Adjust end back to be page aligned
+		}
+
+		if (nr_total <= 0) {
+			lp_err(lpi, "Calculated zero or negative pages (%d) for range [0x%lx, 0x%lx)\n",
+				nr_total, clamped_start_addr, clamped_end_addr);
+			// Fallback to single page if calculation failed somehow
+			clamped_start_addr = address;
+			fallback_end_addr = address + ps;
+			clamped_end_addr = (fallback_end_addr < iov->end) ? fallback_end_addr : iov->end;
+			nr_total = (clamped_end_addr - clamped_start_addr) / ps;
+			if (nr_total <= 0) return -1; // Give up if still invalid
+		}
+
+		// ----- Log added for debugging -----
+		lp_debug(lpi, "IOV Clamped Range: [0x%lx, 0x%lx), nr_total_before_buf_check: %d",
+				 clamped_start_addr, clamped_end_addr, nr_total);
+		lp_debug(lpi, "Buffer capacity: max_nr_buf: %ld (buf_size: %lu)",
+				 lpi->buf_size / ps, lpi->buf_size);
+		// ----- End of added log -----
+
+
+		// Check buffer size and adjust nr_total if needed
+		max_nr_buf = lpi->buf_size / ps;
+		if (nr_total > max_nr_buf) {
+			lp_warn(lpi, "Requested range (%d pages) exceeds buffer size (%ld pages). Clamping to buffer size.\n",
+					nr_total, max_nr_buf);
+			nr_total = max_nr_buf;
+			clamped_end_addr = clamped_start_addr + nr_total * ps;
+			if (nr_total == 0) {
+				 lp_err(lpi, "Buffer too small even for one page (buf_size: %lu)\n", lpi->buf_size);
+				 return -1;
+			}
+		}
+
+		// Calculate the corresponding start address in the image file/object
+		// Note: This assumes the IOV containing the fault represents a contiguous block in the image.
+		img_start_addr = iov->img_start + (clamped_start_addr - iov->start);
+
+		lp_debug(lpi, "Requesting %d pages for range [0x%lx, 0x%lx) (img_start 0x%lx)\n",
+				 nr_total, clamped_start_addr, clamped_end_addr, img_start_addr);
+
+		/*
+		 * IMPORTANT: extract_range needs to be able to extract an arbitrary sub-range
+		 * [clamped_start_addr, clamped_end_addr) from the given 'iov'.
+		 * This might involve splitting the original 'iov' into up to three pieces.
+		 * The current implementation of extract_range might not support this fully.
+		 * It needs modification or replacement to guarantee it returns an iov
+		 * exactly matching the clamped range.
+		 */
+		req_iov = extract_range(iov, clamped_start_addr, clamped_end_addr);
+		if (!req_iov) {
+			lp_err(lpi, "Failed to extract semi-sync range [0x%lx, 0x%lx)\n", clamped_start_addr, clamped_end_addr);
+			// Need robust error recovery if iov was modified by extract_range
+			return -1;
+		}
+
+		// Sanity check: Ensure the returned iov matches the request *exactly*
+		if (req_iov->start != clamped_start_addr || req_iov->end != clamped_end_addr) {
+			lp_err(lpi, "Extracted IOV [0x%lx, 0x%lx) doesn't match requested range [0x%lx, 0x%lx)! Fix extract_range.\n",
+				   req_iov->start, req_iov->end, clamped_start_addr, clamped_end_addr);
+			// Attempt to put the potentially incorrect iov back and fail
+			list_move_tail(&req_iov->l, &lpi->iovs); // Move to tail to avoid processing immediately
+			return -1;
+		}
+
+		list_move(&req_iov->l, &lpi->reqs); // Move the iov for the whole range to requests
+
+		update_xfer_len(lpi, true); // Page fault occurred
+
+		ret = uffd_handle_pages(lpi, img_start_addr, nr_total, PR_ASYNC | PR_ASAP);
+		if (ret < 0) {
+			lp_err(lpi, "Error handling pages for semi-sync range [0x%lx, 0x%lx)\n", clamped_start_addr, clamped_end_addr);
+			// Attempt to move the iov back if handling failed
+			list_move(&req_iov->l, &lpi->iovs);
+			return -1;
+		}
+
+		return 0; // Success
+	} // End of new block scope
 }
 
 static int handle_uffd_event(struct epoll_rfd *lpfd)
