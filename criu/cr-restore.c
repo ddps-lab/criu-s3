@@ -81,6 +81,7 @@
 #include "bpfmap.h"
 #include "apparmor.h"
 #include "pidfd.h"
+#include "object-storage.h"
 
 #include "parasite-syscall.h"
 #include "files-reg.h"
@@ -1639,6 +1640,10 @@ static int __restore_task_with_children(void *_arg)
 		goto err;
 
 	if (prepare_mappings(current))
+		goto err;
+
+	// Clean up curl resources after prepare_mappings to prevent fd conflicts
+	if (opts.enable_object_storage && object_storage_cleanup_and_prepare_for_lazy_pages())
 		goto err;
 
 	if (prepare_sigactions(ca->core) < 0)
