@@ -36,9 +36,6 @@ static int g_is_lazy_pages_context = 0;
 /* Flag to track if curl was initialized in this process */
 static int g_curl_initialized_in_this_process = 0;
 
-/* Mutex-like mechanism might be needed here for multi-threading,
- * but CRIU's process model may not require it.
- */
 
 /* Callback function for libcurl to write received data */
 static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp)
@@ -57,6 +54,30 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
 	mem->size += realsize;
 
 	return realsize;
+}
+
+/* Set fixed curl options that don't change between requests */
+static void set_fixed_curl_options(CURL *handle)
+{
+	curl_easy_setopt(handle, CURLOPT_HTTPGET, 1L);
+	curl_easy_setopt(handle, CURLOPT_FAILONERROR, 1L);           // Fail on 4xx/5xx errors
+	curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 1L);        // Follow redirects
+	curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, write_callback);
+	
+	// TCP keepalive settings
+	curl_easy_setopt(handle, CURLOPT_TCP_KEEPALIVE, 1L);
+	curl_easy_setopt(handle, CURLOPT_TCP_KEEPIDLE, 120L);        // Seconds the connection needs to remain idle before sending keepalive
+	curl_easy_setopt(handle, CURLOPT_TCP_KEEPINTVL, 60L);        // Interval in seconds between keepalive probes
+	
+	// Connection caching/reuse settings
+	curl_easy_setopt(handle, CURLOPT_FORBID_REUSE, 0L);          // Allow connection reuse
+	curl_easy_setopt(handle, CURLOPT_FRESH_CONNECT, 0L);         // Use cached connection if available
+	
+	// Critical: Avoid using stdin (fd 0)
+	curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L);              // Don't use signals (which might use fd 0)
+	
+	// SSL verification
+	curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, 2L);        // Verify hostname in cert
 }
 
 /* Get curl handle for current process (create if not exists) */
@@ -83,6 +104,9 @@ static CURL *get_curl_handle_for_current_process(void)
 		pr_err("Failed to initialize curl handle for PID %d\n", current_pid);
 		return NULL;
 	}
+	
+	// Set fixed options once during handle creation
+	set_fixed_curl_options(new_handle);
 	
 	// Create new entry
 	entry = malloc(sizeof(struct curl_handle_entry));
@@ -364,36 +388,21 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 			pr_err("Failed to initialize curl easy handle\n");
 			return -1;
 		}
+		
+		// For one-time handle, set all options including fixed ones
+		set_fixed_curl_options(curl_handle);
 	} else {
 		// Reset the handle for reuse (keeps connections if possible)
 		curl_easy_reset(curl_handle);
+		
+		// Re-apply fixed settings after reset
+		set_fixed_curl_options(curl_handle);
 	}
 
-	// Set libcurl options
+	// Set variable options for each request
 	curl_easy_setopt(curl_handle, CURLOPT_URL, url);
-	curl_easy_setopt(curl_handle, CURLOPT_HTTPGET, 1L);
 	curl_easy_setopt(curl_handle, CURLOPT_RANGE, range_header);
-	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
 	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
-	curl_easy_setopt(curl_handle, CURLOPT_FAILONERROR, 1L); // Fail on 4xx/5xx errors
-	curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L); // Follow redirects
-	
-	// TCP keepalive settings
-	curl_easy_setopt(curl_handle, CURLOPT_TCP_KEEPALIVE, 1L);
-	curl_easy_setopt(curl_handle, CURLOPT_TCP_KEEPIDLE, 120L);  // Seconds the connection needs to remain idle before sending keepalive
-	curl_easy_setopt(curl_handle, CURLOPT_TCP_KEEPINTVL, 60L);  // Interval in seconds between keepalive probes
-	
-	// Optional connection caching/reuse settings
-	curl_easy_setopt(curl_handle, CURLOPT_FORBID_REUSE, 0L);    // Allow connection reuse
-	curl_easy_setopt(curl_handle, CURLOPT_FRESH_CONNECT, 0L);   // Use cached connection if available
-	
-	// Critical: Avoid using stdin (fd 0)
-	curl_easy_setopt(curl_handle, CURLOPT_NOSIGNAL, 1L);        // Don't use signals (which might use fd 0)
-	
-	// Add options for timeout, SSL verification etc. as needed
-	// curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 30L);        // Timeout for the entire request
-	// curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 10L); // Timeout for the connection phase
-	curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 2L);  // Verify hostname in cert
 
 	pr_debug("Fetching range %s from %s\n", range_header, url);
 	// --- DEBUG --- URL and Range check
@@ -427,16 +436,13 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 				return -1;
 			}
 			
-			// Set all options again
+			// Set all options again (fixed + variable)
+			set_fixed_curl_options(retry_handle);
+			
+			// Set variable options
 			curl_easy_setopt(retry_handle, CURLOPT_URL, url);
-			curl_easy_setopt(retry_handle, CURLOPT_HTTPGET, 1L);
 			curl_easy_setopt(retry_handle, CURLOPT_RANGE, range_header);
-			curl_easy_setopt(retry_handle, CURLOPT_WRITEFUNCTION, write_callback);
 			curl_easy_setopt(retry_handle, CURLOPT_WRITEDATA, (void *)&chunk);
-			curl_easy_setopt(retry_handle, CURLOPT_FAILONERROR, 1L);
-			curl_easy_setopt(retry_handle, CURLOPT_FOLLOWLOCATION, 1L);
-			curl_easy_setopt(retry_handle, CURLOPT_SSL_VERIFYHOST, 2L);
-			curl_easy_setopt(retry_handle, CURLOPT_NOSIGNAL, 1L);
 			
 			// Retry the request
 			res = curl_easy_perform(retry_handle);
