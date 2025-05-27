@@ -1283,9 +1283,9 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		}
 
 		// ----- Log added for debugging -----
-		lp_debug(lpi, "IOV Clamped Range: [0x%lx, 0x%lx), nr_total_before_buf_check: %d",
+		lp_debug(lpi, "IOV Clamped Range: [0x%lx, 0x%lx), nr_total_before_buf_check: %d\n",
 				 clamped_start_addr, clamped_end_addr, nr_total);
-		lp_debug(lpi, "Buffer capacity: max_nr_buf: %ld (buf_size: %lu)",
+		lp_debug(lpi, "Buffer capacity: max_nr_buf: %ld (buf_size: %lu)\n",
 				 lpi->buf_size / ps, lpi->buf_size);
 		// ----- End of added log -----
 
