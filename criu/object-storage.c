@@ -4,6 +4,11 @@
 #include <unistd.h>  // for getpid()
 #include <stdlib.h>  // for malloc, free
 #include <time.h>    // for time()
+#include <ctype.h>   // for tolower
+
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/sha.h>
 
 #include "common/config.h"
 #include "common/compiler.h"
@@ -36,31 +41,202 @@ static int g_is_lazy_pages_context = 0;
 /* Flag to track if curl was initialized in this process */
 static int g_curl_initialized_in_this_process = 0;
 
+/* AWS S3 Express One Zone Session Credentials */
+static char g_session_access_key[256];
+static char g_session_secret_key[256];
+static char g_session_token[2048];
+static time_t g_session_expiration = 0;
+
+/* Forward declarations for static functions */
+static int _object_storage_create_express_session(void);
+static int ensure_valid_session(void);
+static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp);
+static int _parse_xml_tag(const char *xml, const char *tag, char *buffer, size_t buffer_len);
+
+/* Structure to hold both data and error buffers */
+struct FetchContext {
+	struct MemoryStruct *data_chunk;
+	struct MemoryStruct *error_chunk;
+	int got_error;
+};
+
+/*
+ * =================================================================================
+ * AWS Signature V4 Manual Implementation
+ * =================================================================================
+ */
+
+/* Helper to compute SHA256 and return it as a lowercase hex string. */
+__attribute__((used)) static void _sha256_hex(const char *str, size_t len, char *output)
+{
+	EVP_MD_CTX *mdctx;
+	const EVP_MD *md;
+	unsigned char hash[EVP_MAX_MD_SIZE];
+	unsigned int md_len;
+	int i;
+
+	md = EVP_sha256();
+	mdctx = EVP_MD_CTX_new();
+	EVP_DigestInit_ex(mdctx, md, NULL);
+	EVP_DigestUpdate(mdctx, str, len);
+	EVP_DigestFinal_ex(mdctx, hash, &md_len);
+	EVP_MD_CTX_free(mdctx);
+
+	for (i = 0; i < md_len; i++) {
+		sprintf(output + (i * 2), "%02x", hash[i]);
+	}
+	output[md_len * 2] = '\0';
+}
+
+/* Helper to compute HMAC-SHA256. Returns raw bytes. */
+__attribute__((used))
+static unsigned char *_hmac_sha256(const void *key, int key_len, const unsigned char *data, size_t data_len,
+				   unsigned int *out_len)
+{
+	unsigned char *result = malloc(EVP_MAX_MD_SIZE);
+	if (!result) {
+		pr_err("HMAC result malloc failed\n");
+		return NULL;
+	}
+	if (HMAC(EVP_sha256(), key, key_len, data, data_len, result, out_len) == NULL) {
+		free(result);
+		return NULL;
+	}
+	return result;
+}
+
+/* Derives the SigV4 signing key from the AWS secret key. */
+__attribute__((used))
+static unsigned char *_get_signature_key(const char *secret_key, const char *date_stamp, const char *region,
+					 const char *service, unsigned int *out_len)
+{
+	char k_secret[64];
+	unsigned int len;
+	unsigned char *k_date, *k_region, *k_service, *k_signing;
+
+	snprintf(k_secret, sizeof(k_secret), "AWS4%s", secret_key);
+
+	k_date = _hmac_sha256(k_secret, strlen(k_secret), (unsigned char *)date_stamp, strlen(date_stamp), &len);
+	k_region = _hmac_sha256(k_date, len, (unsigned char *)region, strlen(region), &len);
+	k_service = _hmac_sha256(k_region, len, (unsigned char *)service, strlen(service), &len);
+	k_signing = _hmac_sha256(k_service, len, (unsigned char *)"aws4_request", strlen("aws4_request"), out_len);
+
+	/* Intermediate keys are not needed after use */
+	if (k_date) free(k_date);
+	if (k_region) free(k_region);
+	if (k_service) free(k_service);
+
+	return k_signing;
+}
+
+/*
+ * =================================================================================
+ * Core Object Storage Logic
+ * =================================================================================
+ */
 
 /* Callback function for libcurl to write received data */
 static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp)
 {
 	size_t realsize = size * nmemb;
 	struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+	size_t new_size = mem->size + realsize;
 
-	// Ensure buffer has enough space (consider realloc if needed, but for fixed-size fetch, check capacity)
-	if (mem->size + realsize > mem->capacity) {
+	// Dynamic memory allocation for CreateSession responses
+	if (mem->capacity == 0) {
+		// This is for CreateSession API - dynamic allocation
+		char *ptr = realloc(mem->memory, new_size + 1);
+		if (!ptr) {
+			pr_err("Object Storage: Failed to allocate memory for response\n");
+			return 0;
+		}
+		mem->memory = ptr;
+		memcpy(&(mem->memory[mem->size]), contents, realsize);
+		mem->size = new_size;
+		mem->memory[mem->size] = '\0';  // Null terminate for string processing
+		return realsize;
+	}
+
+	// Fixed buffer for range requests
+	if (new_size > mem->capacity) {
 		pr_err("Object Storage: Received data exceeds buffer capacity (%zu > %zu)\n",
-		       mem->size + realsize, mem->capacity);
+		       new_size, mem->capacity);
 		return 0; // Indicate error by returning a size different from what was passed
 	}
 
 	memcpy(&(mem->memory[mem->size]), contents, realsize);
-	mem->size += realsize;
+	mem->size = new_size;
 
 	return realsize;
+}
+
+/* Callback function for libcurl to write error response data */
+static size_t write_error_callback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+	size_t realsize = size * nmemb;
+	struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+	char *ptr;
+
+	// For error responses, always use dynamic allocation
+	ptr = realloc(mem->memory, mem->size + realsize + 1);
+	if (!ptr) {
+		pr_err("Failed to allocate memory for error response\n");
+		return 0;
+	}
+	
+	mem->memory = ptr;
+	memcpy(&(mem->memory[mem->size]), contents, realsize);
+	mem->size += realsize;
+	mem->memory[mem->size] = '\0';
+	
+	return realsize;
+}
+
+/*
+ * Simple XML parser to extract the text content from a given tag.
+ */
+static int _parse_xml_tag(const char *xml, const char *tag, char *buffer, size_t buffer_len)
+{
+	char start_tag[64];
+	char end_tag[64];
+	const char *start;
+	const char *end;
+	size_t len;
+
+	snprintf(start_tag, sizeof(start_tag), "<%s>", tag);
+	snprintf(end_tag, sizeof(end_tag), "</%s>", tag);
+
+	start = strstr(xml, start_tag);
+	if (!start) {
+		/* Try again without namespace prefix */
+		const char *tag_name_only = strchr(tag, ':');
+		if (tag_name_only) {
+			return _parse_xml_tag(xml, tag_name_only + 1, buffer, buffer_len);
+		}
+		return -1;
+	}
+	start += strlen(start_tag);
+
+	end = strstr(start, end_tag);
+	if (!end)
+		return -1;
+
+	len = end - start;
+	if (len >= buffer_len) {
+		pr_err("XML tag '%s' content is too large for buffer\n", tag);
+		return -1;
+	}
+
+	memcpy(buffer, start, len);
+	buffer[len] = '\0';
+	return 0;
 }
 
 /* Set fixed curl options that don't change between requests */
 static void set_fixed_curl_options(CURL *handle)
 {
 	curl_easy_setopt(handle, CURLOPT_HTTPGET, 1L);
-	curl_easy_setopt(handle, CURLOPT_FAILONERROR, 1L);           // Fail on 4xx/5xx errors
+	// curl_easy_setopt(handle, CURLOPT_FAILONERROR, 1L);           // Don't fail on 4xx/5xx errors - we handle them manually
 	curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 1L);        // Follow redirects
 	curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, write_callback);
 	
@@ -78,6 +254,10 @@ static void set_fixed_curl_options(CURL *handle)
 	
 	// SSL verification
 	curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, 2L);        // Verify hostname in cert
+
+	// Debug callback
+	// curl_easy_setopt(handle, CURLOPT_DEBUGFUNCTION, debug_callback);
+	// curl_easy_setopt(handle, CURLOPT_VERBOSE, 1L);                // Enable verbose mode to trigger debug callback
 }
 
 /* Get curl handle for current process (create if not exists) */
@@ -252,6 +432,201 @@ static int check_and_reinitialize_for_lazy_pages(void)
 	return 0;
 }
 
+/*
+ * Create a session for Express One Zone using the CreateSession API.
+ * The resulting temporary credentials will be stored in global variables.
+ */
+static int _object_storage_create_express_session(void)
+{
+	CURL *curl;
+	CURLcode res;
+	struct MemoryStruct chunk;
+	char session_url[1024];
+	long http_code = 0;
+	struct curl_slist *headers = NULL;
+	char amz_date[17];
+	char date_stamp[9];
+	time_t now;
+	struct tm *tm_gmt;
+	const char *method = "GET";
+	const char *service = "s3";
+	const char *payload = "";
+	size_t payload_len;
+	char payload_hash[65];
+	char canonical_uri[] = "/";
+	char canonical_querystring[] = "session=";
+	char canonical_headers[4096];  /* Increased size for long hostnames and session tokens */
+	char signed_headers[] = "host;x-amz-content-sha256;x-amz-create-session-mode;x-amz-date";
+	char canonical_request[8192];  /* Increased size to prevent truncation */
+	char canonical_request_hash[65];
+	char string_to_sign[512];
+	char credential_scope[128];
+	unsigned char *signing_key;
+	unsigned int signing_key_len;
+	unsigned char *signature_raw;
+	unsigned int signature_raw_len;
+	char signature_hex[65];
+	char auth_header[512];
+	char x_amz_date_header[64];
+	char x_amz_content_sha256_header[100];
+	int i;
+
+	pr_info("Creating new S3 Express One Zone session...\n");
+
+	if (!opts.aws_access_key || !opts.aws_secret_key || !opts.aws_region) {
+		pr_err("Missing AWS credentials or region for Express One Zone session\n");
+		return -1;
+	}
+
+	payload_len = strlen(payload);
+	now = time(NULL);
+	tm_gmt = gmtime(&now);
+	strftime(amz_date, sizeof(amz_date), "%Y%m%dT%H%M%SZ", tm_gmt);
+	strftime(date_stamp, sizeof(date_stamp), "%Y%m%d", tm_gmt);
+
+	snprintf(session_url, sizeof(session_url), "https://%s.%s/?session", opts.object_storage_bucket,
+		 opts.object_storage_endpoint_url);
+	pr_info("Session URL: %s\n", session_url);
+
+	_sha256_hex(payload, payload_len, payload_hash);
+
+	snprintf(canonical_headers, sizeof(canonical_headers),
+		 "host:%s.%s\n"
+		 "x-amz-content-sha256:%s\n"
+		 "x-amz-create-session-mode:ReadWrite\n"
+		 "x-amz-date:%s\n",
+		 opts.object_storage_bucket, opts.object_storage_endpoint_url, payload_hash, amz_date);
+
+	snprintf(canonical_request, sizeof(canonical_request), "%s\n%s\n%s\n%s\n%s\n%s", method, canonical_uri,
+		 canonical_querystring, canonical_headers, signed_headers, payload_hash);
+
+	// pr_info("--- Canonical Request ---\n%s\n--- End ---\n", canonical_request);
+
+	_sha256_hex(canonical_request, strlen(canonical_request), canonical_request_hash);
+
+	snprintf(credential_scope, sizeof(credential_scope), "%s/%s/%s/aws4_request", date_stamp, opts.aws_region,
+		 service);
+
+	snprintf(string_to_sign, sizeof(string_to_sign), "AWS4-HMAC-SHA256\n%s\n%s\n%s", amz_date, credential_scope,
+		 canonical_request_hash);
+
+	// pr_info("--- String to Sign ---\n%s\n--- End ---\n", string_to_sign);
+
+	signing_key = _get_signature_key(opts.aws_secret_key, date_stamp, opts.aws_region, service, &signing_key_len);
+	// pr_debug("Using IAM secret key for signing: %.20s...\n", opts.aws_secret_key);
+	signature_raw = _hmac_sha256(signing_key, signing_key_len, (unsigned char *)string_to_sign,
+				     strlen(string_to_sign), &signature_raw_len);
+	if (signing_key)
+		free(signing_key);
+
+	if (signature_raw) {
+		for (i = 0; i < signature_raw_len; i++) {
+			sprintf(signature_hex + i * 2, "%02x", signature_raw[i]);
+		}
+		signature_hex[signature_raw_len * 2] = '\0';
+		free(signature_raw);
+	} else {
+		pr_err("Failed to create signature\n");
+		return -1;
+	}
+
+	snprintf(auth_header, sizeof(auth_header),
+		 "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+		 opts.aws_access_key, credential_scope, signed_headers, signature_hex);
+
+	chunk.memory = malloc(1);  /* Start with minimal allocation */
+	chunk.size = 0;
+	chunk.capacity = 0;  /* 0 indicates dynamic allocation mode */
+
+	curl = curl_easy_init();
+	if (!curl) {
+		pr_err("Failed to initialize curl for session creation\n");
+		free(chunk.memory);
+		return -1;
+	}
+
+	headers = curl_slist_append(headers, "x-amz-create-session-mode: ReadWrite");
+	snprintf(x_amz_date_header, sizeof(x_amz_date_header), "x-amz-date: %s", amz_date);
+	headers = curl_slist_append(headers, x_amz_date_header);
+	snprintf(x_amz_content_sha256_header, sizeof(x_amz_content_sha256_header), "x-amz-content-sha256: %s",
+		 payload_hash);
+	headers = curl_slist_append(headers, x_amz_content_sha256_header);
+	headers = curl_slist_append(headers, auth_header);
+
+	// pr_info("Authorization header: %s\n", auth_header);
+
+	curl_easy_setopt(curl, CURLOPT_URL, session_url);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+	curl_easy_setopt(curl, CURLOPT_FAILONERROR, 0L);  /* Don't fail on errors to capture response */
+	// curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+
+	res = curl_easy_perform(curl);
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (res != CURLE_OK || http_code >= 400) {
+		pr_err("CreateSession request failed: %s (HTTP code: %ld)\n", curl_easy_strerror(res), http_code);
+		pr_err("--- Server Error Response ---\n");
+		if (chunk.size > 0)
+			pr_err("%.*s\n", (int)chunk.size, chunk.memory);
+		pr_err("---------------------------\n");
+		curl_easy_cleanup(curl);
+		free(chunk.memory);
+		curl_slist_free_all(headers);
+		return -1;
+	}
+
+	pr_debug("CreateSession response: %s\n", chunk.memory);
+
+	if (_parse_xml_tag(chunk.memory, "AccessKeyId", g_session_access_key, sizeof(g_session_access_key)) !=
+		    0 ||
+	    _parse_xml_tag(chunk.memory, "SecretAccessKey", g_session_secret_key,
+			   sizeof(g_session_secret_key)) != 0 ||
+	    _parse_xml_tag(chunk.memory, "SessionToken", g_session_token, sizeof(g_session_token)) != 0) {
+		pr_err("Failed to parse session credentials from XML response\n");
+		curl_easy_cleanup(curl);
+		free(chunk.memory);
+		curl_slist_free_all(headers);
+		return -1;
+	}
+
+	pr_info("Successfully parsed session credentials:\n");
+	// pr_info("  Session AccessKeyId: %s\n", g_session_access_key);
+	// pr_info("  Session SecretAccessKey: %.20s...\n", g_session_secret_key[0] ? g_session_secret_key : "(empty)");
+	// pr_info("  Session Token: %.50s%s\n", g_session_token, strlen(g_session_token) > 50 ? "..." : "");
+
+	g_session_expiration = time(NULL) + (4 * 60);
+
+	pr_info("Successfully created S3 Express One Zone session. Expires at %ld\n", g_session_expiration);
+
+	curl_easy_cleanup(curl);
+	free(chunk.memory);
+	curl_slist_free_all(headers);
+
+	return 0;
+}
+
+/*
+ * Ensures that we have a valid (non-expired) Express One Zone session.
+ */
+static int ensure_valid_session(void)
+{
+	if (!opts.express_one_zone)
+		return 0;
+
+	// pr_info("Checking Express One Zone session validity (current time: %ld, expiration: %ld)\n", 
+	//	time(NULL), g_session_expiration);
+
+	if (g_session_expiration == 0 || time(NULL) >= g_session_expiration) {
+		pr_info("Express One Zone session is expired or not created. Creating a new one.\n");
+		return _object_storage_create_express_session();
+	}
+
+	// pr_info("Express One Zone session is still valid\n");
+	return 0;
+}
+
 int object_storage_init(void)
 {
 	CURLcode res = curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -273,6 +648,24 @@ int object_storage_init(void)
 	}
 	
 	pr_info("Object Storage client initialized (libcurl, PID: %d)\n", getpid());
+
+	if (opts.express_one_zone) {
+		pr_info("Express One Zone mode enabled\n");
+		// pr_info("  AWS Region: %s\n", opts.aws_region ? opts.aws_region : "(not set)");
+		// pr_info("  AWS Access Key: %s\n", opts.aws_access_key ? opts.aws_access_key : "(not set)");
+		// pr_info("  AWS Secret Key: %s\n", opts.aws_secret_key ? "(set)" : "(not set)");
+		
+		if (!opts.aws_access_key || !opts.aws_secret_key || !opts.aws_region) {
+			pr_err("Express One Zone requires --aws-access-key, --aws-secret-key, and --aws-region\n");
+			return -1;
+		}
+		
+		if (ensure_valid_session() != 0) {
+			pr_err("Failed to create initial Express One Zone session\n");
+			return -1;
+		}
+	}
+
 	return 0;
 }
 
@@ -282,12 +675,46 @@ void object_storage_cleanup(void)
 	pr_info("Object Storage client cleaned up (libcurl, PID: %d)\n", getpid());
 }
 
+/* Header callback to detect HTTP errors early */
+static size_t header_callback(char *buffer, size_t size, size_t nitems, void *userdata)
+{
+	struct FetchContext *ctx = (struct FetchContext *)userdata;
+	size_t total_size = size * nitems;
+	
+	// Check if this is the status line
+	if (strncmp(buffer, "HTTP/", 5) == 0) {
+		int status_code = 0;
+		// Parse status code from "HTTP/1.1 XXX ..."
+		if (sscanf(buffer, "HTTP/%*d.%*d %d", &status_code) == 1) {
+			if (status_code >= 400) {
+				ctx->got_error = 1;
+				pr_debug("Detected error status code: %d\n", status_code);
+			}
+		}
+	}
+	
+	return total_size;
+}
+
+/* Write callback that routes to appropriate buffer based on context */
+static size_t write_router_callback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+	struct FetchContext *ctx = (struct FetchContext *)userp;
+	
+	if (ctx->got_error) {
+		return write_error_callback(contents, size, nmemb, ctx->error_chunk);
+	} else {
+		return write_callback(contents, size, nmemb, ctx->data_chunk);
+	}
+}
+
 int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer)
 {
 	CURL *curl_handle;
 	CURLcode res;
 	long http_code = 0;
 	struct MemoryStruct chunk;
+	struct MemoryStruct error_response;  /* Buffer for error response */
 	char range_header[64];
 	char url[1024]; // Adjust size as needed
 	char normalized_prefix[256]; // Buffer for normalized prefix
@@ -295,10 +722,19 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	const char *endpoint_url;
 	const char *scheme = "https://"; // Default scheme
 	CURL *retry_handle = NULL; /* 변수 선언을 함수 시작 부분으로 이동 */
+	struct curl_slist *headers = NULL;
+	int ret = -1;
+	struct FetchContext fetch_ctx;
 
 	// --- DEBUG --- Entry point check
-	pr_info("PID %d: Entered object_storage_fetch_range (Key: %s, Offset: %lu, Len: %lu)\n",
-		getpid(), object_key, offset, length);
+	// pr_info("PID %d: Entered object_storage_fetch_range (Key: %s, Offset: %lu, Len: %lu)\n",
+	//	getpid(), object_key, offset, length);
+
+	// For Express One Zone, ensure we have a valid session
+	if (ensure_valid_session() != 0) {
+		pr_err("Failed to ensure valid Express One Zone session\n");
+		return -1;
+	}
 
 	// Check if we need to reinitialize curl for lazy-pages context
 	if (check_and_reinitialize_for_lazy_pages() != 0) {
@@ -316,6 +752,16 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	chunk.memory = buffer;
 	chunk.size = 0;
 	chunk.capacity = length;
+
+	// Initialize error response buffer
+	error_response.memory = malloc(1);
+	error_response.size = 0;
+	error_response.capacity = 0;  /* Dynamic allocation mode */
+
+	// Set up fetch context
+	fetch_ctx.data_chunk = &chunk;
+	fetch_ctx.error_chunk = &error_response;
+	fetch_ctx.got_error = 0;
 
 	// Normalize the object prefix
 	if (opts.object_storage_object_prefix) {
@@ -368,11 +814,20 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	snprintf(full_object_path, sizeof(full_object_path), "%s%s", normalized_prefix, object_key);
 
 	// Construct the final URL
-	snprintf(url, sizeof(url), "%s%s/%s/%s",
-		 scheme,
-		 endpoint_url,
-		 opts.object_storage_bucket,
-		 full_object_path); // Use combined path
+	if (opts.express_one_zone) {
+		snprintf(url, sizeof(url), "https://%s.%s/%s", opts.object_storage_bucket, opts.object_storage_endpoint_url,
+			 full_object_path);
+	} else {
+		// Handle endpoint URL scheme for non-express-one-zone
+		endpoint_url = opts.object_storage_endpoint_url;
+		if (strncmp(endpoint_url, "https://", 8) == 0) {
+			scheme = ""; // Scheme already present
+		} else if (strncmp(endpoint_url, "http://", 7) == 0) {
+			scheme = ""; // Scheme already present
+		}
+		snprintf(url, sizeof(url), "%s%s/%s/%s", scheme, endpoint_url, opts.object_storage_bucket,
+			 full_object_path); // Use path-style for others
+	}
 
 	// Prepare the Range header
 	snprintf(range_header, sizeof(range_header), "%lu-%lu", offset, offset + length - 1);
@@ -386,6 +841,7 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 		curl_handle = curl_easy_init();
 		if (!curl_handle) {
 			pr_err("Failed to initialize curl easy handle\n");
+			free(error_response.memory);
 			return -1;
 		}
 		
@@ -402,19 +858,170 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	// Set variable options for each request
 	curl_easy_setopt(curl_handle, CURLOPT_URL, url);
 	curl_easy_setopt(curl_handle, CURLOPT_RANGE, range_header);
-	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+	
+	// Remove FAILONERROR so we can capture error responses
+	curl_easy_setopt(curl_handle, CURLOPT_FAILONERROR, 0L);
+	
+	// Set up callbacks with context
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_router_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&fetch_ctx);
+	curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, header_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_HEADERDATA, (void *)&fetch_ctx);
+
+	/* If AWS credentials are provided, set up SigV4 authentication */
+	if (opts.express_one_zone && opts.aws_access_key && opts.aws_secret_key) {
+		/* Express One Zone: Use temporary session credentials and manual SigV4 */
+		char session_header[2100];
+		char amz_date[17];
+		char date_stamp[9];
+		char x_amz_date_header[64];
+		char x_amz_content_sha256_header[100];
+		char payload_hash[65];
+		char canonical_uri[1024];  /* Increased size */
+		char canonical_querystring[] = "";
+		char canonical_headers[4096];  /* Increased size for long hostnames and session tokens */
+		char signed_headers[] = "host;range;x-amz-content-sha256;x-amz-date;x-amz-s3session-token";
+		char canonical_request[8192];  /* Increased size to prevent truncation */
+		char canonical_request_hash[65];
+		char string_to_sign[512];
+		char credential_scope[128];
+		char signature_hex[65];
+		char auth_header[1024];  /* Increased size */
+		char range_header_value[64];
+		time_t now;
+		struct tm *tm_gmt;
+		const char *method = "GET";
+		const char *service = "s3";
+		const char *payload = "";
+		size_t payload_len = 0;
+		unsigned char *signing_key;
+		unsigned int signing_key_len;
+		unsigned char *signature_raw;
+		unsigned int signature_raw_len;
+		int i;
+
+		pr_info("Using Express One Zone session credentials with manual SigV4\n");
+		// pr_info("  Session Access Key: %s\n", g_session_access_key[0] ? g_session_access_key : "(empty)");
+		// pr_info("  Session Secret Key: %.20s...\n", g_session_secret_key[0] ? g_session_secret_key : "(empty)");
+		// pr_info("  Session Token: %.50s%s\n", g_session_token, strlen(g_session_token) > 50 ? "..." : "");
+		
+		// Get current time
+		now = time(NULL);
+		tm_gmt = gmtime(&now);
+		strftime(amz_date, sizeof(amz_date), "%Y%m%dT%H%M%SZ", tm_gmt);
+		strftime(date_stamp, sizeof(date_stamp), "%Y%m%d", tm_gmt);
+		
+		// Calculate payload hash (empty for GET)
+		_sha256_hex(payload, payload_len, payload_hash);
+		
+		// Prepare canonical URI (path part of URL)
+		snprintf(canonical_uri, sizeof(canonical_uri), "/%s", full_object_path);
+		
+		// Prepare range header value
+		snprintf(range_header_value, sizeof(range_header_value), "bytes=%lu-%lu", offset, offset + length - 1);
+		
+		// Build canonical headers
+		snprintf(canonical_headers, sizeof(canonical_headers),
+			"host:%s.%s\n"
+			"range:%s\n"
+			"x-amz-content-sha256:%s\n"
+			"x-amz-date:%s\n"
+			"x-amz-s3session-token:%s\n",
+			opts.object_storage_bucket, opts.object_storage_endpoint_url,
+			range_header_value,
+			payload_hash,
+			amz_date,
+			g_session_token);
+		
+		// Build canonical request
+		snprintf(canonical_request, sizeof(canonical_request), "%s\n%s\n%s\n%s\n%s\n%s",
+			method, canonical_uri, canonical_querystring, canonical_headers, signed_headers, payload_hash);
+		
+		// pr_info("Canonical Request:\n%s\n", canonical_request);
+		
+		// Calculate canonical request hash
+		_sha256_hex(canonical_request, strlen(canonical_request), canonical_request_hash);
+		
+		// Build credential scope
+		snprintf(credential_scope, sizeof(credential_scope), "%s/%s/%s/aws4_request",
+			date_stamp, opts.aws_region, service);
+		
+		// Build string to sign
+		snprintf(string_to_sign, sizeof(string_to_sign), "AWS4-HMAC-SHA256\n%s\n%s\n%s",
+			amz_date, credential_scope, canonical_request_hash);
+		
+		// pr_info("String to Sign:\n%s\n", string_to_sign);
+		
+		// Calculate signature
+		signing_key = _get_signature_key(g_session_secret_key, date_stamp, opts.aws_region, service, &signing_key_len);
+		// pr_debug("Using session secret key for signing: %.20s...\n", g_session_secret_key);
+		signature_raw = _hmac_sha256(signing_key, signing_key_len, (unsigned char *)string_to_sign,
+					     strlen(string_to_sign), &signature_raw_len);
+		if (signing_key)
+			free(signing_key);
+		
+		if (signature_raw) {
+			for (i = 0; i < signature_raw_len; i++) {
+				sprintf(signature_hex + i * 2, "%02x", signature_raw[i]);
+			}
+			signature_hex[signature_raw_len * 2] = '\0';
+			free(signature_raw);
+		} else {
+			pr_err("Failed to create signature\n");
+			free(error_response.memory);
+			return -1;
+		}
+		
+		// Build Authorization header
+		snprintf(auth_header, sizeof(auth_header),
+			"Authorization: AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+			g_session_access_key, credential_scope, signed_headers, signature_hex);
+		
+		// Add headers
+		snprintf(x_amz_date_header, sizeof(x_amz_date_header), "X-Amz-Date: %s", amz_date);
+		headers = curl_slist_append(headers, x_amz_date_header);
+		
+		snprintf(x_amz_content_sha256_header, sizeof(x_amz_content_sha256_header), "X-Amz-Content-Sha256: %s", payload_hash);
+		headers = curl_slist_append(headers, x_amz_content_sha256_header);
+		
+		snprintf(session_header, sizeof(session_header), "x-amz-s3session-token: %s", g_session_token);
+		headers = curl_slist_append(headers, session_header);
+		
+		headers = curl_slist_append(headers, auth_header);
+		
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+		
+		pr_info("Manual AWS SigV4 authentication configured for Express One Zone\n");
+	} else if (opts.aws_access_key && opts.aws_secret_key) {
+		/* Standard S3: Use provided IAM credentials */
+		char userpwd[512];
+		snprintf(userpwd, sizeof(userpwd), "%s:%s", opts.aws_access_key, opts.aws_secret_key);
+		curl_easy_setopt(curl_handle, CURLOPT_USERPWD, userpwd);
+	}
 
 	pr_debug("Fetching range %s from %s\n", range_header, url);
 	// --- DEBUG --- URL and Range check
-	pr_info("Libcurl Request - URL: %s\n", url);
-	pr_info("Libcurl Request - Range: %s\n", range_header);
+	// pr_info("Libcurl Request - URL: %s\n", url);
+	// pr_info("Libcurl Request - Range: %s\n", range_header);
 
 	// Perform the request
 	res = curl_easy_perform(curl_handle);
+	
+	// Get HTTP status code
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
 
-	if (res != CURLE_OK) {
-		pr_err("curl_easy_perform() failed: %s (URL: %s, Range: %s)\n",
-		       curl_easy_strerror(res), url, range_header);
+	if (res != CURLE_OK || http_code >= 400) {
+		pr_err("curl_easy_perform() failed: %s (URL: %s, Range: %s, HTTP Code: %ld)\n",
+		       curl_easy_strerror(res), url, range_header, http_code);
+		
+		// If we got an HTTP error response, capture the error body
+		if (res == CURLE_OK && http_code >= 400) {
+			if (error_response.size > 0) {
+				pr_err("--- Server Error Response (HTTP %ld) ---\n", http_code);
+				pr_err("%.*s\n", (int)error_response.size, error_response.memory);
+				pr_err("---------------------------\n");
+			}
+		}
 		
 		// If using a reused handle and got an error, try with a fresh handle
 		if (curl_handle == get_curl_handle_for_current_process()) {
@@ -433,34 +1040,61 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 			retry_handle = curl_easy_init();
 			if (!retry_handle) {
 				pr_err("Failed to initialize retry curl handle\n");
+				free(error_response.memory);
 				return -1;
 			}
 			
 			// Set all options again (fixed + variable)
 			set_fixed_curl_options(retry_handle);
+			curl_easy_setopt(retry_handle, CURLOPT_FAILONERROR, 0L);
 			
 			// Set variable options
 			curl_easy_setopt(retry_handle, CURLOPT_URL, url);
 			curl_easy_setopt(retry_handle, CURLOPT_RANGE, range_header);
-			curl_easy_setopt(retry_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+			
+			// Reset fetch context for retry
+			fetch_ctx.got_error = 0;
+			error_response.size = 0;
+			curl_easy_setopt(retry_handle, CURLOPT_WRITEFUNCTION, write_router_callback);
+			curl_easy_setopt(retry_handle, CURLOPT_WRITEDATA, (void *)&fetch_ctx);
+			curl_easy_setopt(retry_handle, CURLOPT_HEADERFUNCTION, header_callback);
+			curl_easy_setopt(retry_handle, CURLOPT_HEADERDATA, (void *)&fetch_ctx);
+
+			/* Apply headers for retry if we're using Express One Zone */
+			if (headers) {
+				curl_easy_setopt(retry_handle, CURLOPT_HTTPHEADER, headers);
+			}
+			
+			// Reset chunk size for retry
+			chunk.size = 0;
 			
 			// Retry the request
 			res = curl_easy_perform(retry_handle);
 			
-			// Check if retry succeeded
-			if (res != CURLE_OK) {
-				pr_err("Retry also failed: %s\n", curl_easy_strerror(res));
-				curl_easy_cleanup(retry_handle);
-				return -1;
-			}
-			
 			// Get status code
 			curl_easy_getinfo(retry_handle, CURLINFO_RESPONSE_CODE, &http_code);
+			
+			// Check if retry succeeded
+			if (res != CURLE_OK || http_code >= 400) {
+				pr_err("Retry also failed: %s (HTTP Code: %ld)\n", curl_easy_strerror(res), http_code);
+				
+				// Get error response for retry
+				if (error_response.size > 0) {
+					pr_err("--- Retry Error Response (HTTP %ld) ---\n", http_code);
+					pr_err("%.*s\n", (int)error_response.size, error_response.memory);
+					pr_err("---------------------------\n");
+				}
+				
+				curl_easy_cleanup(retry_handle);
+				free(error_response.memory);
+				return -1;
+			}
 			
 			// Check size
 			if (chunk.size != length) {
 				pr_err("Object Storage fetch: Received size mismatch (Expected %lu, Got %zu)\n", length, chunk.size);
 				curl_easy_cleanup(retry_handle);
+				free(error_response.memory);
 				return -1;
 			}
 			
@@ -471,18 +1105,20 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 			pr_info("Recovery successful, creating new persistent handle\n");
 			get_curl_handle_for_current_process(); // Create a new persistent handle
 			
-			return 0;
+			free(error_response.memory);
+			ret = 0;
+			goto cleanup;
 		} else {
 			// One-time handle failed
 			curl_easy_cleanup(curl_handle);
+			free(error_response.memory);
 			return -1;
 		}
 	}
 
-	// Check HTTP status code (optional, as FAILONERROR is set)
-	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+	// Check HTTP status code for success
 	// --- DEBUG --- Response code check
-	pr_info("Libcurl Response - HTTP Code: %ld\n", http_code);
+	// pr_info("Libcurl Response - HTTP Code: %ld\n", http_code);
 	if (http_code != 206) { // 206 Partial Content is expected for range requests
 		pr_warn("Expected HTTP 206 Partial Content, but received %ld\n", http_code);
 		// Depending on the error handling strategy, this might still be considered a failure
@@ -490,7 +1126,7 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 
 	// Check if the received size matches the requested length
 	// --- DEBUG --- Received size check
-	pr_info("Libcurl Response - Received Bytes: %zu (Expected: %lu)\n", chunk.size, length);
+	// pr_info("Libcurl Response - Received Bytes: %zu (Expected: %lu)\n", chunk.size, length);
 	if (chunk.size != length) {
 		pr_err("Object Storage fetch: Received size mismatch (Expected %lu, Got %zu)\n", length, chunk.size);
 		
@@ -501,7 +1137,9 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 			curl_easy_cleanup(curl_handle);
 		}
 		
-		return -1;
+		free(error_response.memory);
+		ret = -1;
+		goto cleanup;
 	}
 
 	pr_debug("Successfully fetched %zu bytes (range %s) from %s\n", chunk.size, range_header, url);
@@ -514,7 +1152,14 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 		update_handle_stats();
 	}
 
-	return 0; // Success
+	free(error_response.memory);
+	ret = 0; // Success
+
+cleanup:
+	if (headers) {
+		curl_slist_free_all(headers);
+	}
+	return ret;
 }
 
 /*
