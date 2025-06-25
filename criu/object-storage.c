@@ -811,7 +811,16 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 		scheme = ""; // Scheme already present
 	}
 
-	snprintf(full_object_path, sizeof(full_object_path), "%s%s", normalized_prefix, object_key);
+	// Check if object_key already contains the prefix to avoid duplication
+	if (normalized_prefix[0] != '\0' && strncmp(object_key, normalized_prefix, strlen(normalized_prefix)) == 0) {
+		// object_key already contains the prefix, use it as is
+		snprintf(full_object_path, sizeof(full_object_path), "%s", object_key);
+		pr_debug("Object key already contains prefix, using as is: %s\n", full_object_path);
+	} else {
+		// Prepend the prefix to object_key
+		snprintf(full_object_path, sizeof(full_object_path), "%s%s", normalized_prefix, object_key);
+		pr_debug("Prepended prefix to object key: %s\n", full_object_path);
+	}
 
 	// Construct the final URL
 	if (opts.express_one_zone) {
