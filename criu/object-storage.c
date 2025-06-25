@@ -743,7 +743,7 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	}
 
 	// Basic validation
-	if (!opts.object_storage_endpoint_url || !opts.object_storage_bucket || !object_key || !buffer || length == 0) {
+	if (!opts.object_storage_endpoint_url || !object_key || !buffer || length == 0) {
 		pr_err("Object Storage fetch range: Invalid arguments provided.\n");
 		return -1;
 	}
@@ -834,8 +834,35 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 		} else if (strncmp(endpoint_url, "http://", 7) == 0) {
 			scheme = ""; // Scheme already present
 		}
-		snprintf(url, sizeof(url), "%s%s/%s/%s", scheme, endpoint_url, opts.object_storage_bucket,
-			 full_object_path); // Use path-style for others
+		
+		// Check if bucket is provided
+		if (opts.object_storage_bucket && opts.object_storage_bucket[0] != '\0') {
+			// Use virtual-hosted-style for S3
+			if (scheme[0] == '\0') {
+				// Scheme already included in endpoint_url, need to extract it
+				const char *hostname_start = endpoint_url;
+				if (strncmp(endpoint_url, "https://", 8) == 0) {
+					hostname_start = endpoint_url + 8;
+				} else if (strncmp(endpoint_url, "http://", 7) == 0) {
+					hostname_start = endpoint_url + 7;
+				}
+				snprintf(url, sizeof(url), "%.*s%s.%s/%s", 
+					(int)(hostname_start - endpoint_url), endpoint_url,  // Copy the scheme part
+					opts.object_storage_bucket, 
+					hostname_start,  // Use hostname without scheme
+					full_object_path);
+			} else {
+				// Need to add scheme
+				snprintf(url, sizeof(url), "%s%s.%s/%s", 
+					scheme,
+					opts.object_storage_bucket, 
+					endpoint_url,
+					full_object_path);
+			}
+		} else {
+			// No bucket - use direct endpoint URL (for CloudFront, CDN, etc.)
+			snprintf(url, sizeof(url), "%s%s/%s", scheme, endpoint_url, full_object_path);
+		}
 	}
 
 	// Prepare the Range header
