@@ -5,6 +5,7 @@
 #include <sys/uio.h>
 #include <limits.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "types.h"
 #include "image.h"
@@ -476,19 +477,95 @@ static int maybe_read_page_remote(struct page_read *pr, unsigned long vaddr, int
 	return ret;
 }
 
-// Function to read page data from Object Storage
+// Object storage semi-synchronous pages around setting (same as lazy-pages)
+#define OBJECT_STORAGE_SEMI_SYNC_PAGES_AROUND 2048
+
+// Function to read page data from Object Storage with semi-synchronous optimization
 static int maybe_read_page_object_storage(struct page_read *pr, unsigned long vaddr, int nr, void *buf, unsigned flags)
 {
 	int ret;
 	unsigned long len = nr * PAGE_SIZE;
 	char object_key[PATH_MAX]; // Assuming PATH_MAX is sufficient for prefix + image name
 	char image_name[64];      // Buffer for dynamic image name (e.g., pages-1.img)
+	int actual_nr = nr;
+	unsigned long actual_len = len;
+	void *actual_buf = buf;
+	void *extended_buf = NULL;
+	unsigned long ps = PAGE_SIZE;
+	bool use_semi_sync = false;
+	unsigned long vaddr_start, vaddr_end, req_start, req_end;
+	unsigned long safe_start, safe_end, original_offset;
+	int safe_nr;
+	unsigned long safe_len, offset_adjustment;
 
 	// Construct the dynamic image name using pages_img_id
 	snprintf(image_name, sizeof(image_name), "pages-%u.img", pr->pages_img_id);
 
-	pr_info("Object Storage: Reading %d pages (len: %lu) from %s at offset %lu for vaddr %lx\n", 
-	        nr, len, image_name, pr->pi_off, vaddr);
+	// Apply semi-synchronous optimization for object storage
+	// When object storage is enabled, always use semi-sync for better performance
+	if (opts.enable_object_storage && nr == 1) {
+		// Calculate safe extended range for semi-sync with bounds checking
+		vaddr_start = vaddr;
+		vaddr_end = vaddr + PAGE_SIZE;
+		original_offset = pr->pi_off; // Save original offset
+		
+		// Calculate initial extended range (2048 pages around)
+		if (vaddr >= OBJECT_STORAGE_SEMI_SYNC_PAGES_AROUND * ps) {
+			req_start = vaddr - OBJECT_STORAGE_SEMI_SYNC_PAGES_AROUND * ps;
+		} else {
+			req_start = 0; // Don't go below 0
+		}
+		req_end = vaddr + (OBJECT_STORAGE_SEMI_SYNC_PAGES_AROUND + 1) * ps;
+		
+		// Check image file bounds to prevent out-of-bounds reads
+		if (pr->pe) {
+			unsigned long pe_start = pr->pe->vaddr;
+			unsigned long pe_end = pe_start + pr->pe->nr_pages * ps;
+			
+			// Clamp to pagemap entry boundaries
+			safe_start = (req_start > pe_start) ? req_start : pe_start;
+			safe_end = (req_end < pe_end) ? req_end : pe_end;
+			
+			// Ensure we don't go beyond the current page entry
+			if (safe_start < vaddr_start) {
+				safe_start = vaddr_start;
+			}
+			if (safe_end <= safe_start) {
+				safe_end = vaddr_end;
+			}
+			
+			// Calculate actual pages and check if it's worth doing semi-sync
+			safe_nr = (safe_end - safe_start) / ps;
+			if (safe_nr > 1) {
+				safe_len = safe_nr * ps;
+				
+				// Allocate extended buffer for semi-sync fetch
+				extended_buf = malloc(safe_len);
+				if (extended_buf) {
+					actual_nr = safe_nr;
+					actual_len = safe_len;
+					actual_buf = extended_buf;
+					use_semi_sync = true;
+					
+					// Adjust offset to start from safe_start instead of vaddr
+					offset_adjustment = vaddr - safe_start;
+					pr->pi_off = original_offset - offset_adjustment;
+					
+					pr_debug("Object Storage: Semi-sync enabled - extending %d page to %d pages (range: 0x%lx-0x%lx, offset_adj: %lu)\n", 
+						 nr, actual_nr, safe_start, safe_end, offset_adjustment);
+				} else {
+					pr_warn("Object Storage: Failed to allocate extended buffer (%lu bytes), using single page\n", safe_len);
+				}
+			} else {
+				pr_debug("Object Storage: Semi-sync range too small (%d pages), using single page\n", safe_nr);
+			}
+		} else {
+			pr_debug("Object Storage: No pagemap entry available, using single page\n");
+		}
+	}
+
+	pr_info("Object Storage: Reading %d pages (len: %lu) from %s at offset %lu for vaddr %lx (semi-sync: %s)\n", 
+	        actual_nr, actual_len, image_name, pr->pi_off, vaddr, use_semi_sync ? "yes" : "no");
 
 	// Construct the object key with prefix if available
 	if (opts.object_storage_object_prefix && strlen(opts.object_storage_object_prefix) > 0) {
@@ -500,10 +577,18 @@ static int maybe_read_page_object_storage(struct page_read *pr, unsigned long va
 	}
 
 	// Fetch data from object storage
-	ret = object_storage_fetch_range(object_key, pr->pi_off, len, buf);
+	ret = object_storage_fetch_range(object_key, pr->pi_off, actual_len, actual_buf);
 
 	if (ret == 0) {
-		pr_debug("Object Storage: Fetch successful for offset %lu\n", pr->pi_off);
+		pr_debug("Object Storage: Fetch successful for offset %lu (fetched %lu bytes)\n", pr->pi_off, actual_len);
+		
+		// If we used semi-sync extended buffer, copy requested portion to original buffer
+		if (use_semi_sync && extended_buf) {
+			// The requested page should be at the start since we adjusted offset
+			memcpy(buf, extended_buf, len);
+			pr_debug("Object Storage: Semi-sync - copied %lu bytes from extended buffer\n", len);
+		}
+		
 		// Call io_complete callback if read was successful
 		if (pr->io_complete) {
 			ret = pr->io_complete(pr, vaddr, nr);
@@ -513,10 +598,15 @@ static int maybe_read_page_object_storage(struct page_read *pr, unsigned long va
 		}
 	} else {
 		pr_err("Object Storage: Failed to fetch range for object '%s', offset %lu, len %lu (ret: %d)\n",
-		       object_key, pr->pi_off, len, ret);
+		       object_key, pr->pi_off, actual_len, ret);
 	}
 
-	// Always advance the offset, regardless of success or failure, 
+	// Clean up extended buffer if allocated
+	if (extended_buf) {
+		free(extended_buf);
+	}
+
+	// Always advance the offset by the originally requested length
 	// to maintain the correct position for subsequent reads.
 	pr->pi_off += len;
 
