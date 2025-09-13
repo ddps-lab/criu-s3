@@ -5,6 +5,9 @@
 #include <stdlib.h>  // for malloc, free
 #include <time.h>    // for time()
 #include <ctype.h>   // for tolower
+#include <pthread.h> // for pthread
+#include <sys/syscall.h> // for syscall
+#include <sys/types.h> // for pid_t
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -32,8 +35,25 @@ struct curl_handle_entry {
 	struct curl_handle_entry *next;  /* Next entry in linked list */
 };
 
+/* Structure to hold thread-specific curl handle */
+struct curl_thread_handle {
+	pthread_t thread_id;     /* Thread ID */
+	CURL *handle;            /* Curl handle for this thread */
+	time_t last_used;        /* Last time this handle was used */
+	int request_count;       /* Number of requests made with this handle */
+	struct curl_thread_handle *next;  /* Next entry in linked list */
+};
+
 /* Global handle storage (linked list head) */
 static struct curl_handle_entry *g_curl_handles = NULL;
+
+/* Thread-local storage key for CURL handles */
+static pthread_key_t g_curl_thread_key;
+static pthread_once_t g_curl_thread_key_once = PTHREAD_ONCE_INIT;
+
+/* Global mutex for thread handle list */
+static pthread_mutex_t g_thread_handles_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct curl_thread_handle *g_thread_handles = NULL;
 
 /* Flag to track if this is a lazy-pages context */
 static int g_is_lazy_pages_context = 0;
@@ -377,6 +397,113 @@ static void cleanup_all_curl_resources(void)
 		pr_info("Object Storage client global resources cleaned up (PID: %d)\n", getpid());
 		g_curl_initialized_in_this_process = 0;
 	}
+}
+
+/* Thread-local storage destructor for CURL handles */
+static void curl_thread_handle_destructor(void *handle)
+{
+	CURL *curl_handle = (CURL *)handle;
+	struct curl_thread_handle *entry, **pp;
+	pthread_t thread_id = pthread_self();
+	
+	if (curl_handle) {
+		/* Remove from global thread handle list */
+		pthread_mutex_lock(&g_thread_handles_mutex);
+		pp = &g_thread_handles;
+		while (*pp) {
+			entry = *pp;
+			if (pthread_equal(entry->thread_id, thread_id)) {
+				*pp = entry->next;
+				pr_debug("Thread %lu: Cleaning up thread-local CURL handle (requests: %d)\n",
+					 (unsigned long)thread_id, entry->request_count);
+				free(entry);
+				break;
+			}
+			pp = &entry->next;
+		}
+		pthread_mutex_unlock(&g_thread_handles_mutex);
+		
+		curl_easy_cleanup(curl_handle);
+	}
+}
+
+/* Initialize thread-local storage key */
+static void init_curl_thread_key(void)
+{
+	pthread_key_create(&g_curl_thread_key, curl_thread_handle_destructor);
+}
+
+/* Get current thread ID using syscall */
+static pid_t get_thread_id(void)
+{
+	return (pid_t)syscall(SYS_gettid);
+}
+
+/* Check if current thread is the main thread */
+static int is_main_thread(void)
+{
+	return get_thread_id() == getpid();
+}
+
+/* Get or create thread-local CURL handle */
+static CURL *get_thread_curl_handle(void)
+{
+	CURL *handle;
+	struct curl_thread_handle *entry;
+	pthread_t thread_id = pthread_self();
+	
+	/* Ensure thread key is initialized */
+	pthread_once(&g_curl_thread_key_once, init_curl_thread_key);
+	
+	/* Check if we already have a handle for this thread */
+	handle = (CURL *)pthread_getspecific(g_curl_thread_key);
+	if (handle) {
+		/* Update statistics */
+		pthread_mutex_lock(&g_thread_handles_mutex);
+		entry = g_thread_handles;
+		while (entry) {
+			if (pthread_equal(entry->thread_id, thread_id)) {
+				entry->last_used = time(NULL);
+				entry->request_count++;
+				break;
+			}
+			entry = entry->next;
+		}
+		pthread_mutex_unlock(&g_thread_handles_mutex);
+		return handle;
+	}
+	
+	/* Create new handle for this thread */
+	handle = curl_easy_init();
+	if (!handle) {
+		pr_err("Thread %lu: Failed to initialize CURL handle\n", (unsigned long)thread_id);
+		return NULL;
+	}
+	
+	/* Set fixed options for the handle */
+	set_fixed_curl_options(handle);
+	
+	/* Store in thread-local storage */
+	pthread_setspecific(g_curl_thread_key, handle);
+	
+	/* Add to global thread handle list for tracking */
+	entry = malloc(sizeof(struct curl_thread_handle));
+	if (entry) {
+		entry->thread_id = thread_id;
+		entry->handle = handle;
+		entry->last_used = time(NULL);
+		entry->request_count = 0;
+		
+		pthread_mutex_lock(&g_thread_handles_mutex);
+		entry->next = g_thread_handles;
+		g_thread_handles = entry;
+		pthread_mutex_unlock(&g_thread_handles_mutex);
+		
+		pr_info("Thread TID=%d (pthread_id=%lu): Created new thread-local CURL handle\n", 
+			get_thread_id(), (unsigned long)thread_id);
+	}
+	
+	return handle;
 }
 
 /* Re-initialize curl for lazy-pages context */
@@ -868,27 +995,41 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	// Prepare the Range header
 	snprintf(range_header, sizeof(range_header), "%lu-%lu", offset, offset + length - 1);
 
-	// Get the reusable curl handle for this process
-	curl_handle = get_curl_handle_for_current_process();
-	if (!curl_handle) {
-		pr_err("Failed to get curl handle for PID %d, falling back to one-time handle\n", getpid());
-		
-		// Fall back to a one-time handle as before
-		curl_handle = curl_easy_init();
+	// Get the reusable curl handle - use thread-local if available, otherwise process-local
+	/* Check if we're in the main thread using gettid */
+	if (!is_main_thread()) {
+		/* We're in a worker thread, use thread-local handle */
+		pr_debug("Thread %d: Using thread-local CURL handle\n", get_thread_id());
+		curl_handle = get_thread_curl_handle();
 		if (!curl_handle) {
-			pr_err("Failed to initialize curl easy handle\n");
+			pr_err("Failed to get thread-local curl handle for thread %d\n", get_thread_id());
 			free(error_response.memory);
 			return -1;
 		}
-		
-		// For one-time handle, set all options including fixed ones
-		set_fixed_curl_options(curl_handle);
 	} else {
-		// Reset the handle for reuse (keeps connections if possible)
-		curl_easy_reset(curl_handle);
-		
-		// Re-apply fixed settings after reset
-		set_fixed_curl_options(curl_handle);
+		/* We're in the main thread/process, use process-local handle */
+		pr_debug("Main thread (PID %d): Using process-local CURL handle\n", getpid());
+		curl_handle = get_curl_handle_for_current_process();
+		if (!curl_handle) {
+			pr_err("Failed to get curl handle for PID %d, falling back to one-time handle\n", getpid());
+			
+			// Fall back to a one-time handle as before
+			curl_handle = curl_easy_init();
+			if (!curl_handle) {
+				pr_err("Failed to initialize curl easy handle\n");
+				free(error_response.memory);
+				return -1;
+			}
+			
+			// For one-time handle, set all options including fixed ones
+			set_fixed_curl_options(curl_handle);
+		} else {
+			// Reset the handle for reuse (keeps connections if possible)
+			curl_easy_reset(curl_handle);
+			
+			// Re-apply fixed settings after reset
+			set_fixed_curl_options(curl_handle);
+		}
 	}
 
 	// Set variable options for each request
@@ -1060,7 +1201,12 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 		}
 		
 		// If using a reused handle and got an error, try with a fresh handle
-		if (curl_handle == get_curl_handle_for_current_process()) {
+		if (!is_main_thread()) {
+			/* Thread-local handle - don't retry, just fail */
+			pr_err("Thread %d: curl_easy_perform failed, not retrying\n", get_thread_id());
+			free(error_response.memory);
+			return -1;
+		} else if (curl_handle == get_curl_handle_for_current_process()) {
 			pr_warn("Retrying with a fresh connection\n");
 			
 			// Clean up the existing handle
@@ -1167,10 +1313,16 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 		pr_err("Object Storage fetch: Received size mismatch (Expected %lu, Got %zu)\n", length, chunk.size);
 		
 		// If using a reused handle, clean it up since something's wrong
-		if (curl_handle == get_curl_handle_for_current_process()) {
-			cleanup_curl_handle_for_process(getpid());
+		if (!is_main_thread()) {
+			/* Thread-local handle - don't clean up here, let thread cleanup handle it */
+			pr_warn("Thread %d: Size mismatch, but keeping thread-local handle\n", get_thread_id());
 		} else {
-			curl_easy_cleanup(curl_handle);
+			/* Process-local or one-time handle */
+			if (curl_handle == get_curl_handle_for_current_process()) {
+				cleanup_curl_handle_for_process(getpid());
+			} else {
+				curl_easy_cleanup(curl_handle);
+			}
 		}
 		
 		free(error_response.memory);
@@ -1180,12 +1332,20 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 
 	pr_debug("Successfully fetched %zu bytes (range %s) from %s\n", chunk.size, range_header, url);
 
-	// If this was a one-time handle, clean it up
-	if (curl_handle != get_curl_handle_for_current_process()) {
-		curl_easy_cleanup(curl_handle);
+	// Handle cleanup based on handle type
+	if (!is_main_thread()) {
+		/* Thread-local handle - don't clean up, just update stats */
+		/* Stats are already updated in get_thread_curl_handle() */
+		pr_debug("Thread %d: Keeping thread-local handle for reuse\n", get_thread_id());
 	} else {
-		// Update stats for the persistent handle
-		update_handle_stats();
+		/* Process-local or one-time handle */
+		if (curl_handle != get_curl_handle_for_current_process()) {
+			/* One-time handle - clean it up */
+			curl_easy_cleanup(curl_handle);
+		} else {
+			/* Persistent process handle - update stats */
+			update_handle_stats();
+		}
 	}
 
 	free(error_response.memory);
@@ -1217,4 +1377,9 @@ int object_storage_cleanup_and_prepare_for_lazy_pages(void)
 	
 	// When lazy-pages kicks in, it will detect the need to reinitialize
 	return 0;
-} 
+}
+
+/* Note: Removed redundant thread-specific public functions since
+ * object_storage_fetch_range now automatically handles thread-local 
+ * handles when called from worker threads
+ */ 
