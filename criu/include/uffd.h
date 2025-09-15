@@ -10,4 +10,7 @@ extern int lazy_pages_setup_zombie(int pid);
 extern int prepare_lazy_pages_socket(void);
 extern int lazy_pages_finish_restore(void);
 
+/* Helper functions for prefetch */
+extern int lpi_resolve_file_offset(void *lpi_ptr, unsigned long vaddr, unsigned long *offset_out);
+
 #endif /* __CR_UFFD_H_ */

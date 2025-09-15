@@ -438,6 +438,10 @@ void init_opts(void)
 	opts.object_storage_bucket = NULL;
 	opts.object_storage_object_prefix = NULL;
 
+	/* Initialize async prefetch options */
+	opts.async_prefetch = false;
+	opts.prefetch_workers = 4;  /* Default to 4 workers */
+
 	/* Initialize Express One Zone options */
 	opts.express_one_zone = false;
 	opts.aws_access_key = NULL;
@@ -723,6 +727,8 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "aws-access-key", required_argument, 0, 1108 },
 		{ "aws-secret-key", required_argument, 0, 1109 },
 		{ "aws-region", required_argument, 0, 1110 },
+		{ "async-prefetch", no_argument, NULL, 1111 },
+		{ "prefetch-workers", required_argument, 0, 1112 },
 		{},
 	};
 
@@ -1094,6 +1100,16 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			break;
 		case 1110:
 			SET_CHAR_OPTS(aws_region, optarg);
+			break;
+		case 1111:
+			opts.async_prefetch = true;
+			break;
+		case 1112:
+			opts.prefetch_workers = atoi(optarg);
+			if (opts.prefetch_workers <= 0 || opts.prefetch_workers > 16) {
+				pr_err("Invalid prefetch-workers value: %s (must be 1-16)\n", optarg);
+				return 2;
+			}
 			break;
 		default:
 			return 2;

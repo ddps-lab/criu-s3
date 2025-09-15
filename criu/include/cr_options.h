@@ -252,6 +252,10 @@ struct cr_options {
 	char *object_storage_bucket;
 	char *object_storage_object_prefix;
 
+	/* Async prefetch options */
+	bool async_prefetch;
+	unsigned int prefetch_workers;
+
 	/* AWS S3 Express One Zone specific options */
 	bool express_one_zone;
 	char *aws_access_key;

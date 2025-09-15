@@ -41,6 +41,9 @@
 #include "fdstore.h"
 #include "util.h"
 #include "namespaces.h"
+#include "page-cache.h"
+#include "prefetch.h"
+#include "object-storage.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
@@ -67,7 +70,7 @@
 #define DEFAULT_XFER_LEN (64 << 10)
 #define MAX_XFER_LEN	 (4 << 20)
 
-#define SEMI_SYNC_PAGES_AROUND 2048
+#define SEMI_SYNC_PAGES_AROUND 1024
 
 static mutex_t *lazy_sock_mutex;
 
@@ -89,6 +92,7 @@ struct lazy_pages_info {
 	unsigned ref_cnt;
 
 	struct page_read pr;
+	pthread_mutex_t pr_lock;
 
 	unsigned long xfer_len; /* in pages */
 	unsigned long total_pages;
@@ -113,10 +117,54 @@ static struct epoll_rfd lazy_sk_rfd;
 static int lazy_pages_sk_id = -1;
 
 static int handle_uffd_event(struct epoll_rfd *lpfd);
+static struct lazy_iov *find_iov(struct lazy_pages_info *lpi, unsigned long addr);
+
+/* Helper functions for prefetch integration */
+struct page_read *lpi_get_page_read(void *lpi_ptr)
+{
+	struct lazy_pages_info *lpi = (struct lazy_pages_info *)lpi_ptr;
+	return &lpi->pr;
+}
+
+void lpi_lock_pr(void *lpi_ptr)
+{
+	struct lazy_pages_info *lpi = (struct lazy_pages_info *)lpi_ptr;
+	pthread_mutex_lock(&lpi->pr_lock);
+}
+
+void lpi_unlock_pr(void *lpi_ptr)
+{
+	struct lazy_pages_info *lpi = (struct lazy_pages_info *)lpi_ptr;
+	pthread_mutex_unlock(&lpi->pr_lock);
+}
+
+int lpi_resolve_file_offset(void *lpi_ptr, unsigned long vaddr, unsigned long *offset_out)
+{
+	struct lazy_pages_info *lpi = (struct lazy_pages_info *)lpi_ptr;
+	struct lazy_iov *iov;
+
+	/* Find the IOV containing this virtual address */
+	iov = find_iov(lpi, vaddr);
+	if (!iov) {
+		/* This is expected for addresses outside lazy-restore scope (zero pages, sparse regions, etc)
+		 * Only log at debug level 4+ to reduce spam for prefetch attempts */
+		if (log_get_loglevel() >= LOG_DEBUG)
+			pr_debug("No IOV found for vaddr 0x%lx (sparse/non-lazy page)\n", vaddr);
+		return -ENOENT;
+	}
+
+	/* Calculate the file offset based on IOV mapping */
+	*offset_out = iov->img_start + (vaddr - iov->start);
+	pr_debug("Resolved vaddr 0x%lx to file offset 0x%lx (iov: 0x%lx-0x%lx -> 0x%lx)\n",
+		vaddr, *offset_out, iov->start, iov->end, iov->img_start);
+
+	return 0;
+}
 
 static struct lazy_pages_info *lpi_init(void)
 {
 	struct lazy_pages_info *lpi = NULL;
+	pthread_mutexattr_t attr;
 
 	lpi = xmalloc(sizeof(*lpi));
 	if (!lpi)
@@ -129,6 +177,11 @@ static struct lazy_pages_info *lpi_init(void)
 	lpi->lpfd.read_event = handle_uffd_event;
 	lpi->xfer_len = DEFAULT_XFER_LEN;
 	lpi->ref_cnt = 1;
+
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+	pthread_mutex_init(&lpi->pr_lock, &attr);
+	pthread_mutexattr_destroy(&attr);
 
 	return lpi;
 }
@@ -676,6 +729,7 @@ static int collect_iovs(struct lazy_pages_info *lpi)
 	int nr_pages = 0, n_vma = 0, max_iov_len = 0;
 	int ret = -1;
 	unsigned long start, end, len;
+	off_t cumulative_offset = 0;  /* Track cumulative file offset */
 
 	mm = init_mm_entry(lpi);
 	if (!mm)
@@ -701,7 +755,7 @@ static int collect_iovs(struct lazy_pages_info *lpi)
 
 			len = min_t(uint64_t, end, vma->end) - start;
 			iov->start = start;
-			iov->img_start = start;
+			iov->img_start = cumulative_offset;  /* Use cumulative file offset */
 			iov->end = iov->start + len;
 			list_add_tail(&iov->l, &lpi->iovs);
 
@@ -713,6 +767,9 @@ static int collect_iovs(struct lazy_pages_info *lpi)
 
 			start = vma->end;
 		}
+
+		/* Update cumulative offset for next IOV */
+		cumulative_offset += pr->pe->nr_pages * page_size();
 	}
 
 	lpi->buf_size = max_iov_len;
@@ -885,15 +942,20 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, int nr
 		return 0;
 
 	list_for_each_entry(req, &lpi->reqs, l) {
-		if (req->img_start == img_addr) {
+		/* Check if the address falls within this IOV's range */
+		if (img_addr >= req->start && img_addr < req->end) {
 			addr = req->start;
+			pr_debug("uffd_io_complete: Found matching IOV for vaddr 0x%lx in [0x%lx-0x%lx]\n",
+				img_addr, req->start, req->end);
 			break;
 		}
 	}
 
 	/* the request may be already gone because if unmap/remove */
-	if (!addr)
+	if (!addr) {
+		lp_warn(lpi, "uffd_io_complete: No matching IOV found for vaddr 0x%lx, may cause issues\n", img_addr);
 		return 0;
+	}
 
 	/*
 	 * By the time we get the pages from the remote source, parts
@@ -913,13 +975,26 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, int nr
 	if (lpi->exited)
 		return 0;
 
+	/* Don't cache data after regular S3 fetch - only prefetch should populate cache */
+
 	/*
 	 * Since the completed request length may differ from the
 	 * actual data we've received we re-insert the request to IOVs
 	 * list and let drop_iovs do the range math, free memory etc.
 	 */
 	iov_list_insert(req, &lpi->iovs);
-	return drop_iovs(lpi, addr, nr * PAGE_SIZE);
+	ret = drop_iovs(lpi, addr, nr * PAGE_SIZE);
+
+	/* Trigger ahead-of-fault prefetch after page fault is complete */
+	if (ret == 0 && opts.async_prefetch) {
+		/* Track access pattern for future pattern-based prefetch */
+		page_cache_mark_access_pattern(addr);
+
+		/* Queue prefetch for the next unit */
+		prefetch_ahead_of_fault(addr, lpi);
+	}
+
+	return ret;
 }
 
 static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, int nr_pages)
@@ -1024,7 +1099,7 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 
 	update_xfer_len(lpi, false);
 
-	err = uffd_handle_pages(lpi, iov->img_start, nr_pages, PR_ASYNC | PR_ASAP);
+	err = uffd_handle_pages(lpi, iov->start, nr_pages, PR_ASYNC | PR_ASAP);
 	if (err < 0) {
 		lp_err(lpi, "Error during UFFD copy\n");
 		return -1;
@@ -1185,7 +1260,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		list_move(&iov->l, &lpi->reqs);
 		update_xfer_len(lpi, true);
 
-		ret = uffd_handle_pages(lpi, iov->img_start, 1, PR_ASYNC | PR_ASAP);
+		ret = uffd_handle_pages(lpi, address, 1, PR_ASYNC | PR_ASAP);
 		if (ret < 0) {
 			lp_err(lpi, "Error during regular page copy for 0x%llx\n", address);
 			// Attempt to move the iov back if handling failed
@@ -1199,8 +1274,6 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	{ // New block scope for C90 compatibility
 		// Variable declarations moved to the top of the block
 		unsigned long ps;
-		unsigned long req_start_addr;
-		unsigned long req_end_addr;
 		unsigned long clamped_start_addr;
 		unsigned long clamped_end_addr;
 		unsigned long fallback_end_addr;
@@ -1208,6 +1281,8 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		unsigned long max_nr_buf;
 		unsigned long img_start_addr;
 		struct lazy_iov *req_iov = NULL; // Initialize req_iov
+		void *cached_data = NULL;
+		enum cache_lookup_result cache_result;
 
 		lp_debug(lpi, "#PF (OS): Semi-synchronous handling for 0x%llx\n", address);
 
@@ -1222,17 +1297,53 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 		// Calculate semi-synchronous range, clamped by the IOV boundaries
 		ps = page_size();
-		// Potential start/end, avoid underflow for req_start_addr
-		req_start_addr = (address > iov->start && address - iov->start > SEMI_SYNC_PAGES_AROUND * ps) ?
-					 address - SEMI_SYNC_PAGES_AROUND * ps :
-					 iov->start;
-		req_end_addr = address + (SEMI_SYNC_PAGES_AROUND + 1) * ps;
+		// Align to semi-sync unit boundary for cache efficiency
+		clamped_start_addr = page_cache_align_to_semi_sync(address);
+		clamped_end_addr = clamped_start_addr + SEMI_SYNC_UNIT_SIZE;
 
-		// Clamp to the boundaries of the IOV containing the faulting address
-		// Replace max macro with ternary operator
-		clamped_start_addr = (req_start_addr > iov->start) ? req_start_addr : iov->start;
-		// Replace min macro with ternary operator
-		clamped_end_addr = (req_end_addr < iov->end) ? req_end_addr : iov->end;
+		// Clamp to IOV boundaries
+		if (clamped_start_addr < iov->start)
+			clamped_start_addr = iov->start;
+		if (clamped_end_addr > iov->end)
+			clamped_end_addr = iov->end;
+
+		// Check if this semi-sync unit is in cache (if async prefetch is enabled)
+		if (opts.async_prefetch) {
+			cache_result = page_cache_lookup_semi_sync(clamped_start_addr, clamped_end_addr, &cached_data);
+		} else {
+			cache_result = CACHE_MISS;
+		}
+
+		if (cache_result == CACHE_FULL_HIT) {
+			int nr_pages = (clamped_end_addr - clamped_start_addr) / ps;
+			lp_info(lpi, "Cache HIT: Using cached data for [0x%lx-0x%lx] (%d pages)\n",
+				clamped_start_addr, clamped_end_addr, nr_pages);
+
+			// Copy cached data to lpi buffer and use regular uffd_copy
+			if (lpi->buf_size < nr_pages * ps) {
+				lp_err(lpi, "Buffer too small for cached data: need %lu, have %lu\n",
+					nr_pages * ps, lpi->buf_size);
+				return -1;
+			}
+
+			memcpy(lpi->buf, cached_data, nr_pages * ps);
+			ret = uffd_copy(lpi, clamped_start_addr, &nr_pages);
+
+			/* Trigger prefetch even on cache hit to maintain aggressive prefetch */
+			if (ret == 0 && opts.async_prefetch) {
+				int prefetch_ret;
+				page_cache_mark_access_pattern(clamped_start_addr);
+				prefetch_ret = prefetch_ahead_of_fault(clamped_start_addr, lpi);
+				lp_info(lpi, "Prefetch triggered after cache hit at 0x%lx, result=%d\n",
+					clamped_start_addr, prefetch_ret);
+			}
+
+			return ret;
+		}
+
+		// Cache miss - continue with normal S3 fetch
+		lp_debug(lpi, "Cache MISS: Fetching from S3 for [0x%lx-0x%lx]\n",
+			clamped_start_addr, clamped_end_addr);
 
 
 		// Ensure the clamped range is valid and aligned (start should be aligned by max)
@@ -1334,16 +1445,35 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			return -1;
 		}
 
+		// Update img_start for the extracted IOV to match the actual range
+		req_iov->img_start = img_start_addr;
+
+		lp_debug(lpi, "Semi-sync: Adding IOV [0x%lx-0x%lx] to reqs, img_start=0x%lx\n",
+			req_iov->start, req_iov->end, req_iov->img_start);
+
 		list_move(&req_iov->l, &lpi->reqs); // Move the iov for the whole range to requests
 
 		update_xfer_len(lpi, true); // Page fault occurred
 
-		ret = uffd_handle_pages(lpi, img_start_addr, nr_total, PR_ASYNC | PR_ASAP);
+		ret = uffd_handle_pages(lpi, clamped_start_addr, nr_total, PR_ASYNC | PR_ASAP);
 		if (ret < 0) {
 			lp_err(lpi, "Error handling pages for semi-sync range [0x%lx, 0x%lx)\n", clamped_start_addr, clamped_end_addr);
 			// Attempt to move the iov back if handling failed
 			list_move(&req_iov->l, &lpi->iovs);
 			return -1;
+		}
+
+		/* Trigger prefetch for the next semi-sync unit after successful handling */
+		if (opts.async_prefetch) {
+			int prefetch_ret;
+			/* Track the access pattern for pattern-based prefetch */
+			page_cache_mark_access_pattern(clamped_start_addr);
+
+			/* Queue prefetch for the next unit(s) */
+			prefetch_ret = prefetch_ahead_of_fault(clamped_start_addr, lpi);
+
+			lp_info(lpi, "Prefetch triggered after semi-sync at 0x%lx, result=%d\n",
+				clamped_start_addr, prefetch_ret);
 		}
 
 		return 0; // Success
@@ -1413,12 +1543,23 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 	struct lazy_pages_info *lpi, *n;
 	int poll_timeout = -1;
 	int ret;
+	static bool idle_prefetch_started = false;
+	static int idle_count = 0;
 
 	for (;;) {
+		/* Use shorter timeout when async prefetch is enabled to detect idle periods */
+		if (opts.async_prefetch && !restore_finished) {
+			poll_timeout = 100; /* 100ms timeout for idle detection */
+		}
+
 		ret = epoll_run_rfds(epollfd, *events, nr_fds, poll_timeout);
 		if (ret < 0)
 			goto out;
 		if (ret > 0) {
+			/* Reset idle count when there's activity */
+			idle_count = 0;
+			idle_prefetch_started = false;
+
 			ret = complete_forks(epollfd, events, &nr_fds);
 			if (ret < 0)
 				goto out;
@@ -1426,6 +1567,17 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 				poll_timeout = 0;
 			if (!restore_finished || !ret)
 				continue;
+		} else if (ret == 0 && opts.async_prefetch && !restore_finished) {
+			/* Timeout occurred - system might be idle */
+			idle_count++;
+
+			/* Start sequential prefetch after 2 idle periods (200ms) */
+			if (idle_count >= 2 && !idle_prefetch_started && !list_empty(&lpis)) {
+				lpi = list_first_entry(&lpis, struct lazy_pages_info, l);
+				pr_info("Starting idle-time sequential prefetch after %d idle periods\n", idle_count);
+				prefetch_start_sequential(lpi);
+				idle_prefetch_started = true;
+			}
 		}
 
 		/* make sure we return success if there is nothing to xfer */
@@ -1585,9 +1737,29 @@ int cr_lazy_pages(bool daemon)
 	if (prepare_dummy_pstree())
 		return -1;
 
+	/* Initialize page cache and prefetch systems */
+	if (opts.enable_object_storage && opts.async_prefetch) {
+		if (page_cache_init() < 0) {
+			pr_err("Failed to initialize page cache\n");
+			return -1;
+		}
+		if (prefetch_init() < 0) {
+			pr_err("Failed to initialize prefetch\n");
+			page_cache_cleanup();
+			return -1;
+		}
+		pr_info("Semi-sync aware cache and prefetch initialized with %u workers\n",
+			opts.prefetch_workers);
+	}
+
 	lazy_sk = prepare_lazy_socket();
-	if (lazy_sk < 0)
+	if (lazy_sk < 0) {
+		if (opts.enable_object_storage && opts.async_prefetch) {
+			prefetch_cleanup();
+			page_cache_cleanup();
+		}
 		return -1;
+	}
 
 	if (daemon) {
 		ret = cr_daemon(1, 0, -1);
@@ -1637,6 +1809,27 @@ int cr_lazy_pages(bool daemon)
 	ret = handle_requests(epollfd, &events, nr_fds);
 
 	disconnect_from_page_server();
+
+	/* Cleanup cache and prefetch systems */
+	if (opts.enable_object_storage && opts.async_prefetch) {
+		struct semi_sync_cache_stats cache_stats;
+		struct prefetch_stats prefetch_stats;
+
+		page_cache_get_stats(&cache_stats);
+		prefetch_get_stats(&prefetch_stats);
+
+		pr_info("Cache stats: lookups=%lu, hits=%lu (%.2f%%), S3 saves=%lu\n",
+			cache_stats.total_lookups, cache_stats.full_hits,
+			cache_stats.total_lookups ? (100.0 * cache_stats.full_hits / cache_stats.total_lookups) : 0,
+			cache_stats.s3_fetches_saved);
+
+		pr_info("Prefetch stats: requests=%lu, completed=%lu, cached=%lu MB\n",
+			prefetch_stats.total_requests, prefetch_stats.completed,
+			prefetch_stats.bytes_prefetched / (1024 * 1024));
+
+		prefetch_cleanup();
+		page_cache_cleanup();
+	}
 
 	xfree(events);
 	return ret;
