@@ -12,5 +12,8 @@ extern int lazy_pages_finish_restore(void);
 
 /* Helper functions for prefetch */
 extern int lpi_resolve_file_offset(void *lpi_ptr, unsigned long vaddr, unsigned long *offset_out);
+extern bool lpi_unit_has_iov(void *lpi_ptr, unsigned long unit_start, unsigned long unit_end);
+extern int lpi_get_first_iov_in_unit(void *lpi_ptr, unsigned long unit_start,
+                                     unsigned long unit_end, unsigned long *offset_out);
 
 #endif /* __CR_UFFD_H_ */

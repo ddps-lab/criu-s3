@@ -161,6 +161,59 @@ int lpi_resolve_file_offset(void *lpi_ptr, unsigned long vaddr, unsigned long *o
 	return 0;
 }
 
+/* Check if a memory unit has any IOV (for prefetch optimization) */
+bool lpi_unit_has_iov(void *lpi_ptr, unsigned long unit_start, unsigned long unit_end)
+{
+	struct lazy_pages_info *lpi = (struct lazy_pages_info *)lpi_ptr;
+	struct lazy_iov *iov;
+
+	list_for_each_entry(iov, &lpi->iovs, l) {
+		/* Check if IOV overlaps with the unit */
+		if (iov->start < unit_end && iov->end > unit_start) {
+			/* Found overlapping IOV */
+			pr_debug("Unit [0x%lx-0x%lx] has IOV [0x%lx-0x%lx]\n",
+				unit_start, unit_end, iov->start, iov->end);
+			return true;
+		}
+		/* If IOVs are sorted and we've passed the unit, stop */
+		if (iov->start >= unit_end) {
+			break;
+		}
+	}
+
+	pr_debug("Unit [0x%lx-0x%lx] has no IOV (sparse)\n", unit_start, unit_end);
+	return false;
+}
+
+/* Get first IOV in a unit (if any) for file offset calculation */
+int lpi_get_first_iov_in_unit(void *lpi_ptr, unsigned long unit_start,
+                              unsigned long unit_end, unsigned long *offset_out)
+{
+	struct lazy_pages_info *lpi = (struct lazy_pages_info *)lpi_ptr;
+	struct lazy_iov *iov;
+
+	list_for_each_entry(iov, &lpi->iovs, l) {
+		/* Check if IOV overlaps with the unit */
+		if (iov->start < unit_end && iov->end > unit_start) {
+			/* Calculate offset for the unit start */
+			if (iov->start <= unit_start) {
+				/* IOV starts before or at unit start */
+				*offset_out = iov->img_start + (unit_start - iov->start);
+			} else {
+				/* IOV starts within the unit */
+				*offset_out = iov->img_start;
+			}
+			return 0;
+		}
+		/* If IOVs are sorted and we've passed the unit, stop */
+		if (iov->start >= unit_end) {
+			break;
+		}
+	}
+
+	return -ENOENT;
+}
+
 static struct lazy_pages_info *lpi_init(void)
 {
 	struct lazy_pages_info *lpi = NULL;

@@ -49,13 +49,11 @@ static struct {
 extern struct page_read *lpi_get_page_read(void *lpi);
 extern void lpi_lock_pr(void *lpi);
 extern void lpi_unlock_pr(void *lpi);
-extern int lpi_resolve_file_offset(void *lpi_ptr, unsigned long vaddr, unsigned long *offset_out);
+extern bool lpi_unit_has_iov(void *lpi_ptr, unsigned long unit_start, unsigned long unit_end);
+extern int lpi_get_first_iov_in_unit(void *lpi_ptr, unsigned long unit_start,
+                                     unsigned long unit_end, unsigned long *offset_out);
 
-static int resolve_file_offset(void *lpi, unsigned long vaddr, unsigned long *offset_out)
-{
-    /* Use the proper IOV-based offset resolution from uffd.c */
-    return lpi_resolve_file_offset(lpi, vaddr, offset_out);
-}
+/* resolve_file_offset no longer needed - using optimized unit checks instead */
 
 static bool request_exists_or_processing(unsigned long vaddr_start)
 {
@@ -332,8 +330,7 @@ int prefetch_ahead_of_fault(unsigned long current_fault_addr, void *lpi)
     int max_units = 8;  /* Prefetch up to 8 units ahead (32MB) */
     int i;
     void *dummy;
-    unsigned long search_addr;
-    unsigned long search_step = PAGE_SIZE * 16; /* Check every 16 pages for efficiency */
+    /* search_addr and search_step no longer needed with optimized unit check */ /* Check every 16 pages for efficiency */
 
     if (!page_cache_should_prefetch_next(current_fault_addr))
         return 0;
@@ -361,35 +358,23 @@ int prefetch_ahead_of_fault(unsigned long current_fault_addr, void *lpi)
             continue;
         }
 
-        /* Try to find a valid IOV within this semi-sync unit
-         * Unit boundary might start in sparse region, but unit may contain valid pages */
-        ret = -ENOENT;
-        file_offset = 0;
-
-        for (search_addr = next_unit_start;
-             search_addr < next_unit_start + SEMI_SYNC_UNIT_SIZE;
-             search_addr += search_step) {
-            ret = resolve_file_offset(lpi, search_addr, &file_offset);
-            if (ret == 0) {
-                /* Found valid IOV in this unit, adjust offset to unit start */
-                file_offset = file_offset - (search_addr - next_unit_start);
-                pr_debug("Prefetch: Found valid IOV at 0x%lx in unit starting at 0x%lx\n",
-                        search_addr, next_unit_start);
-                break;
-            }
+        /* Optimized: Check if unit has any IOV first (single pass) */
+        if (!lpi_unit_has_iov(lpi, next_unit_start, next_unit_start + SEMI_SYNC_UNIT_SIZE)) {
+            /* Entire unit is sparse/non-lazy, skip silently */
+            prefetch_state.stats.pattern_sparse_skips++;
+            pr_debug("Prefetch: Entire unit at 0x%lx is sparse/non-lazy (optimized check), skipping\n",
+                    next_unit_start);
+            /* Only stop if this is the first unit and it's entirely sparse */
+            if (i == 0) return 0;
+            continue; /* Try next unit */
         }
 
+        /* Unit has IOV, get the first IOV's file offset */
+        ret = lpi_get_first_iov_in_unit(lpi, next_unit_start,
+                                        next_unit_start + SEMI_SYNC_UNIT_SIZE,
+                                        &file_offset);
         if (ret < 0) {
-            if (ret == -ENOENT) {
-                /* Entire unit is sparse/non-lazy, skip silently */
-                prefetch_state.stats.pattern_sparse_skips++;
-                pr_debug("Prefetch: Entire unit at 0x%lx is sparse/non-lazy, skipping\n",
-                        next_unit_start);
-                /* Only stop if this is the first unit and it's entirely sparse */
-                if (i == 0) return 0;
-                continue; /* Try next unit */
-            }
-            pr_debug("Prefetch: Cannot resolve offset for unit %d at 0x%lx (error %d)\n",
+            pr_debug("Prefetch: Failed to get IOV offset for unit %d at 0x%lx (error %d)\n",
                     i, next_unit_start, ret);
             break;
         }
@@ -423,8 +408,7 @@ void prefetch_start_sequential(void *lpi)
     unsigned long start_addr;
     unsigned long file_offset;
     int ret;
-    unsigned long search_addr;
-    unsigned long search_step = PAGE_SIZE * 16;
+    /* search_addr and search_step no longer needed with optimized unit check */
     int i;
 
     pthread_mutex_lock(&prefetch_state.queue_lock);
@@ -446,31 +430,22 @@ void prefetch_start_sequential(void *lpi)
     for (i = 0; i < 16; i++) {
         unsigned long unit_start = start_addr + (i * SEMI_SYNC_UNIT_SIZE);
 
-        /* Try to find a valid IOV within this unit */
-        ret = -ENOENT;
-        file_offset = 0;
-
-        for (search_addr = unit_start;
-             search_addr < unit_start + SEMI_SYNC_UNIT_SIZE;
-             search_addr += search_step) {
-            ret = resolve_file_offset(lpi, search_addr, &file_offset);
-            if (ret == 0) {
-                /* Found valid IOV, adjust offset to unit start */
-                file_offset = file_offset - (search_addr - unit_start);
-                pr_debug("Sequential: Found valid IOV at 0x%lx in unit 0x%lx\n",
-                        search_addr, unit_start);
-                break;
-            }
+        /* Optimized: Check if unit has any IOV first (single pass) */
+        if (!lpi_unit_has_iov(lpi, unit_start, unit_start + SEMI_SYNC_UNIT_SIZE)) {
+            /* Entire unit is sparse, skip silently */
+            pr_debug("Sequential: Unit at 0x%lx is entirely sparse (optimized check), skipping\n", unit_start);
+            continue;
         }
 
+        /* Unit has IOV, get the first IOV's file offset */
+        ret = lpi_get_first_iov_in_unit(lpi, unit_start,
+                                        unit_start + SEMI_SYNC_UNIT_SIZE,
+                                        &file_offset);
         if (ret == 0) {
             prefetch_queue_semi_sync_unit(unit_start, file_offset, lpi, PREFETCH_SEQUENTIAL);
-        } else if (ret == -ENOENT) {
-            /* Entire unit is sparse, skip silently */
-            pr_debug("Sequential: Unit at 0x%lx is entirely sparse, skipping\n", unit_start);
         } else {
             /* Log actual errors */
-            pr_debug("Sequential prefetch: Failed to resolve offset for 0x%lx (error %d)\n",
+            pr_debug("Sequential prefetch: Failed to get IOV offset for 0x%lx (error %d)\n",
                     unit_start, ret);
         }
     }
