@@ -27,7 +27,7 @@ REQ-DEB-PKG-TEST-NAMES	+= libaio-dev
 REQ-RPM-PKG-TEST-NAMES	+= $(PYTHON)-PyYAML
 
 
-export LIBS		+= -lprotobuf-c -ldl -lnl-3 -lsoccr -Lsoccr/ -lnet -luuid
+export LIBS		+= -lprotobuf-c -ldl -lnl-3 -lsoccr -Lsoccr/ -lnet -luuid -lcurl -lcrypto -lssl
 
 check-packages-failed:
 	$(warning Can not find some of the required libraries)

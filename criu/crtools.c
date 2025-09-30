@@ -46,6 +46,7 @@
 
 #include "setproctitle.h"
 #include "sysctl.h"
+#include "object-storage.h"
 
 void flush_early_log_to_stderr(void) __attribute__((destructor));
 
@@ -176,6 +177,15 @@ int main(int argc, char *argv[], char *envp[])
 	 * different pid namespaces are sharing the same network namespace.
 	 */
 	util_init();
+
+	/* Initialize object storage client if enabled */
+	if (opts.enable_object_storage) {
+		if (object_storage_init() < 0) {
+			pr_err("Failed to initialize object storage client\n");
+			return 1;
+		}
+	}
+
 	if (opts.mode == CR_SWRK) {
 		if (argc != optind + 2) {
 			fprintf(stderr, "Usage: criu swrk <fd>\n");
@@ -320,8 +330,14 @@ int main(int argc, char *argv[], char *envp[])
 		return ret != 0;
 	}
 
-	if (opts.mode == CR_LAZY_PAGES)
-		return cr_lazy_pages(opts.daemon_mode) != 0;
+	if (opts.mode == CR_LAZY_PAGES) {
+		opts.lazy_pages = true;
+		ret = cr_lazy_pages(opts.daemon_mode) != 0;
+		if (opts.enable_object_storage) {
+			object_storage_cleanup();
+		}
+		return ret;
+	}
 
 	if (opts.mode == CR_CHECK)
 		return cr_check() != 0;

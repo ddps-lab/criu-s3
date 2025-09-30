@@ -4,6 +4,7 @@
 #include <linux/falloc.h>
 #include <sys/uio.h>
 #include <limits.h>
+#include <string.h>
 
 #include "types.h"
 #include "image.h"
@@ -18,6 +19,7 @@
 #include "xmalloc.h"
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
+#include "object-storage.h"
 
 #ifndef SEEK_DATA
 #define SEEK_DATA 3
@@ -463,6 +465,51 @@ static int read_page_complete(unsigned long img_id, unsigned long vaddr, int nr_
 	return ret;
 }
 
+/* Function to read page data from Object Storage */
+static int maybe_read_page_object_storage(struct page_read *pr, unsigned long vaddr, int nr, void *buf, unsigned flags)
+{
+	int ret;
+	unsigned long len = nr * PAGE_SIZE;
+	char object_key[PATH_MAX];
+	char image_name[64];
+
+	/* Construct the dynamic image name using pages_img_id */
+	snprintf(image_name, sizeof(image_name), "pages-%u.img", pr->pages_img_id);
+
+	pr_info("Object Storage: Reading %d pages (len: %lu) from %s at offset %lu for vaddr %lx\n",
+	        nr, len, image_name, pr->pi_off, vaddr);
+
+	/* Construct the object key with prefix if available */
+	if (opts.object_storage_object_prefix && strlen(opts.object_storage_object_prefix) > 0) {
+		snprintf(object_key, sizeof(object_key), "%s%s",
+		         opts.object_storage_object_prefix, image_name);
+	} else {
+		snprintf(object_key, sizeof(object_key), "%s", image_name);
+	}
+
+	/* Fetch data from object storage */
+	ret = object_storage_fetch_range(object_key, pr->pi_off, len, buf);
+
+	if (ret == 0) {
+		pr_debug("Object Storage: Fetch successful for offset %lu\n", pr->pi_off);
+		/* Call io_complete callback if read was successful */
+		if (pr->io_complete) {
+			ret = pr->io_complete(pr, vaddr, nr);
+			if (ret < 0) {
+				pr_err("Object Storage: io_complete callback failed for vaddr %lx\n", vaddr);
+			}
+		}
+	} else {
+		pr_err("Object Storage: Failed to fetch range for object '%s', offset %lu, len %lu (ret: %d)\n",
+		       object_key, pr->pi_off, len, ret);
+	}
+
+	/* Always advance the offset */
+	pr->pi_off += len;
+
+	return ret;
+}
+
 static int maybe_read_page_remote(struct page_read *pr, unsigned long vaddr, int nr, void *buf, unsigned flags)
 {
 	int ret;
@@ -531,6 +578,14 @@ static int process_async_reads(struct page_read *pr)
 {
 	int fd, ret = 0;
 	struct page_read_iov *piov, *n;
+
+	/* Handle NULL pr->pi for object storage mode */
+	if (!pr->pi) {
+		if (list_empty(&pr->async))
+			return 0;
+		pr_warn("Async reads requested but no pages image file available\n");
+		return 0;
+	}
 
 	fd = img_raw_fd(pr->pi);
 	list_for_each_entry_safe(piov, n, &pr->async, l) {
@@ -810,8 +865,16 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 
 	pr->pi = open_pages_image_at(dfd, flags, pr->pmi, &pr->pages_img_id);
 	if (!pr->pi) {
-		close_page_read(pr);
-		return -1;
+		/* If lazy pages from object storage is enabled, we don't need local pages.img */
+		if (opts.lazy_pages && opts.enable_object_storage) {
+			pr_warn("Could not open local pages-%u.img, but proceeding in object storage lazy-pages mode.\n",
+			        pr->pages_img_id);
+			pr->pi = NULL;
+		} else {
+			pr_err("Failed to open pages image (id: %u)\n", pr->pages_img_id);
+			close_page_read(pr);
+			return -1;
+		}
 	}
 
 	if (init_pagemaps(pr)) {
@@ -830,14 +893,26 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->id = ids++;
 	pr->img_id = img_id;
 
-	if (remote)
+	/* Determine the correct page reading function */
+	if (remote) {
 		pr->maybe_read_page = maybe_read_page_remote;
-	else if (opts.stream)
+	} else if (opts.stream) {
 		pr->maybe_read_page = maybe_read_page_img_streamer;
-	else {
+	} else if (opts.lazy_pages && opts.enable_object_storage) {
+		/* Object Storage with Lazy Loading */
+		pr_info("Assigning maybe_read_page_object_storage (lazy_pages: %d, enable_object_storage: %d)\n",
+		        opts.lazy_pages, opts.enable_object_storage);
+		pr->maybe_read_page = maybe_read_page_object_storage;
+		pr->pieok = false;
+	} else {
+		/* Default to local file reading */
+		pr_info("Assigning maybe_read_page_local (lazy_pages: %d, enable_object_storage: %d)\n",
+		        opts.lazy_pages, opts.enable_object_storage);
 		pr->maybe_read_page = maybe_read_page_local;
 		if (!pr->parent && !opts.lazy_pages)
 			pr->pieok = true;
+		else
+			pr->pieok = false;
 	}
 
 	pr_debug("Opened %s page read %u (parent %u)\n", remote ? "remote" : "local", pr->id,

@@ -1152,32 +1152,107 @@ static bool is_page_queued(struct lazy_pages_info *lpi, unsigned long addr)
 
 static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 {
-	struct lazy_iov *iov;
+	struct lazy_iov *iov, *req_iov;
 	__u64 address;
 	int ret;
+	unsigned long fetch_start, fetch_end;
+	int nr_pages;
+	unsigned long ps = page_size();
 
 	/* Align requested address to the next page boundary */
-	address = msg->arg.pagefault.address & ~(page_size() - 1);
-	lp_debug(lpi, "#PF at 0x%llx\n", address);
+	address = msg->arg.pagefault.address & ~(ps - 1);
 
-	if (is_page_queued(lpi, address))
+	/* === Page fault handling START === */
+	lp_info(lpi, "=== PAGE FAULT at 0x%llx ===\n", address);
+
+	if (is_page_queued(lpi, address)) {
+		lp_debug(lpi, "Page 0x%llx already queued, skipping\n", address);
 		return 0;
+	}
 
+	/* Find IOV containing the fault address */
 	iov = find_iov(lpi, address);
-	if (!iov)
+	if (!iov) {
+		lp_debug(lpi, "No IOV found for 0x%llx -> zero page\n", address);
 		return uffd_zero(lpi, address, 1);
+	}
 
-	iov = extract_range(iov, address, address + PAGE_SIZE);
-	if (!iov)
+	/* === IOV-based semi-synchronous logic === */
+	if (opts.enable_object_storage && opts.lazy_pages) {
+		/* Fetch entire IOV instead of just single page */
+		fetch_start = iov->start;
+		fetch_end = iov->end;
+		nr_pages = (fetch_end - fetch_start) / ps;
+
+		lp_info(lpi, "Found IOV: [0x%lx - 0x%lx], img_start=0x%lx, size=%d pages\n",
+			iov->start, iov->end, iov->img_start, nr_pages);
+
+		/* Check buffer size */
+		if (nr_pages * ps > lpi->buf_size) {
+			lp_warn(lpi, "*** IOV too large (%d pages = %lu bytes), buffer size=%lu bytes ***\n",
+				nr_pages, nr_pages * ps, lpi->buf_size);
+			lp_warn(lpi, "*** Clamping to buffer size: %lu pages ***\n", lpi->buf_size / ps);
+			nr_pages = lpi->buf_size / ps;
+			fetch_end = fetch_start + nr_pages * ps;
+		}
+
+		lp_info(lpi, "Semi-sync: Extending to entire IOV -> %d pages [0x%lx - 0x%lx]\n",
+			nr_pages, fetch_start, fetch_end);
+
+		/* Extract IOV range */
+		req_iov = extract_range(iov, fetch_start, fetch_end);
+		if (!req_iov) {
+			lp_err(lpi, "!!! Failed to extract IOV range [0x%lx - 0x%lx] !!!\n",
+			       fetch_start, fetch_end);
+			return -1;
+		}
+
+		/* Sanity check */
+		if (req_iov->start != fetch_start || req_iov->end != fetch_end) {
+			lp_err(lpi, "!!! IOV mismatch: expected [0x%lx-0x%lx], got [0x%lx-0x%lx] !!!\n",
+			       fetch_start, fetch_end, req_iov->start, req_iov->end);
+			list_move_tail(&req_iov->l, &lpi->iovs);
+			return -1;
+		}
+
+		lp_debug(lpi, "Set req_iov img_start=0x%lx (orig iov img_start=0x%lx, offset=%lu)\n",
+			 req_iov->img_start, iov->img_start, fetch_start - iov->start);
+
+		/* Move to request queue */
+		list_move(&req_iov->l, &lpi->reqs);
+		update_xfer_len(lpi, true);
+
+		/* Fetch from object storage */
+		lp_info(lpi, ">>> Fetching %d pages from object storage <<<\n", nr_pages);
+		ret = uffd_handle_pages(lpi, fetch_start, nr_pages, PR_ASYNC | PR_ASAP);
+
+		if (ret < 0) {
+			lp_err(lpi, "!!! Fetch FAILED for [0x%lx - 0x%lx] !!!\n",
+			       fetch_start, fetch_end);
+			list_move(&req_iov->l, &lpi->iovs);
+			return -1;
+		}
+
+		lp_info(lpi, "=== PAGE FAULT HANDLED successfully ===\n");
+		return 0;
+	}
+
+	/* === Original single-page logic (non-object-storage) === */
+	lp_debug(lpi, "Using single-page mode for 0x%llx\n", address);
+
+	iov = extract_range(iov, address, address + ps);
+	if (!iov) {
+		lp_err(lpi, "Failed to extract single page range\n");
 		return -1;
+	}
 
 	list_move(&iov->l, &lpi->reqs);
-
 	update_xfer_len(lpi, true);
 
 	ret = uffd_handle_pages(lpi, iov->img_start, 1, PR_ASYNC | PR_ASAP);
 	if (ret < 0) {
-		lp_err(lpi, "Error during regular page copy\n");
+		lp_err(lpi, "Error during single page copy\n");
+		list_move(&iov->l, &lpi->iovs);
 		return -1;
 	}
 

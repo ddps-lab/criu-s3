@@ -431,6 +431,16 @@ void init_opts(void)
 	opts.file_validation_method = FILE_VALIDATION_DEFAULT;
 	opts.network_lock_method = NETWORK_LOCK_DEFAULT;
 	opts.ghost_fiemap = FIEMAP_DEFAULT;
+
+	/* Initialize Object Storage options */
+	opts.enable_object_storage = false;
+	opts.object_storage_endpoint_url = NULL;
+	opts.object_storage_bucket = NULL;
+	opts.object_storage_object_prefix = NULL;
+	opts.express_one_zone = false;
+	opts.aws_access_key = NULL;
+	opts.aws_secret_key = NULL;
+	opts.aws_region = NULL;
 }
 
 bool deprecated_ok(char *what)
@@ -703,6 +713,14 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		BOOL_OPT("mntns-compat-mode", &opts.mntns_compat_mode),
 		BOOL_OPT("unprivileged", &opts.unprivileged),
 		BOOL_OPT("ghost-fiemap", &opts.ghost_fiemap),
+		{ "enable-object-storage", no_argument, NULL, 1101 },
+		{ "object-storage-endpoint-url", required_argument, 0, 1102 },
+		{ "object-storage-bucket", required_argument, 0, 1103 },
+		{ "object-storage-object-prefix", required_argument, 0, 1104 },
+		{ "express-one-zone", no_argument, NULL, 1105 },
+		{ "aws-access-key", required_argument, 0, 1106 },
+		{ "aws-secret-key", required_argument, 0, 1107 },
+		{ "aws-region", required_argument, 0, 1108 },
 		{},
 	};
 
@@ -1051,6 +1069,30 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		case 'h':
 			*usage_error = false;
 			return 2;
+		case 1101:
+			opts.enable_object_storage = true;
+			break;
+		case 1102:
+			SET_CHAR_OPTS(object_storage_endpoint_url, optarg);
+			break;
+		case 1103:
+			SET_CHAR_OPTS(object_storage_bucket, optarg);
+			break;
+		case 1104:
+			SET_CHAR_OPTS(object_storage_object_prefix, optarg);
+			break;
+		case 1105:
+			opts.express_one_zone = true;
+			break;
+		case 1106:
+			SET_CHAR_OPTS(aws_access_key, optarg);
+			break;
+		case 1107:
+			SET_CHAR_OPTS(aws_secret_key, optarg);
+			break;
+		case 1108:
+			SET_CHAR_OPTS(aws_region, optarg);
+			break;
 		default:
 			return 2;
 		}
@@ -1059,6 +1101,20 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 	if (has_network_lock_opt && !strcmp(argv[optind], "restore")) {
 		pr_warn("--network-lock will be ignored in restore command\n");
 		pr_info("Network lock method from dump will be used in restore\n");
+	}
+
+	if (opts.enable_object_storage) {
+		pr_info("Object Storage Enabled\n");
+		pr_info("  Endpoint URL: %s\n", opts.object_storage_endpoint_url ? opts.object_storage_endpoint_url : "(not set)");
+		pr_info("  Bucket: %s\n", opts.object_storage_bucket ? opts.object_storage_bucket : "(not set)");
+		pr_info("  Object Prefix: %s\n", opts.object_storage_object_prefix ? opts.object_storage_object_prefix : "(not set)");
+	}
+
+	if (opts.express_one_zone) {
+		pr_info("S3 Express One Zone Enabled\n");
+		pr_info("  AWS Region: %s\n", opts.aws_region ? opts.aws_region : "(not set)");
+		pr_info("  AWS Access Key: %s\n", opts.aws_access_key ? "(set)" : "(not set)");
+		pr_info("  AWS Secret Key: %s\n", opts.aws_secret_key ? "(set)" : "(not set)");
 	}
 
 	return 0;
