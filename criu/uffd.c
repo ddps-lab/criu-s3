@@ -41,6 +41,8 @@
 #include "fdstore.h"
 #include "util.h"
 #include "namespaces.h"
+#include "page-cache.h"
+#include "prefetch.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
@@ -785,6 +787,53 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 
 	lp_debug(lpi, "Found %ld pages to be handled by UFFD\n", lpi->total_pages);
 
+	/* Initialize IOV metadata for async prefetch */
+	if (opts.async_prefetch) {
+		struct lazy_iov *iov;
+		struct iov_info *iov_array;
+		int num_iovs = 0;
+		int i = 0;
+
+		/* Count IOVs */
+		list_for_each_entry(iov, &lpi->iovs, l)
+			num_iovs++;
+
+		/* Allocate IOV array for metadata initialization */
+		iov_array = xzalloc(sizeof(struct iov_info) * num_iovs);
+		if (!iov_array) {
+			lp_err(lpi, "Failed to allocate IOV array for prefetch\n");
+			goto out;
+		}
+
+		/* Copy IOV data to array and calculate actual file offsets */
+		list_for_each_entry(iov, &lpi->iovs, l) {
+			iov_array[i].iov_start = iov->start;
+			iov_array[i].iov_end = iov->end;
+
+			/* Calculate actual file offset using seek_pagemap */
+			lpi->pr.reset(&lpi->pr);
+			if (lpi->pr.seek_pagemap(&lpi->pr, iov->img_start) > 0) {
+				iov_array[i].file_offset = lpi->pr.pi_off;
+			} else {
+				lp_err(lpi, "Failed to seek pagemap for IOV at vaddr 0x%lx\n",
+				       iov->img_start);
+				iov_array[i].file_offset = 0;
+			}
+			i++;
+		}
+
+		/* Initialize prefetch IOV metadata */
+		ret = prefetch_init_iovs(lpi, lpi->pr.pages_img_id, iov_array, num_iovs);
+		xfree(iov_array);
+
+		if (ret < 0) {
+			lp_err(lpi, "Failed to initialize prefetch IOV metadata\n");
+			goto out;
+		}
+
+		lp_debug(lpi, "Initialized prefetch metadata for %d IOVs\n", num_iovs);
+	}
+
 	list_add_tail(&lpi->l, &lpis);
 	*_lpi = lpi;
 
@@ -856,6 +905,27 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, int *nr_pages)
 	uffdio_copy.copy = 0;
 
 	lp_debug(lpi, "uffd_copy: 0x%llx/%ld\n", uffdio_copy.dst, len);
+	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) &&
+	    uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
+		return -1;
+
+	lpi->copied_pages += *nr_pages;
+
+	return 0;
+}
+
+static int uffd_copy_from_buf(struct lazy_pages_info *lpi, __u64 address, int *nr_pages, void *src_buf)
+{
+	struct uffdio_copy uffdio_copy;
+	unsigned long len = *nr_pages * page_size();
+
+	uffdio_copy.dst = address;
+	uffdio_copy.src = (unsigned long)src_buf;
+	uffdio_copy.len = len;
+	uffdio_copy.mode = 0;
+	uffdio_copy.copy = 0;
+
+	lp_debug(lpi, "uffd_copy_from_buf: 0x%llx/%ld from %p\n", uffdio_copy.dst, len, src_buf);
 	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) &&
 	    uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
 		return -1;
@@ -1150,6 +1220,37 @@ static bool is_page_queued(struct lazy_pages_info *lpi, unsigned long addr)
 	return false;
 }
 
+/* Get IOV index by searching for IOV that contains the address */
+static int get_iov_index_by_addr(struct lazy_pages_info *lpi, unsigned long addr)
+{
+	struct lazy_iov *iov;
+	int index = 0;
+
+	/* Search in iovs list */
+	list_for_each_entry(iov, &lpi->iovs, l) {
+		if (addr >= iov->start && addr < iov->end)
+			return index;
+		index++;
+	}
+
+	/* Search in reqs list - but use original img_start for index calculation */
+	list_for_each_entry(iov, &lpi->reqs, l) {
+		if (addr >= iov->start && addr < iov->end) {
+			/* Find matching IOV in original list by img_start */
+			int idx = 0;
+			struct lazy_iov *orig_iov;
+			list_for_each_entry(orig_iov, &lpi->iovs, l) {
+				if (orig_iov->img_start == iov->img_start)
+					return idx;
+				idx++;
+			}
+			return -1;
+		}
+	}
+
+	return -1;
+}
+
 static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 {
 	struct lazy_iov *iov, *req_iov;
@@ -1179,6 +1280,10 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 	/* === IOV-based semi-synchronous logic === */
 	if (opts.enable_object_storage && opts.lazy_pages) {
+		void *cached_data = NULL;
+		enum cache_result cache_result = CACHE_MISS;
+		int iov_index = -1;
+
 		/* Fetch entire IOV instead of just single page */
 		fetch_start = iov->start;
 		fetch_end = iov->end;
@@ -1196,7 +1301,46 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			fetch_end = fetch_start + nr_pages * ps;
 		}
 
-		lp_info(lpi, "Semi-sync: Extending to entire IOV -> %d pages [0x%lx - 0x%lx]\n",
+		/* Try cache lookup if async prefetch is enabled */
+		if (opts.async_prefetch) {
+			cache_result = cache_lookup_iov(fetch_start, fetch_end, &cached_data);
+			iov_index = get_iov_index_by_addr(lpi, address);
+		}
+
+		/* Cache HIT - restore directly from cache */
+		if (cache_result == CACHE_HIT) {
+			size_t cache_size = fetch_end - fetch_start;
+
+			lp_info(lpi, "CACHE HIT: IOV [0x%lx-0x%lx] (%zu bytes)\n",
+				fetch_start, fetch_end, cache_size);
+
+			/* Restore pages directly from cache buffer */
+			ret = uffd_copy_from_buf(lpi, fetch_start, &nr_pages, cached_data);
+
+			/* Free the copied cache data */
+			xfree(cached_data);
+
+			if (ret < 0) {
+				lp_err(lpi, "uffd_copy_from_buf failed for cached IOV\n");
+				return -1;
+			}
+
+			/* Mark IOV as restored in cache (will be removed) */
+			cache_mark_restored(fetch_start, fetch_end);
+
+			/* Trigger prefetch strategies */
+			if (opts.async_prefetch && iov_index >= 0) {
+				lp_debug(lpi, "Triggering prefetch for IOV index %d\n", iov_index);
+				prefetch_on_fault(lpi, iov_index);
+			}
+
+			lp_info(lpi, "=== PAGE FAULT SERVED from CACHE (prefetched) ===\n");
+			return 0;
+		}
+
+		/* Cache MISS - fetch from S3 */
+		lp_info(lpi, "Semi-sync: %s - Fetching %d pages [0x%lx - 0x%lx]\n",
+			cache_result == CACHE_MISS ? "CACHE MISS" : "No cache",
 			nr_pages, fetch_start, fetch_end);
 
 		/* Extract IOV range */
@@ -1233,7 +1377,13 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			return -1;
 		}
 
-		lp_info(lpi, "=== PAGE FAULT HANDLED successfully ===\n");
+		/* Trigger prefetch strategies */
+		if (opts.async_prefetch && iov_index >= 0) {
+			lp_debug(lpi, "Triggering prefetch for IOV index %d\n", iov_index);
+			prefetch_on_fault(lpi, iov_index);
+		}
+
+		lp_info(lpi, "=== PAGE FAULT SERVED from S3 (on-demand) ===\n");
 		return 0;
 	}
 
@@ -1521,6 +1671,29 @@ int cr_lazy_pages(bool daemon)
 	if (status_ready())
 		return -1;
 
+	/* Initialize async prefetch system if enabled */
+	if (opts.async_prefetch) {
+		int num_workers = opts.prefetch_workers > 0 ? opts.prefetch_workers : 4;
+		unsigned long cache_limit = opts.cache_limit_mb;
+
+		/* Initialize page cache */
+		ret = cache_init(cache_limit);
+		if (ret < 0) {
+			pr_err("Failed to initialize page cache\n");
+			return -1;
+		}
+
+		/* Initialize prefetch system */
+		ret = prefetch_init(num_workers);
+		if (ret < 0) {
+			pr_err("Failed to initialize prefetch system\n");
+			cache_cleanup();
+			return -1;
+		}
+
+		pr_info("Async prefetch initialized: %d workers, cache limit %lu MB\n", num_workers, cache_limit);
+	}
+
 	/*
 	 * we poll nr_tasks userfault fds, UNIX socket between lazy-pages
 	 * daemon and the cr-restore, and, optionally TCP socket for
@@ -1528,8 +1701,13 @@ int cr_lazy_pages(bool daemon)
 	 */
 	nr_fds = task_entries->nr_tasks + (opts.use_page_server ? 2 : 1);
 	epollfd = epoll_prepare(nr_fds, &events);
-	if (epollfd < 0)
+	if (epollfd < 0) {
+		if (opts.async_prefetch) {
+			prefetch_cleanup();
+			cache_cleanup();
+		}
 		return -1;
+	}
 
 	if (prepare_uffds(lazy_sk, epollfd)) {
 		xfree(events);
@@ -1546,6 +1724,26 @@ int cr_lazy_pages(bool daemon)
 	ret = handle_requests(epollfd, &events, nr_fds);
 
 	disconnect_from_page_server();
+
+	/* Cleanup async prefetch system if enabled */
+	if (opts.async_prefetch) {
+		struct cache_stats cache_stats;
+		struct prefetch_stats prefetch_stats;
+
+		/* Get and print statistics */
+		cache_get_stats(&cache_stats);
+		prefetch_get_stats(&prefetch_stats);
+
+		pr_info("Cache stats: lookups=%lu hits=%lu misses=%lu hit_rate=%.1f%%\n", cache_stats.lookups,
+			cache_stats.hits, cache_stats.misses,
+			cache_stats.lookups > 0 ? (100.0 * cache_stats.hits / cache_stats.lookups) : 0.0);
+
+		pr_info("Prefetch stats: total=%lu completed=%lu failed=%lu bytes=%lu\n", prefetch_stats.total_requests,
+			prefetch_stats.completed, prefetch_stats.failed, prefetch_stats.bytes_prefetched);
+
+		prefetch_cleanup();
+		cache_cleanup();
+	}
 
 	xfree(events);
 	return ret;

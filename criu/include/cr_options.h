@@ -257,6 +257,11 @@ struct cr_options {
 	char *aws_access_key;
 	char *aws_secret_key;
 	char *aws_region;
+
+	/* Async prefetch options */
+	bool async_prefetch;
+	int prefetch_workers;
+	unsigned long cache_limit_mb;
 };
 
 extern struct cr_options opts;

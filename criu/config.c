@@ -441,6 +441,11 @@ void init_opts(void)
 	opts.aws_access_key = NULL;
 	opts.aws_secret_key = NULL;
 	opts.aws_region = NULL;
+
+	/* Initialize Async Prefetch options */
+	opts.async_prefetch = false;
+	opts.prefetch_workers = 4;		/* Default 4 workers */
+	opts.cache_limit_mb = 0;		/* Default unlimited */
 }
 
 bool deprecated_ok(char *what)
@@ -721,6 +726,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "aws-access-key", required_argument, 0, 1106 },
 		{ "aws-secret-key", required_argument, 0, 1107 },
 		{ "aws-region", required_argument, 0, 1108 },
+		{ "async-prefetch", no_argument, NULL, 1109 },
+		{ "prefetch-workers", required_argument, 0, 1110 },
+		{ "cache-limit", required_argument, 0, 1111 },
 		{},
 	};
 
@@ -1093,6 +1101,19 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		case 1108:
 			SET_CHAR_OPTS(aws_region, optarg);
 			break;
+		case 1109:
+			opts.async_prefetch = true;
+			break;
+		case 1110:
+			opts.prefetch_workers = atoi(optarg);
+			if (opts.prefetch_workers <= 0) {
+				pr_err("Invalid prefetch workers: %s (must be > 0)\n", optarg);
+				return 1;
+			}
+			break;
+		case 1111:
+			opts.cache_limit_mb = strtoul(optarg, NULL, 10);
+			break;
 		default:
 			return 2;
 		}
@@ -1115,6 +1136,12 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		pr_info("  AWS Region: %s\n", opts.aws_region ? opts.aws_region : "(not set)");
 		pr_info("  AWS Access Key: %s\n", opts.aws_access_key ? "(set)" : "(not set)");
 		pr_info("  AWS Secret Key: %s\n", opts.aws_secret_key ? "(set)" : "(not set)");
+	}
+
+	if (opts.async_prefetch) {
+		pr_info("Async Prefetch Enabled\n");
+		pr_info("  Prefetch Workers: %d\n", opts.prefetch_workers);
+		pr_info("  Cache Limit: %lu MB %s\n", opts.cache_limit_mb, opts.cache_limit_mb == 0 ? "(unlimited)" : "");
 	}
 
 	return 0;
