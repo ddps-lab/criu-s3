@@ -32,6 +32,13 @@ void cache_cleanup(void);
 /* Lookup IOV in cache - returns CACHE_HIT if exact match found
  * On CACHE_HIT: allocates memory and copies data to *data_out. Caller must free.
  * On CACHE_MISS: *data_out is not modified
+ *
+ * This is for page fault handlers - updates statistics (lookups, hits, misses)
+ */
+enum cache_result cache_lookup_iov_for_fault(unsigned long iov_start, unsigned long iov_end, void **data_out);
+
+/* Internal cache lookup without statistics update
+ * Used by prefetch workers to avoid polluting page fault cache hit rate statistics
  */
 enum cache_result cache_lookup_iov(unsigned long iov_start, unsigned long iov_end, void **data_out);
 

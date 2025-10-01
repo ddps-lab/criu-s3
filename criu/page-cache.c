@@ -185,7 +185,8 @@ void cache_cleanup(void)
 		cache_state.stats.stores);
 }
 
-enum cache_result cache_lookup_iov(unsigned long iov_start, unsigned long iov_end, void **data_out)
+/* Internal lookup with statistics - for page fault handlers */
+enum cache_result cache_lookup_iov_for_fault(unsigned long iov_start, unsigned long iov_end, void **data_out)
 {
 	struct cache_entry *entry;
 	enum cache_result result = CACHE_MISS;
@@ -219,6 +220,46 @@ enum cache_result cache_lookup_iov(unsigned long iov_start, unsigned long iov_en
 		result = CACHE_MISS;
 
 		pr_debug("Cache MISS: IOV [0x%lx-0x%lx]\n", iov_start, iov_end);
+	}
+
+	pthread_mutex_unlock(&cache_state.lock);
+
+	return result;
+}
+
+/* Internal lookup without statistics - for prefetch workers */
+enum cache_result cache_lookup_iov(unsigned long iov_start, unsigned long iov_end, void **data_out)
+{
+	struct cache_entry *entry;
+	enum cache_result result = CACHE_MISS;
+
+	if (!cache_state.initialized)
+		return CACHE_MISS;
+
+	pthread_mutex_lock(&cache_state.lock);
+
+	/* No statistics update for prefetch worker lookups */
+
+	entry = cache_lookup_internal(iov_start);
+
+	if (entry && entry->iov_start == iov_start && entry->iov_end == iov_end) {
+		/* Exact match - allocate and copy data to avoid use-after-free */
+		void *data_copy = xmalloc(entry->data_size);
+		if (!data_copy) {
+			pr_err("Failed to allocate memory for cache data copy\n");
+			pthread_mutex_unlock(&cache_state.lock);
+			return CACHE_MISS;
+		}
+
+		memcpy(data_copy, entry->data, entry->data_size);
+		*data_out = data_copy;
+		result = CACHE_HIT;
+
+		pr_debug("Cache HIT (no stats): IOV [0x%lx-0x%lx] (%zu bytes)\n", iov_start, iov_end, entry->data_size);
+	} else {
+		result = CACHE_MISS;
+
+		pr_debug("Cache MISS (no stats): IOV [0x%lx-0x%lx]\n", iov_start, iov_end);
 	}
 
 	pthread_mutex_unlock(&cache_state.lock);

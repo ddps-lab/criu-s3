@@ -1303,7 +1303,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 		/* Try cache lookup if async prefetch is enabled */
 		if (opts.async_prefetch) {
-			cache_result = cache_lookup_iov(fetch_start, fetch_end, &cached_data);
+			cache_result = cache_lookup_iov_for_fault(fetch_start, fetch_end, &cached_data);
 			iov_index = get_iov_index_by_addr(lpi, address);
 		}
 
