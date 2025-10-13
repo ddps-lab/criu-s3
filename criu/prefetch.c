@@ -37,8 +37,8 @@
 #define PATTERN_HISTORY_SIZE 32
 #define PATTERN_ANALYSIS_WINDOW 16
 #define ADAPTATION_INTERVAL 100
-#define DEFAULT_AHEAD_IOVS 8
-#define DEFAULT_BACKGROUND_IOVS 32
+#define DEFAULT_AHEAD_IOVS 32  /* Coverage-first: ahead determines hit potential */
+#define DEFAULT_BACKGROUND_IOVS 0  /* Sequential workload: focus on ahead, disable background */
 #define MIN_AHEAD_IOVS 4
 #define MAX_AHEAD_IOVS 64
 #define MIN_BACKGROUND_IOVS 0
@@ -71,6 +71,7 @@ struct iov_meta {
 	bool in_cache;       /* Currently in cache */
 	bool prefetching;    /* Currently being prefetched */
 	bool restored;       /* Has been restored to process */
+	bool queued;         /* Currently in prefetch queue */
 
 	int iov_index;       /* Index in IOV array */
 	struct rb_node node; /* Red-black tree node */
@@ -141,6 +142,35 @@ static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Saved lpi pointer for strategies */
 static void *global_lpi = NULL;
 static unsigned int global_pages_img_id = 0;  /* For object storage fetch */
+
+/* ========== Controller Infrastructure ========== */
+
+#include "hash-table.h"
+
+/* Hash table for O(1) IOV index -> request lookup */
+static struct hash_table request_hash_table;
+
+/* Controller statistics */
+struct controller_stats {
+	unsigned long faults_processed;
+	unsigned long queue_removes;
+	unsigned long priority_promotions;
+	unsigned long obsolete_prevented;  /* Removed before worker fetched */
+	unsigned long proximity_removed;   /* Removed due to proximity to fault */
+};
+static struct controller_stats controller_stats;
+static pthread_mutex_t controller_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Proximity-based removal configuration (base values for adaptive calculation) */
+#define PROXIMITY_WINDOW_DEFAULT 8
+#define PROXIMITY_WINDOW_SEQUENTIAL 8  /* Base value for formula-based scaling */
+#define PROXIMITY_WINDOW_RANDOM 4
+
+/* Adaptive queue management */
+#define TARGET_QUEUE_SIZE 64  /* Target queue size for steady state */
+#define BASE_PROMOTION_DISTANCE 64  /* Base promotion distance */
+
+static int proximity_window = PROXIMITY_WINDOW_DEFAULT;
 
 /* ========== IOV Metadata Functions (Phase 2) ========== */
 
@@ -228,6 +258,7 @@ int prefetch_init_iovs(void *lpi, unsigned int pages_img_id, struct iov_info *io
 	/* Create metadata for each IOV */
 	for (i = 0; i < num_iovs; i++) {
 		struct iov_meta *meta = xzalloc(sizeof(struct iov_meta));
+		unsigned long size;
 		if (!meta) {
 			pr_err("Failed to allocate IOV metadata for index %d\n", i);
 			pthread_mutex_unlock(&iov_meta_lock);
@@ -244,6 +275,13 @@ int prefetch_init_iovs(void *lpi, unsigned int pages_img_id, struct iov_info *io
 		meta->restored = false;
 		meta->iov_index = i;
 
+		/* Log IOV info for debugging (especially large IOVs) */
+		size = meta->iov_end - meta->iov_start;
+		if (size >= 4 * 1024 * 1024 || (i >= 190 && i <= 195)) {
+			pr_info("IOV[%d]: [0x%lx-0x%lx] size=%lu KB\n",
+				i, meta->iov_start, meta->iov_end, size / 1024);
+		}
+
 		/* Insert into RB-tree */
 		if (iov_meta_insert(meta) < 0) {
 			xfree(meta);
@@ -259,6 +297,15 @@ int prefetch_init_iovs(void *lpi, unsigned int pages_img_id, struct iov_info *io
 	pthread_mutex_unlock(&iov_meta_lock);
 
 	pr_debug("IOV metadata initialized: %d IOVs\n", num_iovs);
+
+	/* Initialize hash table */
+	hash_table_init(&request_hash_table);
+
+	/* Initialize controller stats */
+	memset(&controller_stats, 0, sizeof(controller_stats));
+
+	pr_info("CONTROLLER: Hash table initialized\n");
+
 	return 0;
 }
 
@@ -330,6 +377,24 @@ void iov_meta_mark_restored(unsigned long iov_start)
 	pthread_mutex_unlock(&iov_meta_lock);
 }
 
+/* Get IOV index by address (searches RB-tree) */
+int iov_meta_get_index_by_addr(unsigned long addr)
+{
+	struct iov_meta *meta;
+	int index = -1;
+
+	pthread_mutex_lock(&iov_meta_lock);
+
+	/* Search for IOV containing this address */
+	meta = iov_meta_search(addr);
+	if (meta)
+		index = meta->iov_index;
+
+	pthread_mutex_unlock(&iov_meta_lock);
+
+	return index;
+}
+
 /* ========== Pattern Detection (Phase 3) ========== */
 
 /* Add IOV index to access history */
@@ -361,6 +426,8 @@ static struct pattern_info detect_pattern(void)
 	int start;
 	int i;
 	int sequential_count;
+	int consecutive_seq;
+	int max_consecutive;
 	float seq_ratio;
 	int backward_count;
 	float back_ratio;
@@ -383,15 +450,31 @@ static struct pattern_info detect_pattern(void)
 
 	pthread_mutex_unlock(&history_lock);
 
-	/* Analyze for sequential pattern */
+	/* Analyze for sequential pattern with enhanced detection */
 	sequential_count = 0;
+	consecutive_seq = 0;  /* Count consecutive sequential accesses */
+	max_consecutive = 0;
+
 	for (i = 1; i < window_size; i++) {
-		if (indices[i] == indices[i-1] + 1)
+		if (indices[i] == indices[i-1] + 1) {
 			sequential_count++;
+			consecutive_seq++;
+			if (consecutive_seq > max_consecutive)
+				max_consecutive = consecutive_seq;
+		} else {
+			consecutive_seq = 0;
+		}
 	}
 
 	seq_ratio = (float)sequential_count / (window_size - 1);
-	if (seq_ratio > 0.7) {
+
+	/* Enhanced confidence: boost if we have long consecutive runs */
+	if (max_consecutive >= 3) {
+		/* Strong sequential pattern: 3+ consecutive accesses */
+		info.type = PATTERN_SEQUENTIAL;
+		info.confidence = 0.95;  /* High confidence for consecutive pattern */
+		return info;
+	} else if (seq_ratio > 0.7) {
 		info.type = PATTERN_SEQUENTIAL;
 		info.confidence = seq_ratio;
 		return info;
@@ -457,7 +540,7 @@ static struct pattern_info detect_pattern(void)
 /* ========== Adaptive Configuration (Phase 3) ========== */
 
 /* Adapt configuration based on performance metrics */
-static void adapt_config(void)
+static void __attribute__((unused)) adapt_config(void)
 {
 	struct cache_stats cache_stats;
 
@@ -511,7 +594,7 @@ static void adapt_config(void)
 /* ========== Prefetch Strategies (Phase 4) ========== */
 
 /* Pattern-based prefetch strategy */
-static int prefetch_pattern_based(void *lpi, int current_iov_index)
+static int __attribute__((unused)) prefetch_pattern_based(void *lpi, int current_iov_index)
 {
 	struct pattern_info pattern;
 	int queued;
@@ -569,7 +652,7 @@ static int prefetch_pattern_based(void *lpi, int current_iov_index)
 }
 
 /* Ahead-of-fault prefetch strategy */
-static int prefetch_ahead_of_fault(void *lpi, int current_iov_index)
+static int __attribute__((unused)) prefetch_ahead_of_fault(void *lpi, int current_iov_index)
 {
 	int queued;
 	int ahead_count;
@@ -584,6 +667,7 @@ static int prefetch_ahead_of_fault(void *lpi, int current_iov_index)
 	for (i = 1; i <= ahead_count; i++) {
 		int target_index;
 		struct iov_meta *meta;
+		unsigned long iov_size;
 
 		target_index = current_iov_index + i;
 
@@ -592,6 +676,11 @@ static int prefetch_ahead_of_fault(void *lpi, int current_iov_index)
 
 		meta = iov_meta_get_by_index(target_index);
 		if (!meta || meta->restored || meta->prefetching)
+			continue;
+
+		/* Skip small IOVs (< 256KB) - not worth prefetching */
+		iov_size = meta->iov_end - meta->iov_start;
+		if (iov_size < (256 * 1024))
 			continue;
 
 		/* Queue for prefetch */
@@ -610,7 +699,7 @@ static int prefetch_ahead_of_fault(void *lpi, int current_iov_index)
 }
 
 /* Background unrestored prefetch strategy */
-static int prefetch_background_unrestored(void *lpi)
+static int __attribute__((unused)) prefetch_background_unrestored(void *lpi)
 {
 	int queued;
 	int background_count;
@@ -630,8 +719,14 @@ static int prefetch_background_unrestored(void *lpi)
 
 	for (i = 0; i < total_iovs && queued < background_count; i++) {
 		struct iov_meta *meta = iov_index_map[i];
+		unsigned long iov_size;
 
 		if (!meta || meta->restored || meta->prefetching || meta->has_fault)
+			continue;
+
+		/* Skip small IOVs (< 256KB) - not worth prefetching */
+		iov_size = meta->iov_end - meta->iov_start;
+		if (iov_size < (256 * 1024))
 			continue;
 
 		/* Queue for background prefetch */
@@ -693,7 +788,6 @@ static void *prefetch_worker(void *arg)
 		struct iov_meta *meta;
 		unsigned long size;
 		void *data;
-		void *cached_data;
 		int ret;
 		struct timespec ts;
 
@@ -728,28 +822,28 @@ static void *prefetch_worker(void *arg)
 		if (!req)
 			continue;
 
-		/* Check if already cached after dequeue (another worker may have cached it) */
-		cached_data = NULL;
-		if (cache_lookup_iov(req->iov_start, req->iov_end, &cached_data) == CACHE_HIT) {
-			pr_debug("PREFETCH: Worker %d: IOV [0x%lx-0x%lx] already cached by another worker, skipping\n",
-				 worker_id, req->iov_start, req->iov_end);
-			xfree(cached_data);
-			xfree(req);
-			continue;
-		}
+		/* Remove from hash table (controller uses hash for O(1) lookup) */
+		pthread_mutex_lock(&queue_lock);
+		hash_table_remove(&request_hash_table, req->iov_index);
+		pthread_mutex_unlock(&queue_lock);
 
-		/* Check if already being processed by another worker */
+		/* Check metadata */
 		pthread_mutex_lock(&iov_meta_lock);
 		meta = iov_meta_search(req->iov_start);
-		if (meta && (meta->in_cache || meta->prefetching)) {
-			pthread_mutex_unlock(&iov_meta_lock);
-			pr_debug("PREFETCH: Worker %d: IOV [0x%lx-0x%lx] already being processed, skipping\n",
-				 worker_id, req->iov_start, req->iov_end);
-			xfree(req);
-			continue;
-		}
-		if (meta)
+
+		if (meta) {
+			/* Skip if already in cache */
+			if (meta->in_cache) {
+				pthread_mutex_unlock(&iov_meta_lock);
+				pr_debug("PREFETCH: Worker %d: IOV[%d] already in cache, skipping\n",
+					 worker_id, req->iov_index);
+				xfree(req);
+				continue;
+			}
+
+			/* Set prefetching flag */
 			meta->prefetching = true;
+		}
 		pthread_mutex_unlock(&iov_meta_lock);
 
 		pr_debug("PREFETCH: Worker %d processing IOV [0x%lx-0x%lx] priority=%d\n",
@@ -954,7 +1048,92 @@ void prefetch_cleanup(void)
 
 	pthread_mutex_unlock(&iov_meta_lock);
 
+	/* Cleanup hash table */
+	hash_table_cleanup(&request_hash_table);
+
+	/* Print controller stats */
+	pthread_mutex_lock(&controller_stats_lock);
+	pr_info("CONTROLLER Stats: faults=%lu removes=%lu promotes=%lu obsolete_prevented=%lu proximity_removed=%lu\n",
+		controller_stats.faults_processed,
+		controller_stats.queue_removes,
+		controller_stats.priority_promotions,
+		controller_stats.obsolete_prevented,
+		controller_stats.proximity_removed);
+	pthread_mutex_unlock(&controller_stats_lock);
+
 	pr_info("Prefetch system cleaned up\n");
+}
+
+/* Pre-queue all IOVs for controller-based prefetch */
+int prefetch_prequeue_all_iovs(void *lpi, unsigned int pages_img_id)
+{
+	int i, queued = 0;
+
+	if (!global_lpi || !iov_index_map) {
+		pr_err("CONTROLLER: Cannot pre-queue - IOV metadata not initialized\n");
+		return -EINVAL;
+	}
+
+	pr_info("CONTROLLER: Pre-queueing all IOVs (total: %d)\n", total_iovs);
+
+	pthread_mutex_lock(&queue_lock);
+
+	for (i = 0; i < total_iovs; i++) {
+		struct iov_meta *meta = iov_index_map[i];
+		struct prefetch_request *req;
+		unsigned long size;
+		int initial_priority;
+
+		if (!meta)
+			continue;
+
+		/* Filter small IOVs (< 256KB) */
+		size = meta->iov_end - meta->iov_start;
+		if (size < 256 * 1024)
+			continue;
+
+		/* Create prefetch request */
+		req = xzalloc(sizeof(*req));
+		if (!req) {
+			pr_warn("CONTROLLER: Failed to allocate request for IOV[%d]\n", i);
+			continue;
+		}
+
+		req->lpi = lpi;
+		req->iov_start = meta->iov_start;
+		req->iov_end = meta->iov_end;
+		req->file_offset = meta->file_offset;
+		req->pages_img_id = pages_img_id;
+		req->iov_index = i;
+
+		/* Initial priority: First 32 = MEDIUM (50), rest = LOW (20) */
+		if (i < 32) {
+			initial_priority = 50;  /* PRIORITY_MEDIUM */
+			list_add_tail(&req->list, &queue_medium);
+		} else {
+			initial_priority = 20;  /* PRIORITY_LOW */
+			list_add_tail(&req->list, &queue_low);
+		}
+
+		req->priority = initial_priority;
+
+		/* Add to hash table for O(1) lookup */
+		if (hash_table_insert(&request_hash_table, i, req) < 0) {
+			pr_warn("CONTROLLER: Failed to insert IOV[%d] into hash table\n", i);
+			list_del(&req->list);
+			xfree(req);
+			continue;
+		}
+
+		queued++;
+	}
+
+	pthread_mutex_unlock(&queue_lock);
+
+	pr_info("CONTROLLER: Pre-queued %d IOVs (filtered %d small IOVs)\n",
+		queued, total_iovs - queued);
+
+	return queued;
 }
 
 /* Queue IOV for prefetch */
@@ -963,19 +1142,42 @@ int prefetch_queue_iov(void *lpi, unsigned long iov_start, unsigned long iov_end
 {
 	struct prefetch_request *req;
 	struct list_head *target_queue;
+	struct iov_meta *meta;
 
-	/* Check if already in cache */
-	void *cached_data;
-	if (cache_lookup_iov(iov_start, iov_end, &cached_data) == CACHE_HIT) {
-		pr_debug("PREFETCH: IOV [0x%lx-0x%lx] already in cache, skipping queue\n", iov_start, iov_end);
-		xfree(cached_data);
-		return 0;
+	/* Aggressive duplicate filtering: each IOV should only be queued once */
+	meta = iov_meta_search(iov_start);
+	if (meta) {
+		pthread_mutex_lock(&iov_meta_lock);
+
+		/* Skip if already completed */
+		if (meta->in_cache || meta->restored) {
+			pthread_mutex_unlock(&iov_meta_lock);
+			return 0;
+		}
+
+		/* Skip if already being prefetched - no need to re-queue */
+		if (meta->prefetching) {
+			pthread_mutex_unlock(&iov_meta_lock);
+			return 0;
+		}
+
+		/* Mark as prefetching immediately at queue time to prevent duplicates */
+		/* This is the key: set flag BEFORE queueing to prevent race condition */
+		meta->prefetching = true;
+
+		pthread_mutex_unlock(&iov_meta_lock);
 	}
 
 	/* Create request */
 	req = xzalloc(sizeof(*req));
 	if (!req) {
 		pr_err("Failed to allocate prefetch request\n");
+		/* Rollback prefetching flag on allocation failure */
+		if (meta) {
+			pthread_mutex_lock(&iov_meta_lock);
+			meta->prefetching = false;
+			pthread_mutex_unlock(&iov_meta_lock);
+		}
 		return -ENOMEM;
 	}
 
@@ -1011,16 +1213,49 @@ int prefetch_queue_iov(void *lpi, unsigned long iov_start, unsigned long iov_end
 	return 0;
 }
 
-/* Trigger prefetch strategies on page fault */
+/* Helper: Promote IOV priority in queue - O(1) with hash table */
+static int promote_iov_priority(int iov_index, int new_priority)
+{
+	struct prefetch_request *req;
+
+	/* Lookup in hash table - O(1) */
+	req = hash_table_lookup(&request_hash_table, iov_index);
+
+	if (!req)
+		return -ENOENT;  /* Not in queue (already processed or filtered) */
+
+	if (req->priority >= new_priority)
+		return 0;  /* Already high priority */
+
+	/* Remove from current queue */
+	list_del(&req->list);
+
+	/* Update priority */
+	req->priority = new_priority;
+
+	/* Re-insert to appropriate queue */
+	if (new_priority >= 70) {
+		list_add_tail(&req->list, &queue_high);
+	} else if (new_priority >= 40) {
+		list_add_tail(&req->list, &queue_medium);
+	} else {
+		list_add_tail(&req->list, &queue_low);
+	}
+
+	return 0;
+}
+
+/* Controller: Trigger prefetch on page fault */
 void prefetch_on_fault(void *lpi, int iov_index)
 {
 	struct iov_meta *meta;
-	int queued;
+	struct pattern_info pattern;
+	int promote_count = 0;
+	int promote_distance = 0;
+	int current_queue_size;
+	int base_forward_window;
 
-	pr_debug("Page fault triggered for IOV index %d\n", iov_index);
-
-	/* Register/update IOV metadata if needed */
-	/* Note: In real implementation, we'd extract IOV details from lpi */
+	pr_debug("CONTROLLER: Page fault at IOV index %d\n", iov_index);
 
 	/* Update access history */
 	update_access_history(iov_index);
@@ -1033,27 +1268,245 @@ void prefetch_on_fault(void *lpi, int iov_index)
 		pthread_mutex_unlock(&iov_meta_lock);
 	}
 
-	/* Update fault count */
-	pthread_mutex_lock(&config_lock);
-	config.fault_count++;
-	pthread_mutex_unlock(&config_lock);
+	/* === CONTROLLER LOGIC === */
+	pthread_mutex_lock(&queue_lock);
 
-	/* Trigger all three strategies */
-	queued = 0;
+	/* 1. Remove faulted IOV from queue (already on-demand fetched) */
+	{
+		struct prefetch_request *faulted_req = hash_table_lookup(&request_hash_table, iov_index);
+		if (faulted_req) {
+			list_del(&faulted_req->list);
+			hash_table_remove(&request_hash_table, iov_index);
+			xfree(faulted_req);
 
-	/* 1. Pattern-based (highest priority) */
-	queued += prefetch_pattern_based(lpi, iov_index);
+			pthread_mutex_lock(&controller_stats_lock);
+			controller_stats.queue_removes++;
+			controller_stats.obsolete_prevented++;
+			pthread_mutex_unlock(&controller_stats_lock);
 
-	/* 2. Ahead-of-fault (medium priority) */
-	queued += prefetch_ahead_of_fault(lpi, iov_index);
+			pr_debug("CONTROLLER: Removed IOV[%d] from queue (on-demand fetched)\n", iov_index);
+		}
+	}
 
-	/* 3. Background unrestored (low priority) */
-	queued += prefetch_background_unrestored(lpi);
+	/* 2. Detect pattern */
+	pattern = detect_pattern();
 
-	pr_debug("Prefetch triggered: queued %d IOVs total\n", queued);
+	/* 2.1. Calculate current queue size for adaptive calculations */
+	current_queue_size = request_hash_table.count;
 
-	/* Adapt configuration periodically */
-	adapt_config();
+	/* 2.2. Formula-based adaptive proximity window calculation */
+	if (pattern.type == PATTERN_SEQUENTIAL) {
+		/* Sequential pattern: Use formula-based continuous scaling */
+		float queue_health;
+
+		/* Base window on confidence */
+		if (pattern.confidence > 0.8) {
+			base_forward_window = PROXIMITY_WINDOW_SEQUENTIAL;  /* 8 for strong sequential */
+		} else if (pattern.confidence > 0.5) {
+			base_forward_window = PROXIMITY_WINDOW_DEFAULT;  /* 8 for moderate sequential */
+		} else {
+			base_forward_window = 4;  /* 4 for weak sequential */
+		}
+
+		/* Formula: forward_window = base × queue_health_factor
+		 * queue_health = current_queue_size / TARGET_QUEUE_SIZE
+		 * Clamp to [0.25, 1.0] to keep window in [base/4, base] range
+		 */
+		queue_health = (float)current_queue_size / TARGET_QUEUE_SIZE;
+		if (queue_health < 0.25f)
+			queue_health = 0.25f;
+		if (queue_health > 1.0f)
+			queue_health = 1.0f;
+
+		/* Continuous scaling: 1 unit precision */
+		proximity_window = (int)(base_forward_window * queue_health);
+
+		/* Ensure minimum window */
+		if (proximity_window < 2)
+			proximity_window = 2;
+
+		/* Critical queue: disable removal */
+		if (current_queue_size < 16) {
+			proximity_window = 0;
+			pr_info("CONTROLLER: Queue critically low (%d IOVs), disabling proximity removal\n",
+				current_queue_size);
+		}
+	} else if (pattern.type == PATTERN_RANDOM) {
+		/* Random pattern: application may NOT access nearby IOVs */
+		proximity_window = 0;  /* No proximity removal for random access */
+	} else if (pattern.type == PATTERN_STRIDE) {
+		/* Stride pattern: only remove strided IOVs, not sequential */
+		proximity_window = 0;  /* Handle separately in stride promotion logic */
+	} else {
+		/* Unknown pattern: conservative removal */
+		proximity_window = PROXIMITY_WINDOW_RANDOM;  /* 4 as default conservative */
+	}
+
+	/* 2.3. Remove proximity IOVs from queue (only for sequential patterns) */
+	{
+		int proximity_removed_count = 0;
+		int backward_jump_detected = 0;
+		int backward_window = 0;
+
+		/* Detect backward jump: check if we jumped back significantly */
+		if (history_count >= 2) {
+			int prev_iov = access_history[(history_head - 1 + PATTERN_HISTORY_SIZE) % PATTERN_HISTORY_SIZE];
+			int delta = iov_index - prev_iov;
+
+			/* If we jumped backward by more than 8 IOVs, don't remove backward IOVs */
+			if (delta < -8) {
+				backward_jump_detected = 1;
+				pr_info("CONTROLLER: Backward jump detected: %d -> %d (delta=%d)\n",
+					 prev_iov, iov_index, delta);
+			}
+		}
+
+		/* Formula: backward_window = forward_window / 4
+		 * Backward jumps are rare (~0.5%), so conservative removal
+		 * Minimum: 1 IOV if forward >= 4
+		 */
+		if (proximity_window >= 4) {
+			backward_window = proximity_window / 4;
+			if (backward_window < 1)
+				backward_window = 1;  /* Ensure minimum 1 */
+		} else {
+			backward_window = 0;  /* No backward removal if forward < 4 */
+		}
+
+		/* Only remove if we have a predictable pattern */
+		if (proximity_window > 0) {
+			/* Forward removal */
+			for (int i = 1; i <= proximity_window; i++) {
+				int proximity_idx = iov_index + i;
+				struct prefetch_request *prox_req = hash_table_lookup(&request_hash_table, proximity_idx);
+				if (prox_req) {
+					list_del(&prox_req->list);
+					hash_table_remove(&request_hash_table, proximity_idx);
+					xfree(prox_req);
+					proximity_removed_count++;
+
+					pr_debug("CONTROLLER: Removed forward proximity IOV[%d] (window=%d)\n",
+						 proximity_idx, proximity_window);
+				}
+			}
+
+			/* Backward removal: smaller window, only if no backward jump detected */
+			if (!backward_jump_detected && backward_window > 0) {
+				for (int i = 1; i <= backward_window; i++) {
+					int proximity_idx = iov_index - i;
+					struct prefetch_request *prox_req = hash_table_lookup(&request_hash_table, proximity_idx);
+					if (prox_req) {
+						list_del(&prox_req->list);
+						hash_table_remove(&request_hash_table, proximity_idx);
+						xfree(prox_req);
+						proximity_removed_count++;
+
+						pr_debug("CONTROLLER: Removed backward proximity IOV[%d] (window=%d)\n",
+							 proximity_idx, backward_window);
+					}
+				}
+			} else if (backward_jump_detected) {
+				pr_info("CONTROLLER: Skipped backward removal due to backward jump (preserving IOVs for potential re-access)\n");
+			}
+		}
+
+		pthread_mutex_lock(&controller_stats_lock);
+		controller_stats.proximity_removed += proximity_removed_count;
+		pthread_mutex_unlock(&controller_stats_lock);
+
+		if (proximity_removed_count > 0) {
+			pr_debug("CONTROLLER: Removed %d proximity IOVs (fwd_win=%d, bwd_win=%d, queue=%d, pattern=%d, conf=%.2f, bwd_jump=%d)\n",
+				 proximity_removed_count, proximity_window, backward_window, current_queue_size,
+				 pattern.type, pattern.confidence, backward_jump_detected);
+		}
+	}
+
+	/* 3. Formula-based adaptive promotion distance */
+	switch (pattern.type) {
+	case PATTERN_SEQUENTIAL:
+		{
+			int queue_deficit;
+			int base_promote_distance;
+
+			/* Base distance on confidence */
+			if (pattern.confidence > 0.8) {
+				base_promote_distance = 64;  /* Strong sequential */
+			} else if (pattern.confidence > 0.6) {
+				base_promote_distance = 32;  /* Moderate sequential */
+			} else {
+				base_promote_distance = 16;   /* Weak sequential */
+			}
+
+			/* Formula: promote_distance = BASE + (queue_deficit / 2)
+			 * queue_deficit = max(0, TARGET - current)
+			 * Damping factor (/ 2) prevents over-promotion when queue is healthy
+			 * This provides gradual refill rather than aggressive promotion
+			 */
+			queue_deficit = TARGET_QUEUE_SIZE - current_queue_size;
+			if (queue_deficit < 0)
+				queue_deficit = 0;
+
+			/* Apply damping: half of deficit for gradual adjustment */
+			promote_distance = base_promote_distance + (queue_deficit / 2);
+
+			/* Cap maximum to avoid excessive promotion */
+			if (promote_distance > 128)
+				promote_distance = 128;
+
+			pr_debug("ADAPTIVE: queue=%d deficit=%d base_promote=%d final_promote=%d\n",
+				 current_queue_size, queue_deficit, base_promote_distance, promote_distance);
+
+			/* Promote IOVs AFTER proximity window to HIGH priority */
+			/* Workers should focus on IOVs that application won't access immediately */
+			for (int i = proximity_window + 1; i <= proximity_window + promote_distance; i++) {
+				if (promote_iov_priority(iov_index + i, 70) == 0) {
+					promote_count++;
+				}
+			}
+		}
+		break;
+
+	case PATTERN_STRIDE:
+		/* Promote stride-based IOVs */
+		for (int i = 1; i <= 16; i++) {
+			if (promote_iov_priority(iov_index + i * pattern.stride, 70) == 0) {
+				promote_count++;
+			}
+		}
+		break;
+
+	case PATTERN_RANDOM:
+		/* Minimal prefetch */
+		promote_iov_priority(iov_index + 1, 60);
+		promote_iov_priority(iov_index + 2, 60);
+		promote_count = 2;
+		break;
+
+	default:
+		/* Default: ahead 8 */
+		for (int i = 1; i <= 8; i++) {
+			if (promote_iov_priority(iov_index + i, 65) == 0) {
+				promote_count++;
+			}
+		}
+		break;
+	}
+
+	pthread_mutex_unlock(&queue_lock);
+
+	/* 4. Wake worker if promoted any IOVs */
+	if (promote_count > 0) {
+		pthread_cond_signal(&queue_cond);
+	}
+
+	/* Update controller stats */
+	pthread_mutex_lock(&controller_stats_lock);
+	controller_stats.faults_processed++;
+	controller_stats.priority_promotions += promote_count;
+	pthread_mutex_unlock(&controller_stats_lock);
+
+	pr_debug("CONTROLLER: Pattern=%d conf=%.2f, promoted %d IOVs\n",
+		 pattern.type, pattern.confidence, promote_count);
 }
 
 /* Get prefetch statistics */

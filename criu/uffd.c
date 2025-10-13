@@ -832,6 +832,14 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 		}
 
 		lp_debug(lpi, "Initialized prefetch metadata for %d IOVs\n", num_iovs);
+
+		/* Pre-queue all IOVs for controller-based prefetch */
+		ret = prefetch_prequeue_all_iovs(lpi, lpi->pr.pages_img_id);
+		if (ret < 0) {
+			lp_warn(lpi, "Failed to pre-queue IOVs: %d\n", ret);
+		} else {
+			lp_info(lpi, "Pre-queued %d IOVs for controller-based prefetch\n", ret);
+		}
 	}
 
 	list_add_tail(&lpi->l, &lpis);
@@ -1220,36 +1228,8 @@ static bool is_page_queued(struct lazy_pages_info *lpi, unsigned long addr)
 	return false;
 }
 
-/* Get IOV index by searching for IOV that contains the address */
-static int get_iov_index_by_addr(struct lazy_pages_info *lpi, unsigned long addr)
-{
-	struct lazy_iov *iov;
-	int index = 0;
-
-	/* Search in iovs list */
-	list_for_each_entry(iov, &lpi->iovs, l) {
-		if (addr >= iov->start && addr < iov->end)
-			return index;
-		index++;
-	}
-
-	/* Search in reqs list - but use original img_start for index calculation */
-	list_for_each_entry(iov, &lpi->reqs, l) {
-		if (addr >= iov->start && addr < iov->end) {
-			/* Find matching IOV in original list by img_start */
-			int idx = 0;
-			struct lazy_iov *orig_iov;
-			list_for_each_entry(orig_iov, &lpi->iovs, l) {
-				if (orig_iov->img_start == iov->img_start)
-					return idx;
-				idx++;
-			}
-			return -1;
-		}
-	}
-
-	return -1;
-}
+/* OLD: get_iov_index_by_addr() - removed, now using iov_meta_get_index_by_addr() from prefetch.c
+ * This function was buggy because lpi->iovs list order doesn't match IOV array index order */
 
 static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 {
@@ -1304,7 +1284,8 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		/* Try cache lookup if async prefetch is enabled */
 		if (opts.async_prefetch) {
 			cache_result = cache_lookup_iov_for_fault(fetch_start, fetch_end, &cached_data);
-			iov_index = get_iov_index_by_addr(lpi, address);
+			/* Use RB-tree based lookup for correct IOV index */
+			iov_index = iov_meta_get_index_by_addr(address);
 		}
 
 		/* Cache HIT - restore directly from cache */
@@ -1673,7 +1654,7 @@ int cr_lazy_pages(bool daemon)
 
 	/* Initialize async prefetch system if enabled */
 	if (opts.async_prefetch) {
-		int num_workers = opts.prefetch_workers > 0 ? opts.prefetch_workers : 4;
+		int num_workers = opts.prefetch_workers > 0 ? opts.prefetch_workers : 8;  /* 8 workers for optimal throughput */
 		unsigned long cache_limit = opts.cache_limit_mb;
 
 		/* Initialize page cache */

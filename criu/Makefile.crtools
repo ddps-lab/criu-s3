@@ -104,6 +104,7 @@ obj-y			+= hugetlb.o
 obj-y			+= pidfd.o
 obj-y			+= object-storage.o
 obj-y			+= page-cache.o
+obj-y			+= hash-table.o
 obj-y			+= prefetch.o
 
 PROTOBUF_GEN := scripts/protobuf-gen.sh

@@ -40,6 +40,12 @@ void prefetch_cleanup(void);
 /* Initialize IOV metadata from IOV array */
 int prefetch_init_iovs(void *lpi, unsigned int pages_img_id, struct iov_info *iovs, int num_iovs);
 
+/* Pre-queue all IOVs for controller-based prefetch */
+int prefetch_prequeue_all_iovs(void *lpi, unsigned int pages_img_id);
+
+/* Get IOV index by address (correct mapping using RB-tree) */
+int iov_meta_get_index_by_addr(unsigned long addr);
+
 /* Queue IOV for prefetch */
 int prefetch_queue_iov(void *lpi, unsigned long iov_start, unsigned long iov_end, unsigned long file_offset,
 		       enum prefetch_priority priority);
