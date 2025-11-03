@@ -1309,6 +1309,14 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			/* Mark IOV as restored in cache (will be removed) */
 			cache_mark_restored(fetch_start, fetch_end);
 
+			/* Remove IOV from lpi->iovs after successful cache restore */
+			ret = drop_iovs(lpi, fetch_start, fetch_end - fetch_start);
+			if (ret < 0) {
+				lp_err(lpi, "Failed to drop restored IOV [0x%lx-0x%lx] from list\n",
+				       fetch_start, fetch_end);
+				return -1;
+			}
+
 			/* Trigger prefetch strategies */
 			if (opts.async_prefetch && iov_index >= 0) {
 				lp_debug(lpi, "Triggering prefetch for IOV index %d\n", iov_index);
