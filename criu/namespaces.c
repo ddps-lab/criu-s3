@@ -54,6 +54,20 @@ int check_namespace_opts(void)
 	if (join_ns_flags & CLONE_NEWUSER)
 		pr_warn("join-ns with user-namespace is not fully tested and dangerous\n");
 
+	/*
+	 * BUGFIX: Clear root_ns_mask bits for joined namespaces
+	 * When using --join-ns, we join existing namespaces instead of restoring them.
+	 * However, root_ns_mask is loaded from checkpoint image and never adjusted.
+	 * This causes functions like prepare_mnt_ns() and read_mnt_ns_img() to still
+	 * attempt namespace restoration even when we're joining existing ones.
+	 * Clear the bits to skip restoration for joined namespaces.
+	 */
+	if (join_ns_flags) {
+		pr_info("Clearing root_ns_mask bits for joined namespaces: 0x%lx -> 0x%lx\n",
+			root_ns_mask, root_ns_mask & ~join_ns_flags);
+		root_ns_mask &= ~join_ns_flags;
+	}
+
 	errno = 0;
 	return 0;
 }
@@ -1837,6 +1851,17 @@ static int read_pid_ns_img(void)
 
 int prepare_namespace_before_tasks(void)
 {
+	/*
+	 * CRITICAL FIX: Clear root_ns_mask for joined namespaces BEFORE reading images
+	 * This must happen before read_mnt_ns_img() is called, otherwise plain_mountpoint
+	 * won't be set and we'll get segfault in service_mountpoint()
+	 */
+	if (join_ns_flags) {
+		pr_info("Clearing root_ns_mask bits for joined namespaces: 0x%lx -> 0x%lx\n",
+			root_ns_mask, root_ns_mask & ~join_ns_flags);
+		root_ns_mask &= ~join_ns_flags;
+	}
+
 	if (start_usernsd())
 		goto err_unds;
 
