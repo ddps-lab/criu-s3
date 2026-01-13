@@ -7,6 +7,7 @@
 #include "log.h"
 #include "xmalloc.h"
 #include "rbtree.h"
+#include "object-storage.h"
 
 /* Cache entry - one per IOV */
 struct cache_entry {
@@ -214,11 +215,15 @@ enum cache_result cache_lookup_iov_for_fault(unsigned long iov_start, unsigned l
 		cache_state.stats.hits++;
 		result = CACHE_HIT;
 
+		/* Log cache hit for simulation (using -1 as iov_idx since we only have iov_start) */
+		PREFETCH_CACHE_HIT_LOG(-1);
 		pr_debug("Cache HIT: IOV [0x%lx-0x%lx] (%zu bytes)\n", iov_start, iov_end, entry->data_size);
 	} else {
 		cache_state.stats.misses++;
 		result = CACHE_MISS;
 
+		/* Log cache miss for simulation */
+		PREFETCH_CACHE_MISS_LOG(-1);
 		pr_debug("Cache MISS: IOV [0x%lx-0x%lx]\n", iov_start, iov_end);
 	}
 
@@ -326,6 +331,8 @@ int cache_store_iov(unsigned long iov_start, unsigned long iov_end, unsigned lon
 	if (cache_state.total_bytes > cache_state.stats.peak_bytes)
 		cache_state.stats.peak_bytes = cache_state.total_bytes;
 
+	/* Log cache store for simulation */
+	PREFETCH_CACHE_STORE_LOG(-1, size);
 	pr_debug("Cache STORE: IOV [0x%lx-0x%lx] (%zu bytes, prefetched=%d)\n", iov_start, iov_end, size,
 		 is_prefetched);
 

@@ -790,6 +790,8 @@ static void *prefetch_worker(void *arg)
 		void *data;
 		int ret;
 		struct timespec ts;
+		struct timespec worker_start, worker_end;
+		double worker_duration_ms;
 
 		/* Wait for work or timeout */
 		pthread_mutex_lock(&queue_lock);
@@ -846,6 +848,10 @@ static void *prefetch_worker(void *arg)
 		}
 		pthread_mutex_unlock(&iov_meta_lock);
 
+		/* Log worker start for simulation and record start time */
+		clock_gettime(CLOCK_MONOTONIC, &worker_start);
+		PREFETCH_WORKER_START_LOG(worker_id, req->iov_index);
+
 		pr_debug("PREFETCH: Worker %d processing IOV [0x%lx-0x%lx] priority=%d\n",
 			 worker_id, req->iov_start, req->iov_end, req->priority);
 
@@ -883,6 +889,7 @@ static void *prefetch_worker(void *arg)
 			ret = object_storage_fetch_range(object_key, req->file_offset, size, data);
 
 			if (ret != 0) {
+				PREFETCH_WORKER_ERROR_LOG(worker_id, req->iov_index, ret);
 				pr_err("PREFETCH: Worker %d: Failed to fetch from S3: %s (ret=%d)\n",
 				       worker_id, object_key, ret);
 			}
@@ -901,6 +908,12 @@ static void *prefetch_worker(void *arg)
 				stats.bytes_prefetched += size;
 				stats.completed++;
 				pthread_mutex_unlock(&stats_lock);
+
+				/* Calculate worker duration and log completion */
+				clock_gettime(CLOCK_MONOTONIC, &worker_end);
+				worker_duration_ms = (worker_end.tv_sec - worker_start.tv_sec) * 1000.0 +
+						     (worker_end.tv_nsec - worker_start.tv_nsec) / 1000000.0;
+				PREFETCH_WORKER_DONE_LOG(worker_id, req->iov_index, worker_duration_ms);
 
 				pr_debug("PREFETCH: Worker %d: Successfully cached IOV\n", worker_id);
 			} else {
@@ -1186,6 +1199,7 @@ int prefetch_queue_iov(void *lpi, unsigned long iov_start, unsigned long iov_end
 	req->iov_end = iov_end;
 	req->file_offset = file_offset;
 	req->pages_img_id = global_pages_img_id;
+	req->iov_index = meta ? meta->iov_index : -1;
 	req->priority = priority;
 	INIT_LIST_HEAD(&req->list);
 
@@ -1207,6 +1221,9 @@ int prefetch_queue_iov(void *lpi, unsigned long iov_start, unsigned long iov_end
 	stats.total_requests++;
 	pthread_mutex_unlock(&stats_lock);
 
+	/* Log queue event for simulation */
+	PREFETCH_QUEUE_LOG(req->iov_index, iov_start, iov_end, priority);
+
 	pr_debug("PREFETCH: Queued IOV [0x%lx-0x%lx] with priority %d\n",
 		 iov_start, iov_end, priority);
 
@@ -1217,6 +1234,7 @@ int prefetch_queue_iov(void *lpi, unsigned long iov_start, unsigned long iov_end
 static int promote_iov_priority(int iov_index, int new_priority)
 {
 	struct prefetch_request *req;
+	int old_priority;
 
 	/* Lookup in hash table - O(1) */
 	req = hash_table_lookup(&request_hash_table, iov_index);
@@ -1226,6 +1244,8 @@ static int promote_iov_priority(int iov_index, int new_priority)
 
 	if (req->priority >= new_priority)
 		return 0;  /* Already high priority */
+
+	old_priority = req->priority;
 
 	/* Remove from current queue */
 	list_del(&req->list);
@@ -1241,6 +1261,9 @@ static int promote_iov_priority(int iov_index, int new_priority)
 	} else {
 		list_add_tail(&req->list, &queue_low);
 	}
+
+	/* Log priority promotion for simulation */
+	PREFETCH_CONTROLLER_PROMOTE_LOG(iov_index, old_priority, new_priority);
 
 	return 0;
 }
@@ -1260,6 +1283,12 @@ void prefetch_on_fault(void *lpi, int iov_index)
 	/* Update access history */
 	update_access_history(iov_index);
 
+	/* Detect pattern first for logging */
+	{
+		struct pattern_info early_pattern = detect_pattern();
+		PREFETCH_CONTROLLER_FAULT_LOG(iov_index, early_pattern.type, early_pattern.confidence);
+	}
+
 	/* Mark as faulted */
 	meta = iov_meta_get_by_index(iov_index);
 	if (meta) {
@@ -1275,6 +1304,7 @@ void prefetch_on_fault(void *lpi, int iov_index)
 	{
 		struct prefetch_request *faulted_req = hash_table_lookup(&request_hash_table, iov_index);
 		if (faulted_req) {
+			PREFETCH_CONTROLLER_REMOVE_LOG(iov_index, "on-demand");
 			list_del(&faulted_req->list);
 			hash_table_remove(&request_hash_table, iov_index);
 			xfree(faulted_req);
@@ -1380,6 +1410,7 @@ void prefetch_on_fault(void *lpi, int iov_index)
 				int proximity_idx = iov_index + i;
 				struct prefetch_request *prox_req = hash_table_lookup(&request_hash_table, proximity_idx);
 				if (prox_req) {
+					PREFETCH_CONTROLLER_REMOVE_LOG(proximity_idx, "proximity_fwd");
 					list_del(&prox_req->list);
 					hash_table_remove(&request_hash_table, proximity_idx);
 					xfree(prox_req);
@@ -1396,6 +1427,7 @@ void prefetch_on_fault(void *lpi, int iov_index)
 					int proximity_idx = iov_index - i;
 					struct prefetch_request *prox_req = hash_table_lookup(&request_hash_table, proximity_idx);
 					if (prox_req) {
+						PREFETCH_CONTROLLER_REMOVE_LOG(proximity_idx, "proximity_bwd");
 						list_del(&prox_req->list);
 						hash_table_remove(&request_hash_table, proximity_idx);
 						xfree(prox_req);

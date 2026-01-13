@@ -661,7 +661,7 @@ static int _object_storage_create_express_session(void)
 	char x_amz_content_sha256_header[100];
 	int i;
 
-	pr_info("Creating new S3 Express One Zone session...\n");
+	OBJSTOR_SESSION_CREATE_LOG();
 
 	if (!opts.aws_access_key || !opts.aws_secret_key || !opts.aws_region) {
 		pr_err("Missing AWS credentials or region for Express One Zone session\n");
@@ -748,6 +748,7 @@ static int _object_storage_create_express_session(void)
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
 	if (res != CURLE_OK || http_code >= 400) {
+		OBJSTOR_SESSION_ERROR_LOG(http_code);
 		pr_err("CreateSession request failed: %s (HTTP code: %ld)\n", curl_easy_strerror(res), http_code);
 		pr_err("--- Server Error Response ---\n");
 		if (chunk.size > 0)
@@ -777,7 +778,7 @@ static int _object_storage_create_express_session(void)
 	/* Set session expiration to 4 minutes from now */
 	g_session_expiration = time(NULL) + (4 * 60);
 
-	pr_info("Successfully created S3 Express One Zone session. Expires at %ld\n", g_session_expiration);
+	OBJSTOR_SESSION_CREATED_LOG(g_session_expiration);
 
 	curl_easy_cleanup(curl);
 	free(chunk.memory);
@@ -867,6 +868,8 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	struct curl_slist *headers = NULL;
 	int ret = -1;
 	struct FetchContext fetch_ctx;
+	struct timespec fetch_start, fetch_end;
+	double fetch_duration_ms;
 
 	/* Ensure we have a valid session for Express One Zone */
 	if (ensure_valid_session() != 0) {
@@ -1156,6 +1159,10 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 
 	pr_debug("Fetching range %s from %s\n", range_header, url);
 
+	/* Log fetch start for simulation and record start time */
+	clock_gettime(CLOCK_MONOTONIC, &fetch_start);
+	OBJSTOR_FETCH_START_LOG(object_key, offset, length);
+
 	/* Perform the request */
 	res = curl_easy_perform(curl_handle);
 
@@ -1163,6 +1170,7 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
 
 	if (res != CURLE_OK || http_code >= 400) {
+		OBJSTOR_FETCH_ERROR_LOG(object_key, offset, length, (int)http_code);
 		pr_err("curl_easy_perform() failed: %s (URL: %s, Range: %s, HTTP Code: %ld)\n",
 		       curl_easy_strerror(res), url, range_header, http_code);
 
@@ -1291,6 +1299,12 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 		ret = -1;
 		goto cleanup;
 	}
+
+	/* Calculate fetch duration and log completion */
+	clock_gettime(CLOCK_MONOTONIC, &fetch_end);
+	fetch_duration_ms = (fetch_end.tv_sec - fetch_start.tv_sec) * 1000.0 +
+			    (fetch_end.tv_nsec - fetch_start.tv_nsec) / 1000000.0;
+	OBJSTOR_FETCH_DONE_LOG(object_key, offset, length, fetch_duration_ms);
 
 	pr_debug("Successfully fetched %zu bytes (range %s) from %s\n", chunk.size, range_header, url);
 
