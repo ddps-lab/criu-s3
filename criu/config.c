@@ -437,6 +437,7 @@ void init_opts(void)
 	opts.object_storage_endpoint_url = NULL;
 	opts.object_storage_bucket = NULL;
 	opts.object_storage_object_prefix = NULL;
+	opts.object_storage_path_style = false;
 	opts.express_one_zone = false;
 	opts.aws_access_key = NULL;
 	opts.aws_secret_key = NULL;
@@ -736,6 +737,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "exclude-range", required_argument, 0, 1112 },
 		{ "exclude-file", required_argument, 0, 1113 },
 		{ "no-parent-range", required_argument, 0, 1114 },
+		{ "object-storage-path-style", no_argument, NULL, 1115 },
 		{},
 	};
 
@@ -1165,6 +1167,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			list_add_tail(&er->list, &opts.no_parent_ranges);
 			break;
 		}
+		case 1115:
+			opts.object_storage_path_style = true;
+			break;
 		default:
 			return 2;
 		}

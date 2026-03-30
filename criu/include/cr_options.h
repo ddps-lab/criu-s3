@@ -257,6 +257,7 @@ struct cr_options {
 	char *object_storage_endpoint_url;
 	char *object_storage_bucket;
 	char *object_storage_object_prefix;
+	bool object_storage_path_style;
 
 	/* AWS S3 Express One Zone specific options */
 	bool express_one_zone;
