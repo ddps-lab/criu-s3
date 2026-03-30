@@ -130,6 +130,12 @@ enum criu_mode {
 	CR_SHOW_DEPRECATED,
 };
 
+struct exclude_range {
+	unsigned long start;
+	unsigned long end;
+	struct list_head list;
+};
+
 struct cr_options {
 	int final_state;
 	int check_extra_features;
@@ -262,6 +268,11 @@ struct cr_options {
 	bool async_prefetch;
 	int prefetch_workers;
 	unsigned long cache_limit_mb;
+
+	/* Hot VMA exclude ranges for pre-dump */
+	struct list_head exclude_ranges;
+	/* No-parent ranges: dump normally but without parent reference */
+	struct list_head no_parent_ranges;
 };
 
 extern struct cr_options opts;

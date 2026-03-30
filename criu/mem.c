@@ -252,6 +252,76 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 	return ret;
 }
 
+static bool vma_in_exclude_list(unsigned long vma_start, unsigned long vma_end)
+{
+	struct exclude_range *er;
+
+	if (list_empty(&opts.exclude_ranges))
+		return false;
+
+	list_for_each_entry(er, &opts.exclude_ranges, list) {
+		if (vma_start < er->end && vma_end > er->start)
+			return true;
+	}
+	return false;
+}
+
+static bool vma_in_no_parent_list(unsigned long vma_start, unsigned long vma_end)
+{
+	struct exclude_range *er;
+
+	if (list_empty(&opts.no_parent_ranges))
+		return false;
+
+	list_for_each_entry(er, &opts.no_parent_ranges, list) {
+		if (vma_start < er->end && vma_end > er->start)
+			return true;
+	}
+	return false;
+}
+
+static void save_hot_vma_metadata(const char *imgs_dir)
+{
+	char path[PATH_MAX];
+	struct exclude_range *er;
+	FILE *f;
+	bool first;
+
+	snprintf(path, sizeof(path), "%s/hot-vmas.json", imgs_dir);
+	f = fopen(path, "w");
+	if (!f) {
+		pr_perror("Can't create %s", path);
+		return;
+	}
+
+	fprintf(f, "{\n");
+
+	fprintf(f, "  \"excluded\": [\n");
+	first = true;
+	list_for_each_entry(er, &opts.exclude_ranges, list) {
+		if (!first)
+			fprintf(f, ",\n");
+		fprintf(f, "    {\"start\": \"0x%lx\", \"end\": \"0x%lx\"}", er->start, er->end);
+		first = false;
+	}
+	fprintf(f, "\n  ],\n");
+
+	fprintf(f, "  \"no_parent\": [\n");
+	first = true;
+	list_for_each_entry(er, &opts.no_parent_ranges, list) {
+		if (!first)
+			fprintf(f, ",\n");
+		fprintf(f, "    {\"start\": \"0x%lx\", \"end\": \"0x%lx\"}", er->start, er->end);
+		first = false;
+	}
+	fprintf(f, "\n  ]\n");
+
+	fprintf(f, "}\n");
+	fclose(f);
+
+	pr_info("Saved hot VMA metadata to %s\n", path);
+}
+
 static struct parasite_dump_pages_args *
 prep_dump_pages_args(struct parasite_ctl *ctl, struct vm_area_list *vma_area_list, bool skip_non_trackable)
 {
@@ -278,6 +348,9 @@ prep_dump_pages_args(struct parasite_ctl *ctl, struct vm_area_list *vma_area_lis
 		 * See also generate_vma_iovs() comment.
 		 */
 		if ((vma->e->flags & MAP_HUGETLB) && skip_non_trackable)
+			continue;
+		/* Skip hot VMAs during pre-dump */
+		if (skip_non_trackable && vma_in_exclude_list(vma->e->start, vma->e->start + vma_area_len(vma)))
 			continue;
 		if (vma->e->prot & PROT_READ)
 			continue;
@@ -456,6 +529,23 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 		has_parent = false;
 	}
 
+	/* Hot VMA handling: skip during pre-dump, full dump without parent on final dump */
+	if (vma_in_exclude_list(vma->e->start, vma->e->end)) {
+		if (pre_dump) {
+			pr_info("Skipping hot VMA [%lx-%lx] during pre-dump\n",
+				(unsigned long)vma->e->start, (unsigned long)vma->e->end);
+			return 0;
+		}
+		has_parent = false;
+	}
+
+	/* No-parent VMA: dump normally but without parent reference */
+	if (vma_in_no_parent_list(vma->e->start, vma->e->end)) {
+		pr_info("No-parent VMA [%lx-%lx]: dumping without parent reference\n",
+			(unsigned long)vma->e->start, (unsigned long)vma->e->end);
+		has_parent = false;
+	}
+
 	if (pmc_get_map(pmc, vma))
 		return -1;
 
@@ -590,6 +680,10 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	ret = task_reset_dirty_track(item->pid->real);
 	if (ret)
 		goto out_xfer;
+
+	if (!list_empty(&opts.exclude_ranges) || !list_empty(&opts.no_parent_ranges))
+		save_hot_vma_metadata(opts.imgs_dir);
+
 	exit_code = 0;
 out_xfer:
 	if (!mdc->pre_dump)
