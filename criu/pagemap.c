@@ -865,9 +865,9 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 
 	pr->pi = open_pages_image_at(dfd, flags, pr->pmi, &pr->pages_img_id);
 	if (!pr->pi) {
-		/* If lazy pages from object storage is enabled, we don't need local pages.img */
-		if (opts.lazy_pages && opts.enable_object_storage) {
-			pr_warn("Could not open local pages-%u.img, but proceeding in object storage lazy-pages mode.\n",
+		/* If object storage is enabled, we don't need local pages.img */
+		if (opts.enable_object_storage) {
+			pr_warn("Could not open local pages-%u.img, but proceeding in object storage mode.\n",
 			        pr->pages_img_id);
 			pr->pi = NULL;
 		} else {
@@ -898,8 +898,8 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		pr->maybe_read_page = maybe_read_page_remote;
 	} else if (opts.stream) {
 		pr->maybe_read_page = maybe_read_page_img_streamer;
-	} else if (opts.lazy_pages && opts.enable_object_storage) {
-		/* Object Storage with Lazy Loading */
+	} else if (opts.enable_object_storage) {
+		/* Object Storage: fetch pages from S3/MinIO/compatible storage */
 		pr_info("Assigning maybe_read_page_object_storage (lazy_pages: %d, enable_object_storage: %d)\n",
 		        opts.lazy_pages, opts.enable_object_storage);
 		pr->maybe_read_page = maybe_read_page_object_storage;
