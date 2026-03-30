@@ -446,6 +446,10 @@ void init_opts(void)
 	opts.async_prefetch = false;
 	opts.prefetch_workers = 4;		/* Default 4 workers */
 	opts.cache_limit_mb = 0;		/* Default unlimited */
+
+	/* Initialize exclude ranges */
+	INIT_LIST_HEAD(&opts.exclude_ranges);
+	INIT_LIST_HEAD(&opts.no_parent_ranges);
 }
 
 bool deprecated_ok(char *what)
@@ -729,6 +733,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "async-prefetch", no_argument, NULL, 1109 },
 		{ "prefetch-workers", required_argument, 0, 1110 },
 		{ "cache-limit", required_argument, 0, 1111 },
+		{ "exclude-range", required_argument, 0, 1112 },
+		{ "exclude-file", required_argument, 0, 1113 },
+		{ "no-parent-range", required_argument, 0, 1114 },
 		{},
 	};
 
@@ -1114,6 +1121,50 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		case 1111:
 			opts.cache_limit_mb = strtoul(optarg, NULL, 10);
 			break;
+		case 1112: {
+			struct exclude_range *er = xzalloc(sizeof(*er));
+			if (!er)
+				return 1;
+			if (sscanf(optarg, "%lx:%lx", &er->start, &er->end) != 2) {
+				pr_err("Invalid exclude-range format: %s (expected start:end in hex)\n", optarg);
+				xfree(er);
+				return 1;
+			}
+			list_add_tail(&er->list, &opts.exclude_ranges);
+			break;
+		}
+		case 1113: {
+			unsigned long s, e;
+			FILE *f = fopen(optarg, "r");
+			if (!f) {
+				pr_perror("Can't open exclude file %s", optarg);
+				return 1;
+			}
+			while (fscanf(f, "%lx %lx", &s, &e) == 2) {
+				struct exclude_range *er = xzalloc(sizeof(*er));
+				if (!er) {
+					fclose(f);
+					return 1;
+				}
+				er->start = s;
+				er->end = e;
+				list_add_tail(&er->list, &opts.exclude_ranges);
+			}
+			fclose(f);
+			break;
+		}
+		case 1114: {
+			struct exclude_range *er = xzalloc(sizeof(*er));
+			if (!er)
+				return 1;
+			if (sscanf(optarg, "%lx:%lx", &er->start, &er->end) != 2) {
+				pr_err("Invalid no-parent-range format: %s (expected start:end in hex)\n", optarg);
+				xfree(er);
+				return 1;
+			}
+			list_add_tail(&er->list, &opts.no_parent_ranges);
+			break;
+		}
 		default:
 			return 2;
 		}
