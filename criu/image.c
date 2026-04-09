@@ -19,6 +19,7 @@
 #include "proc_parse.h"
 #include "img-streamer.h"
 #include "namespaces.h"
+#include "object-storage.h"
 
 bool ns_per_id = false;
 bool img_common_magic = true;
@@ -632,6 +633,16 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 	}
 
 	img->_x.fd = ret;
+
+	/*
+	 * When object-storage-upload is enabled and we're writing (O_DUMP),
+	 * save the filename so close_image() can upload to S3.
+	 * We reuse the 'path' field that's normally only used for lazy images.
+	 */
+	if (opts.object_storage_upload && (flags & O_CREAT)) {
+		img->path = xstrdup(path);
+	}
+
 	if (oflags & O_NOBUF)
 		bfd_setraw(&img->_x);
 	else {
@@ -688,8 +699,55 @@ void close_image(struct cr_img *img)
 		 */
 		unlinkat(get_service_fd(IMG_FD_OFF), img->path, 0);
 		xfree(img->path);
-	} else if (!empty_image(img))
-		bclose(&img->_x);
+	} else if (!empty_image(img)) {
+		/*
+		 * Upload metadata files to S3 on close (dual-write).
+		 * Skip pages-*.img as those are handled by page-xfer S3 backend.
+		 */
+		if (opts.object_storage_upload && img->path &&
+		    strncmp(img->path, "pages-", 6) != 0) {
+			int fd = img_raw_fd(img);
+			off_t file_size;
+
+			/* Flush buffered writes first */
+			bclose(&img->_x);
+
+			/* Reopen to read back for S3 upload */
+			fd = openat(get_service_fd(IMG_FD_OFF), img->path, O_RDONLY);
+			if (fd >= 0) {
+				file_size = lseek(fd, 0, SEEK_END);
+				if (file_size > 0) {
+					void *buf;
+					ssize_t nr;
+					unsigned long rd;
+
+					lseek(fd, 0, SEEK_SET);
+					buf = xmalloc(file_size);
+					if (buf) {
+						rd = 0;
+						while (rd < (unsigned long)file_size) {
+							nr = read(fd, (char *)buf + rd,
+								  file_size - rd);
+							if (nr <= 0)
+								break;
+							rd += nr;
+						}
+						if (rd == (unsigned long)file_size) {
+							object_storage_put_object(
+								img->path, buf, file_size);
+						}
+						xfree(buf);
+					}
+				}
+				close(fd);
+			}
+			xfree(img->path);
+		} else {
+			if (img->path)
+				xfree(img->path);
+			bclose(&img->_x);
+		}
+	}
 
 	xfree(img);
 }
