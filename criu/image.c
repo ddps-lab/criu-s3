@@ -509,6 +509,7 @@ struct cr_img *open_image_at(int dfd, int type, unsigned long flags, ...)
 	img = xmalloc(sizeof(*img));
 	if (!img)
 		return NULL;
+	img->path = NULL;
 
 	oflags = flags | imgset_template[type].oflags;
 
@@ -801,6 +802,7 @@ struct cr_img *img_from_fd(int fd)
 	img = xmalloc(sizeof(*img));
 	if (img) {
 		img->_x.fd = fd;
+		img->path = NULL;
 		bfd_setraw(&img->_x);
 	}
 
