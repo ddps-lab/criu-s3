@@ -359,8 +359,10 @@ static void close_page_xfer(struct page_xfer *xfer)
 		xfree(xfer->parent);
 		xfer->parent = NULL;
 	}
-	close_image(xfer->pi);
-	close_image(xfer->pmi);
+	if (xfer->pi)
+		close_image(xfer->pi);
+	if (xfer->pmi)
+		close_image(xfer->pmi);
 }
 
 static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
@@ -494,8 +496,8 @@ static int write_pages_object_storage(struct page_xfer *xfer, int p, unsigned lo
 			return -1;
 		}
 
-		/* Write to local pages file */
-		{
+		/* Write to local pages file (skip in S3-only mode) */
+		if (xfer->pi) {
 			ssize_t nw;
 			unsigned long wr = 0;
 			while (wr < (unsigned long)nread) {
@@ -644,7 +646,11 @@ static int open_page_object_storage_xfer(struct page_xfer *xfer, int fd_type, un
 {
 	int ret;
 
-	/* First, open local xfer as usual */
+	/*
+	 * Open local xfer first (creates pagemap + pages files locally).
+	 * We need local pagemap for pb_write_one() buffering.
+	 * Pages file is only needed in dual-write mode.
+	 */
 	ret = open_page_local_xfer(xfer, fd_type, img_id);
 	if (ret < 0)
 		return ret;
@@ -670,6 +676,16 @@ static int open_page_object_storage_xfer(struct page_xfer *xfer, int fd_type, un
 	} else {
 		snprintf(xfer->object_storage.pagemap_key, sizeof(xfer->object_storage.pagemap_key),
 			 "pagemap-%lu.img", img_id);
+	}
+
+	/*
+	 * Close local pages file — pages data goes only to object storage.
+	 * This eliminates disk I/O for the bulk data (pages are 99%+ of size).
+	 * Pagemap stays local for pb_write_one() buffering, uploaded on close.
+	 */
+	if (xfer->pi) {
+		close_image(xfer->pi);
+		xfer->pi = NULL;
 	}
 
 	/* Allocate part buffer */

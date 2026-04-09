@@ -620,6 +620,13 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 		ret = userns_call(userns_openat, UNS_FDOUT, &pa, sizeof(struct openat_args), dfd);
 		if (ret < 0)
 			errno = pa.err;
+	} else if (opts.object_storage_upload && (flags & O_CREAT)) {
+		/*
+		 * Object storage upload mode: use memfd instead of local file.
+		 * All writes go to memory, uploaded to S3 on close_image().
+		 * Eliminates disk I/O entirely for metadata files.
+		 */
+		ret = memfd_create(path, 0);
 	} else
 		ret = openat(dfd, path, flags, CR_FD_PERM);
 	if (ret < 0) {
@@ -752,11 +759,14 @@ void close_image(struct cr_img *img)
 			int fd;
 			off_t file_size;
 
-			/* Flush buffered writes first */
+			/*
+			 * Dup the fd before bclose() closes it, so we can
+			 * read back the written data for S3 upload.
+			 * Works with both memfd (S3-only) and local files (dual-write).
+			 */
+			fd = dup(img->_x.fd);
 			bclose(&img->_x);
 
-			/* Reopen to read back for S3 upload */
-			fd = openat(get_service_fd(IMG_FD_OFF), img->path, O_RDONLY);
 			if (fd >= 0) {
 				file_size = lseek(fd, 0, SEEK_END);
 				if (file_size > 0) {
@@ -775,10 +785,9 @@ void close_image(struct cr_img *img)
 								break;
 							rd += nr;
 						}
-						if (rd == (unsigned long)file_size) {
+						if (rd == (unsigned long)file_size)
 							object_storage_put_object(
 								img->path, buf, file_size);
-						}
 						xfree(buf);
 					}
 				}
