@@ -61,17 +61,24 @@ struct pattern_info {
 	int stride;        /* For PATTERN_STRIDE */
 };
 
+/* Explicit IOV state machine */
+enum iov_state {
+	IOV_NOT_REQUESTED,   /* Initial state after metadata init */
+	IOV_QUEUED,          /* In prefetch queue, waiting for worker */
+	IOV_FETCHING,        /* Worker is actively fetching from S3 */
+	IOV_CACHED,          /* Data in page cache, awaiting UFFDIO_COPY */
+	IOV_RESTORED,        /* Installed in address space (terminal) */
+	IOV_FAULTED          /* Removed from queue due to on-demand fault */
+};
+
 /* IOV metadata for tracking state */
 struct iov_meta {
 	unsigned long iov_start;
 	unsigned long iov_end;
 	unsigned long file_offset;
 
-	bool has_fault;      /* Has experienced page fault */
-	bool in_cache;       /* Currently in cache */
-	bool prefetching;    /* Currently being prefetched */
-	bool restored;       /* Has been restored to process */
-	bool queued;         /* Currently in prefetch queue */
+	enum iov_state state;
+	bool is_hot;         /* Hot VMA from checkpoint metadata */
 
 	int iov_index;       /* Index in IOV array */
 	struct rb_node node; /* Red-black tree node */
@@ -277,10 +284,8 @@ int prefetch_init_iovs(void *lpi, unsigned int pages_img_id, struct iov_info *io
 		meta->iov_end = iovs[i].iov_end;
 		/* file_offset is already calculated in uffd.c */
 		meta->file_offset = iovs[i].file_offset;
-		meta->has_fault = false;
-		meta->in_cache = false;
-		meta->prefetching = false;
-		meta->restored = false;
+		meta->state = IOV_NOT_REQUESTED;
+		meta->is_hot = false;
 		meta->iov_index = i;
 
 		/* Log IOV info for debugging (especially large IOVs) */
@@ -345,43 +350,39 @@ struct iov_meta *iov_meta_get_by_index(int index)
 }
 
 
-/* Mark IOV as having experienced a fault */
+/* Mark IOV as having experienced a fault (on-demand path) */
 void iov_meta_mark_fault(unsigned long iov_start)
 {
 	struct iov_meta *meta;
 
 	pthread_mutex_lock(&iov_meta_lock);
 	meta = iov_meta_search(iov_start);
-	if (meta)
-		meta->has_fault = true;
+	if (meta && meta->state < IOV_CACHED)
+		meta->state = IOV_FAULTED;
 	pthread_mutex_unlock(&iov_meta_lock);
 }
 
-/* Mark IOV as cached */
+/* Mark IOV as cached (worker completed fetch) */
 void iov_meta_mark_cached(unsigned long iov_start)
 {
 	struct iov_meta *meta;
 
 	pthread_mutex_lock(&iov_meta_lock);
 	meta = iov_meta_search(iov_start);
-	if (meta) {
-		meta->in_cache = true;
-		meta->prefetching = false;
-	}
+	if (meta)
+		meta->state = IOV_CACHED;
 	pthread_mutex_unlock(&iov_meta_lock);
 }
 
-/* Mark IOV as restored */
+/* Mark IOV as restored (UFFDIO_COPY completed) */
 void iov_meta_mark_restored(unsigned long iov_start)
 {
 	struct iov_meta *meta;
 
 	pthread_mutex_lock(&iov_meta_lock);
 	meta = iov_meta_search(iov_start);
-	if (meta) {
-		meta->restored = true;
-		meta->in_cache = false;
-	}
+	if (meta)
+		meta->state = IOV_RESTORED;
 	pthread_mutex_unlock(&iov_meta_lock);
 }
 
@@ -643,7 +644,7 @@ static int __attribute__((unused)) prefetch_pattern_based(void *lpi, int current
 			continue;
 
 		meta = iov_meta_get_by_index(target_index);
-		if (!meta || meta->restored || meta->prefetching)
+		if (!meta || meta->state >= IOV_QUEUED)
 			continue;
 
 		/* Queue for prefetch */
@@ -683,7 +684,7 @@ static int __attribute__((unused)) prefetch_ahead_of_fault(void *lpi, int curren
 			break;
 
 		meta = iov_meta_get_by_index(target_index);
-		if (!meta || meta->restored || meta->prefetching)
+		if (!meta || meta->state >= IOV_QUEUED)
 			continue;
 
 		/* Skip small IOVs (< 256KB) - not worth prefetching */
@@ -729,7 +730,7 @@ static int __attribute__((unused)) prefetch_background_unrestored(void *lpi)
 		struct iov_meta *meta = iov_index_map[i];
 		unsigned long iov_size;
 
-		if (!meta || meta->restored || meta->prefetching || meta->has_fault)
+		if (!meta || meta->state >= IOV_QUEUED)
 			continue;
 
 		/* Skip small IOVs (< 256KB) - not worth prefetching */
@@ -843,7 +844,7 @@ static void *prefetch_worker(void *arg)
 
 		if (meta) {
 			/* Skip if already in cache */
-			if (meta->in_cache) {
+			if (meta->state >= IOV_CACHED) {
 				pthread_mutex_unlock(&iov_meta_lock);
 				pr_debug("PREFETCH: Worker %d: IOV[%d] already in cache, skipping\n",
 					 worker_id, req->iov_index);
@@ -852,7 +853,7 @@ static void *prefetch_worker(void *arg)
 			}
 
 			/* Set prefetching flag */
-			meta->prefetching = true;
+			meta->state = IOV_FETCHING;
 		}
 		pthread_mutex_unlock(&iov_meta_lock);
 
@@ -946,7 +947,7 @@ next_request:
 		pthread_mutex_lock(&iov_meta_lock);
 		meta = iov_meta_search(req->iov_start);
 		if (meta)
-			meta->prefetching = false;
+			meta->state = IOV_NOT_REQUESTED;
 		pthread_mutex_unlock(&iov_meta_lock);
 
 		xfree(req);
@@ -1171,20 +1172,19 @@ int prefetch_queue_iov(void *lpi, unsigned long iov_start, unsigned long iov_end
 		pthread_mutex_lock(&iov_meta_lock);
 
 		/* Skip if already completed */
-		if (meta->in_cache || meta->restored) {
+		if (meta->state >= IOV_CACHED) {
 			pthread_mutex_unlock(&iov_meta_lock);
 			return 0;
 		}
 
 		/* Skip if already being prefetched - no need to re-queue */
-		if (meta->prefetching) {
+		if (meta->state >= IOV_QUEUED) {
 			pthread_mutex_unlock(&iov_meta_lock);
 			return 0;
 		}
 
-		/* Mark as prefetching immediately at queue time to prevent duplicates */
-		/* This is the key: set flag BEFORE queueing to prevent race condition */
-		meta->prefetching = true;
+		/* Mark as QUEUED immediately to prevent duplicate queuing (race prevention) */
+		meta->state = IOV_QUEUED;
 
 		pthread_mutex_unlock(&iov_meta_lock);
 	}
@@ -1196,7 +1196,7 @@ int prefetch_queue_iov(void *lpi, unsigned long iov_start, unsigned long iov_end
 		/* Rollback prefetching flag on allocation failure */
 		if (meta) {
 			pthread_mutex_lock(&iov_meta_lock);
-			meta->prefetching = false;
+			meta->state = IOV_NOT_REQUESTED;
 			pthread_mutex_unlock(&iov_meta_lock);
 		}
 		return -ENOMEM;
@@ -1301,7 +1301,7 @@ void prefetch_on_fault(void *lpi, int iov_index)
 	meta = iov_meta_get_by_index(iov_index);
 	if (meta) {
 		pthread_mutex_lock(&iov_meta_lock);
-		meta->has_fault = true;
+		if (meta->state < IOV_CACHED) meta->state = IOV_FAULTED;
 		pthread_mutex_unlock(&iov_meta_lock);
 	}
 
