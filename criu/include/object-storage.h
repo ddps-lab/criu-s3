@@ -42,55 +42,72 @@
 
 /* Prefetch queue events */
 #define PREFETCH_QUEUE_LOG(iov_idx, iov_start, iov_end, priority) \
-	pr_info("prefetch: QUEUE iov_idx=%d iov_start=0x%lx iov_end=0x%lx priority=%d\n", \
+	pr_info(" QUEUE iov_idx=%d iov_start=0x%lx iov_end=0x%lx priority=%d\n", \
 		(int)(iov_idx), (unsigned long)(iov_start), (unsigned long)(iov_end), (int)(priority))
 
 #define PREFETCH_DEQUEUE_LOG(iov_idx, worker_id) \
-	pr_info("prefetch: DEQUEUE iov_idx=%d worker=%d\n", \
+	pr_info(" DEQUEUE iov_idx=%d worker=%d\n", \
 		(int)(iov_idx), (int)(worker_id))
 
 /* Prefetch worker events */
 #define PREFETCH_WORKER_START_LOG(worker_id, iov_idx) \
-	pr_info("prefetch: WORKER_START worker=%d iov_idx=%d\n", \
+	pr_info(" WORKER_START worker=%d iov_idx=%d\n", \
 		(int)(worker_id), (int)(iov_idx))
 
 #define PREFETCH_WORKER_DONE_LOG(worker_id, iov_idx, dur_ms) \
-	pr_info("prefetch: WORKER_DONE worker=%d iov_idx=%d dur_ms=%.2f\n", \
+	pr_info(" WORKER_DONE worker=%d iov_idx=%d dur_ms=%.2f\n", \
 		(int)(worker_id), (int)(iov_idx), (double)(dur_ms))
 
 #define PREFETCH_WORKER_ERROR_LOG(worker_id, iov_idx, error_code) \
-	pr_err("prefetch: WORKER_ERROR worker=%d iov_idx=%d error=%d\n", \
+	pr_err(" WORKER_ERROR worker=%d iov_idx=%d error=%d\n", \
 	       (int)(worker_id), (int)(iov_idx), (int)(error_code))
 
 /* Cache events */
 #define PREFETCH_CACHE_HIT_LOG(iov_idx) \
-	pr_info("prefetch: CACHE_HIT iov_idx=%d\n", (int)(iov_idx))
+	pr_info(" CACHE_HIT iov_idx=%d\n", (int)(iov_idx))
 
 #define PREFETCH_CACHE_MISS_LOG(iov_idx) \
-	pr_info("prefetch: CACHE_MISS iov_idx=%d\n", (int)(iov_idx))
+	pr_info(" CACHE_MISS iov_idx=%d\n", (int)(iov_idx))
 
 #define PREFETCH_CACHE_STORE_LOG(iov_idx, size_bytes) \
-	pr_info("prefetch: CACHE_STORE iov_idx=%d size=%lu\n", \
+	pr_info(" CACHE_STORE iov_idx=%d size=%lu\n", \
 		(int)(iov_idx), (unsigned long)(size_bytes))
 
 /* Controller events */
-#define PREFETCH_CONTROLLER_FAULT_LOG(iov_idx, pattern_type, confidence) \
-	pr_info("prefetch: CONTROLLER_FAULT iov_idx=%d pattern=%d confidence=%.2f\n", \
-		(int)(iov_idx), (int)(pattern_type), (double)(confidence))
+#define PREFETCH_CONTROLLER_FAULT_LOG(iov_idx) \
+	pr_info(" FAULT iov_idx=%d\n", (int)(iov_idx))
 
 #define PREFETCH_CONTROLLER_PROMOTE_LOG(iov_idx, old_priority, new_priority) \
-	pr_info("prefetch: CONTROLLER_PROMOTE iov_idx=%d old_prio=%d new_prio=%d\n", \
+	pr_info(" PROMOTE iov_idx=%d old_prio=%d new_prio=%d\n", \
 		(int)(iov_idx), (int)(old_priority), (int)(new_priority))
 
 #define PREFETCH_CONTROLLER_REMOVE_LOG(iov_idx, reason) \
-	pr_info("prefetch: CONTROLLER_REMOVE iov_idx=%d reason=%s\n", \
+	pr_info(" REMOVE iov_idx=%d reason=%s\n", \
 		(int)(iov_idx), (reason))
 
-/* Statistics events (emitted periodically or at cleanup) */
+/* Statistics events (emitted at cleanup) */
 #define PREFETCH_STATS_LOG(total_requests, completed, failed, cache_hits, cache_misses) \
-	pr_info("prefetch: STATS requests=%lu completed=%lu failed=%lu hits=%lu misses=%lu\n", \
+	pr_info(" STATS requests=%lu completed=%lu failed=%lu hits=%lu misses=%lu\n", \
 		(unsigned long)(total_requests), (unsigned long)(completed), \
 		(unsigned long)(failed), (unsigned long)(cache_hits), (unsigned long)(cache_misses))
+
+/* Lazy restore page fault events (uffd.c) */
+#define LAZY_FAULT_LOG(pid, addr, iov_start, iov_end, nr_pages) \
+	pr_info(" FAULT pid=%d addr=0x%lx iov=[0x%lx-0x%lx] pages=%d\n", \
+		(int)(pid), (unsigned long)(addr), (unsigned long)(iov_start), \
+		(unsigned long)(iov_end), (int)(nr_pages))
+
+#define LAZY_SERVED_CACHE_LOG(pid, addr, nr_pages) \
+	pr_info(" SERVED_CACHE pid=%d addr=0x%lx pages=%d\n", \
+		(int)(pid), (unsigned long)(addr), (int)(nr_pages))
+
+#define LAZY_SERVED_S3_LOG(pid, addr, nr_pages, dur_ms) \
+	pr_info(" SERVED_S3 pid=%d addr=0x%lx pages=%d dur_ms=%.2f\n", \
+		(int)(pid), (unsigned long)(addr), (int)(nr_pages), (double)(dur_ms))
+
+#define LAZY_SERVED_ZERO_LOG(pid, addr) \
+	pr_info(" SERVED_ZERO pid=%d addr=0x%lx\n", \
+		(int)(pid), (unsigned long)(addr))
 
 /*
  * =============================================================================

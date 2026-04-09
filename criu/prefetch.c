@@ -686,9 +686,14 @@ void prefetch_cleanup(void)
 	/* Cleanup hash table */
 	hash_table_cleanup(&request_hash_table);
 
-	/* Print controller stats */
+	/* Print summary stats */
+	pthread_mutex_lock(&stats_lock);
+	PREFETCH_STATS_LOG(stats.total_requests, stats.completed, stats.failed,
+			   stats.cache_stored, stats.bytes_prefetched);
+	pthread_mutex_unlock(&stats_lock);
+
 	pthread_mutex_lock(&controller_stats_lock);
-	pr_info("CONTROLLER Stats: faults=%lu removes=%lu promotes=%lu obsolete_prevented=%lu proximity_removed=%lu\n",
+	pr_info("prefetch: CONTROLLER faults=%lu removes=%lu promotes=%lu obsolete=%lu proximity=%lu\n",
 		controller_stats.faults_processed,
 		controller_stats.queue_removes,
 		controller_stats.priority_promotions,
@@ -897,7 +902,7 @@ void prefetch_on_fault(void *lpi, int iov_index)
 	int current_queue_size;
 	int promote_distance;
 
-	pr_debug("CONTROLLER: Page fault at IOV index %d\n", iov_index);
+	PREFETCH_CONTROLLER_FAULT_LOG(iov_index);
 
 	if (iov_index < 0 || iov_index >= total_iovs)
 		return;
