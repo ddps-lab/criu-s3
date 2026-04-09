@@ -117,6 +117,17 @@ int object_storage_init(void);
 int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer);
 
 /*
+ * Upload an object to object storage (simple PUT, for files < 5GB)
+ *
+ * @param object_key: The key/path for the object in the bucket
+ * @param data: Pointer to data to upload
+ * @param length: Size of data in bytes
+ *
+ * Returns 0 on success, -1 on failure
+ */
+int object_storage_put_object(const char *object_key, const void *data, unsigned long length);
+
+/*
  * Clean up the object storage client and release resources
  */
 void object_storage_cleanup(void);

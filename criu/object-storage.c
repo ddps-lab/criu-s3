@@ -1082,6 +1082,279 @@ void object_storage_cleanup(void)
 	pr_info("Object Storage client cleaned up (libcurl, PID: %d)\n", getpid());
 }
 
+/*
+ * =================================================================================
+ * URL Construction Helper
+ * =================================================================================
+ *
+ * Constructs S3 URL, auth host, and canonical URI from object key and options.
+ * Shared by fetch_range, put_object, and multipart operations.
+ */
+struct object_url_info {
+	char url[2048];
+	char auth_host[512];
+	char canonical_uri[2048];
+	char full_object_path[1024];
+};
+
+static int _construct_object_url(const char *object_key, struct object_url_info *info)
+{
+	char normalized_prefix[512];
+	const char *endpoint_url;
+	const char *hostname;
+
+	memset(info, 0, sizeof(*info));
+
+	/* Normalize the object prefix */
+	if (opts.object_storage_object_prefix) {
+		const char *original_prefix = opts.object_storage_object_prefix;
+		size_t prefix_len = strlen(original_prefix);
+		if (prefix_len == 1 && original_prefix[0] == '/') {
+			normalized_prefix[0] = '\0';
+		} else if (prefix_len > 0) {
+			const char *start = original_prefix;
+			size_t copy_len = prefix_len;
+			if (original_prefix[0] == '/') {
+				start++;
+				copy_len--;
+			}
+			snprintf(normalized_prefix, sizeof(normalized_prefix), "%.*s", (int)copy_len, start);
+			if (copy_len > 0 && normalized_prefix[copy_len - 1] != '/') {
+				size_t current_len = strlen(normalized_prefix);
+				if (current_len < sizeof(normalized_prefix) - 1) {
+					normalized_prefix[current_len] = '/';
+					normalized_prefix[current_len + 1] = '\0';
+				}
+			}
+		} else {
+			normalized_prefix[0] = '\0';
+		}
+	} else {
+		normalized_prefix[0] = '\0';
+	}
+
+	/* Handle endpoint URL and extract hostname */
+	endpoint_url = opts.object_storage_endpoint_url;
+	hostname = _strip_scheme(endpoint_url);
+
+	/* Build full object path */
+	if (normalized_prefix[0] != '\0' && strncmp(object_key, normalized_prefix, strlen(normalized_prefix)) == 0) {
+		snprintf(info->full_object_path, sizeof(info->full_object_path), "%s", object_key);
+	} else {
+		snprintf(info->full_object_path, sizeof(info->full_object_path), "%s%s", normalized_prefix, object_key);
+	}
+
+	/* Construct URL */
+	if (opts.express_one_zone) {
+		snprintf(info->url, sizeof(info->url), "https://%s.%s/%s",
+			 opts.object_storage_bucket, opts.object_storage_endpoint_url, info->full_object_path);
+	} else if (opts.object_storage_bucket && opts.object_storage_bucket[0] != '\0') {
+		if (opts.object_storage_path_style) {
+			if (hostname != endpoint_url) {
+				snprintf(info->url, sizeof(info->url), "%.*s%s/%s/%s",
+					 (int)(hostname - endpoint_url), endpoint_url,
+					 hostname, opts.object_storage_bucket, info->full_object_path);
+			} else {
+				snprintf(info->url, sizeof(info->url), "https://%s/%s/%s",
+					 hostname, opts.object_storage_bucket, info->full_object_path);
+			}
+		} else {
+			if (hostname != endpoint_url) {
+				snprintf(info->url, sizeof(info->url), "%.*s%s.%s/%s",
+					 (int)(hostname - endpoint_url), endpoint_url,
+					 opts.object_storage_bucket, hostname, info->full_object_path);
+			} else {
+				snprintf(info->url, sizeof(info->url), "https://%s.%s/%s",
+					 opts.object_storage_bucket, hostname, info->full_object_path);
+			}
+		}
+	} else {
+		if (hostname != endpoint_url) {
+			snprintf(info->url, sizeof(info->url), "%s/%s", endpoint_url, info->full_object_path);
+		} else {
+			snprintf(info->url, sizeof(info->url), "https://%s/%s", hostname, info->full_object_path);
+		}
+	}
+
+	/* Construct auth host */
+	if (opts.express_one_zone) {
+		snprintf(info->auth_host, sizeof(info->auth_host), "%s.%s",
+			 opts.object_storage_bucket, opts.object_storage_endpoint_url);
+	} else if (opts.object_storage_path_style ||
+		   !opts.object_storage_bucket || !opts.object_storage_bucket[0]) {
+		snprintf(info->auth_host, sizeof(info->auth_host), "%s", hostname);
+	} else {
+		snprintf(info->auth_host, sizeof(info->auth_host), "%s.%s",
+			 opts.object_storage_bucket, hostname);
+	}
+	/* Strip trailing slash from auth_host */
+	{
+		size_t hlen = strlen(info->auth_host);
+		if (hlen > 0 && info->auth_host[hlen - 1] == '/')
+			info->auth_host[hlen - 1] = '\0';
+	}
+
+	/* Construct canonical URI */
+	if (!opts.express_one_zone && opts.object_storage_path_style &&
+	    opts.object_storage_bucket && opts.object_storage_bucket[0]) {
+		snprintf(info->canonical_uri, sizeof(info->canonical_uri), "/%s/%s",
+			 opts.object_storage_bucket, info->full_object_path);
+	} else {
+		snprintf(info->canonical_uri, sizeof(info->canonical_uri), "/%s", info->full_object_path);
+	}
+
+	return 0;
+}
+
+/*
+ * Get curl handle appropriate for current thread context.
+ * Returns NULL on failure.
+ */
+static CURL *_get_curl_handle(void)
+{
+	CURL *handle;
+
+	if (!is_main_thread()) {
+		handle = get_thread_curl_handle();
+		if (!handle)
+			pr_err("Failed to get thread-local curl handle\n");
+		return handle;
+	}
+
+	handle = get_curl_handle_for_current_process();
+	if (!handle) {
+		pr_warn("Failed to get process curl handle, using one-time handle\n");
+		handle = curl_easy_init();
+		if (handle)
+			set_fixed_curl_options(handle);
+		return handle;
+	}
+
+	curl_easy_reset(handle);
+	set_fixed_curl_options(handle);
+	return handle;
+}
+
+/*
+ * =================================================================================
+ * PUT Object — Simple upload for small files (metadata, pagemap, etc.)
+ * =================================================================================
+ */
+
+/* Read callback for curl PUT upload */
+struct UploadContext {
+	const char *data;
+	unsigned long size;
+	unsigned long offset;
+};
+
+static size_t _upload_read_callback(char *ptr, size_t size, size_t nmemb, void *userdata)
+{
+	struct UploadContext *ctx = (struct UploadContext *)userdata;
+	size_t remaining = ctx->size - ctx->offset;
+	size_t to_copy = size * nmemb;
+	if (to_copy > remaining)
+		to_copy = remaining;
+	memcpy(ptr, ctx->data + ctx->offset, to_copy);
+	ctx->offset += to_copy;
+	return to_copy;
+}
+
+int object_storage_put_object(const char *object_key, const void *data, unsigned long length)
+{
+	struct object_url_info url_info;
+	struct UploadContext upload_ctx;
+	struct MemoryStruct response;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	struct curl_slist *headers = NULL;
+	char content_sha256[65];
+
+	if (!object_key || !data) {
+		pr_err("put_object: NULL object_key or data\n");
+		return -1;
+	}
+
+	/* Ensure valid session for Express One Zone */
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	/* Construct URL */
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	/* Compute SHA256 of the body */
+	_sha256_hex((const char *)data, length, content_sha256);
+
+	/* Get curl handle */
+	curl_handle = _get_curl_handle();
+	if (!curl_handle)
+		return -1;
+
+	/* Setup upload context */
+	upload_ctx.data = (const char *)data;
+	upload_ctx.size = length;
+	upload_ctx.offset = 0;
+
+	/* Setup response buffer */
+	response.memory = malloc(1);
+	response.size = 0;
+	response.capacity = 0;
+
+	/* Configure curl for PUT */
+	curl_easy_setopt(curl_handle, CURLOPT_URL, url_info.url);
+	curl_easy_setopt(curl_handle, CURLOPT_UPLOAD, 1L);
+	curl_easy_setopt(curl_handle, CURLOPT_READFUNCTION, _upload_read_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_READDATA, &upload_ctx);
+	curl_easy_setopt(curl_handle, CURLOPT_INFILESIZE_LARGE, (curl_off_t)length);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &response);
+
+	/* Build auth headers */
+	if (_build_auth_headers("PUT", url_info.auth_host, url_info.canonical_uri, NULL,
+			       content_sha256, NULL, (long)length, &headers) != 0) {
+		free(response.memory);
+		return -1;
+	}
+	if (headers)
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	pr_info("PUT %s (%lu bytes)\n", url_info.url, length);
+
+	/* Execute */
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (headers)
+		curl_slist_free_all(headers);
+
+	if (res != CURLE_OK) {
+		pr_err("PUT failed: %s\n", curl_easy_strerror(res));
+		free(response.memory);
+		return -1;
+	}
+
+	if (http_code < 200 || http_code >= 300) {
+		pr_err("PUT failed with HTTP %ld: %.*s\n", http_code,
+		       (int)response.size, response.memory);
+		free(response.memory);
+		return -1;
+	}
+
+	pr_info("PUT %s succeeded (HTTP %ld)\n", object_key, http_code);
+	free(response.memory);
+	return 0;
+}
+
+/*
+ * =================================================================================
+ * Fetch Range (existing)
+ * =================================================================================
+ */
+
 int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer)
 {
 	CURL *curl_handle;
