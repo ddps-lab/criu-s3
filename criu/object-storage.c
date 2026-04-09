@@ -177,30 +177,37 @@ static const char *_strip_scheme(const char *url)
 }
 
 /*
- * Build SigV4 authentication headers for a GET request with Range header.
+ * Build SigV4 authentication headers for an S3 request.
  *
  * Parameters:
  *   access_key    - AWS access key ID (or session access key for Express)
  *   secret_key    - AWS secret access key (or session secret key for Express)
  *   session_token - Session token (NULL for standard S3/MinIO)
  *   region        - AWS region (e.g., "us-east-1")
- *   host          - Host header value, scheme-free (e.g., "bucket.s3.amazonaws.com" or "minio:9000")
- *   canonical_uri - URI path (e.g., "/object/key" or "/bucket/object/key")
- *   range_value   - Range header value (e.g., "bytes=0-4095")
+ *   method        - HTTP method ("GET", "PUT", "POST", "DELETE")
+ *   host          - Host header value, scheme-free (e.g., "bucket.s3.amazonaws.com")
+ *   canonical_uri - URI path (e.g., "/object/key")
+ *   query_string  - Canonical query string (NULL or "" for none)
+ *   content_sha256 - SHA256 hex of request body (use EMPTY_PAYLOAD_HASH for no body)
+ *   range_value   - Range header value (NULL if not applicable)
+ *   content_length - Content-Length value (-1 if not applicable)
  *   headers       - Output: curl_slist with Authorization, X-Amz-Date, etc.
  *
  * Returns 0 on success, -1 on failure.
  */
+#define EMPTY_PAYLOAD_HASH "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
 static int _build_sigv4_headers(const char *access_key, const char *secret_key,
 				const char *session_token, const char *region,
-				const char *host, const char *canonical_uri,
-				const char *range_value, struct curl_slist **headers)
+				const char *method, const char *host,
+				const char *canonical_uri, const char *query_string,
+				const char *content_sha256, const char *range_value,
+				long content_length, struct curl_slist **headers)
 {
 	char amz_date[17];
 	char date_stamp[9];
-	char payload_hash[65];
 	char canonical_headers[4096];
-	char signed_headers[128];
+	char signed_headers[256];
 	char canonical_request[8192];
 	char canonical_request_hash[65];
 	char string_to_sign[512];
@@ -211,49 +218,76 @@ static int _build_sigv4_headers(const char *access_key, const char *secret_key,
 	char x_amz_content_sha256_header[100];
 	time_t now;
 	struct tm *tm_gmt;
-	const char *method = "GET";
 	const char *service = "s3";
-	const char *canonical_querystring = "";
+	const char *qs = (query_string && query_string[0]) ? query_string : "";
 	unsigned char *signing_key;
 	unsigned int signing_key_len;
 	unsigned char *signature_raw;
 	unsigned int signature_raw_len;
 	int i;
+	int pos;
 
 	now = time(NULL);
 	tm_gmt = gmtime(&now);
 	strftime(amz_date, sizeof(amz_date), "%Y%m%dT%H%M%SZ", tm_gmt);
 	strftime(date_stamp, sizeof(date_stamp), "%Y%m%d", tm_gmt);
 
-	/* Payload hash (empty for GET) */
-	_sha256_hex("", 0, payload_hash);
+	/*
+	 * Build signed headers and canonical headers.
+	 * Headers MUST be sorted alphabetically by name.
+	 * Conditionally include: content-length, range, x-amz-s3session-token.
+	 */
+	pos = 0;
+	signed_headers[0] = '\0';
+	canonical_headers[0] = '\0';
 
-	/* Build signed headers string and canonical headers */
+	/* content-length (only for PUT/POST with body) */
+	if (content_length >= 0) {
+		pos += snprintf(canonical_headers + pos, sizeof(canonical_headers) - pos,
+				"content-length:%ld\n", content_length);
+		strncat(signed_headers, "content-length;", sizeof(signed_headers) - strlen(signed_headers) - 1);
+	}
+
+	/* host (always) */
+	pos += snprintf(canonical_headers + pos, sizeof(canonical_headers) - pos,
+			"host:%s\n", host);
+	strncat(signed_headers, "host;", sizeof(signed_headers) - strlen(signed_headers) - 1);
+
+	/* range (only for GET with range) */
+	if (range_value) {
+		pos += snprintf(canonical_headers + pos, sizeof(canonical_headers) - pos,
+				"range:%s\n", range_value);
+		strncat(signed_headers, "range;", sizeof(signed_headers) - strlen(signed_headers) - 1);
+	}
+
+	/* x-amz-content-sha256 (always) */
+	pos += snprintf(canonical_headers + pos, sizeof(canonical_headers) - pos,
+			"x-amz-content-sha256:%s\n", content_sha256);
+	strncat(signed_headers, "x-amz-content-sha256;", sizeof(signed_headers) - strlen(signed_headers) - 1);
+
+	/* x-amz-date (always) */
+	pos += snprintf(canonical_headers + pos, sizeof(canonical_headers) - pos,
+			"x-amz-date:%s\n", amz_date);
+	strncat(signed_headers, "x-amz-date;", sizeof(signed_headers) - strlen(signed_headers) - 1);
+
+	/* x-amz-s3session-token (Express One Zone only) */
 	if (session_token) {
-		snprintf(signed_headers, sizeof(signed_headers),
-			 "host;range;x-amz-content-sha256;x-amz-date;x-amz-s3session-token");
-		snprintf(canonical_headers, sizeof(canonical_headers),
-			 "host:%s\n"
-			 "range:%s\n"
-			 "x-amz-content-sha256:%s\n"
-			 "x-amz-date:%s\n"
-			 "x-amz-s3session-token:%s\n",
-			 host, range_value, payload_hash, amz_date, session_token);
-	} else {
-		snprintf(signed_headers, sizeof(signed_headers),
-			 "host;range;x-amz-content-sha256;x-amz-date");
-		snprintf(canonical_headers, sizeof(canonical_headers),
-			 "host:%s\n"
-			 "range:%s\n"
-			 "x-amz-content-sha256:%s\n"
-			 "x-amz-date:%s\n",
-			 host, range_value, payload_hash, amz_date);
+		pos += snprintf(canonical_headers + pos, sizeof(canonical_headers) - pos,
+				"x-amz-s3session-token:%s\n", session_token);
+		strncat(signed_headers, "x-amz-s3session-token;", sizeof(signed_headers) - strlen(signed_headers) - 1);
+	}
+
+	/* Remove trailing semicolon from signed_headers */
+	{
+		size_t sh_len = strlen(signed_headers);
+		if (sh_len > 0 && signed_headers[sh_len - 1] == ';')
+			signed_headers[sh_len - 1] = '\0';
 	}
 
 	/* Build canonical request */
 	snprintf(canonical_request, sizeof(canonical_request), "%s\n%s\n%s\n%s\n%s\n%s",
-		 method, canonical_uri, canonical_querystring,
-		 canonical_headers, signed_headers, payload_hash);
+		 method, canonical_uri, qs,
+		 canonical_headers, signed_headers, content_sha256);
 
 	/* Hash canonical request */
 	_sha256_hex(canonical_request, strlen(canonical_request), canonical_request_hash);
@@ -287,13 +321,19 @@ static int _build_sigv4_headers(const char *access_key, const char *secret_key,
 		 "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
 		 access_key, credential_scope, signed_headers, signature_hex);
 
-	/* Append headers */
+	/* Append headers to curl_slist */
 	snprintf(x_amz_date_header, sizeof(x_amz_date_header), "X-Amz-Date: %s", amz_date);
 	*headers = curl_slist_append(*headers, x_amz_date_header);
 
 	snprintf(x_amz_content_sha256_header, sizeof(x_amz_content_sha256_header),
-		 "X-Amz-Content-Sha256: %s", payload_hash);
+		 "X-Amz-Content-Sha256: %s", content_sha256);
 	*headers = curl_slist_append(*headers, x_amz_content_sha256_header);
+
+	if (content_length >= 0) {
+		char cl_header[64];
+		snprintf(cl_header, sizeof(cl_header), "Content-Length: %ld", content_length);
+		*headers = curl_slist_append(*headers, cl_header);
+	}
 
 	if (session_token) {
 		char token_header[2100];
@@ -311,34 +351,40 @@ static int _build_sigv4_headers(const char *access_key, const char *secret_key,
  * Build authentication headers for object storage requests.
  * Single entry point for all auth methods — dispatches to provider-specific implementations.
  *
- * Currently supports:
- *   - AWS SigV4 (S3, S3 Express One Zone, MinIO, S3-compatible)
- *
- * Future extension points (add branches here):
- *   - Azure Blob Storage: SharedKey / SAS token
- *   - GCP Cloud Storage: OAuth2 Bearer token
- *   - S3-compatible with HMAC: reuses _build_sigv4_headers()
+ * Parameters:
+ *   method        - HTTP method ("GET", "PUT", "POST", "DELETE")
+ *   host          - Host header value, scheme-free
+ *   canonical_uri - URI path
+ *   query_string  - Canonical query string (NULL or "" for none)
+ *   content_sha256 - SHA256 hex of body (EMPTY_PAYLOAD_HASH for no body)
+ *   range_value   - Range header value (NULL if not applicable)
+ *   content_length - Content-Length (-1 if not applicable)
+ *   headers       - Output: curl_slist
  */
-static int _build_auth_headers(const char *host, const char *canonical_uri,
-			       const char *range_value, struct curl_slist **headers)
+static int _build_auth_headers(const char *method, const char *host,
+			       const char *canonical_uri, const char *query_string,
+			       const char *content_sha256, const char *range_value,
+			       long content_length, struct curl_slist **headers)
 {
 	if (opts.express_one_zone && opts.aws_access_key && opts.aws_secret_key) {
-		/* AWS S3 Express One Zone: SigV4 with temporary session credentials */
 		pr_debug("Auth: SigV4 with Express One Zone session credentials\n");
 		return _build_sigv4_headers(g_session_access_key, g_session_secret_key,
 					    g_session_token, opts.aws_region,
-					    host, canonical_uri, range_value, headers);
+					    method, host, canonical_uri, query_string,
+					    content_sha256, range_value,
+					    content_length, headers);
 	}
 
 	if (opts.aws_access_key && opts.aws_secret_key) {
-		/* AWS S3 / MinIO / S3-compatible: SigV4 with IAM credentials */
 		pr_debug("Auth: SigV4 with standard credentials\n");
 		return _build_sigv4_headers(opts.aws_access_key, opts.aws_secret_key,
 					    NULL, opts.aws_region,
-					    host, canonical_uri, range_value, headers);
+					    method, host, canonical_uri, query_string,
+					    content_sha256, range_value,
+					    content_length, headers);
 	}
 
-	/* No credentials — anonymous access (e.g., public bucket) */
+	/* No credentials — anonymous access */
 	return 0;
 }
 
@@ -1257,7 +1303,8 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 		snprintf(range_header_value, sizeof(range_header_value), "bytes=%lu-%lu",
 			 offset, offset + length - 1);
 
-		if (_build_auth_headers(auth_host, auth_canonical_uri, range_header_value, &headers) != 0) {
+		if (_build_auth_headers("GET", auth_host, auth_canonical_uri, NULL,
+				       EMPTY_PAYLOAD_HASH, range_header_value, -1, &headers) != 0) {
 			free(error_response.memory);
 			return -1;
 		}
