@@ -738,6 +738,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "exclude-file", required_argument, 0, 1113 },
 		{ "no-parent-range", required_argument, 0, 1114 },
 		{ "object-storage-path-style", no_argument, NULL, 1115 },
+		{ "object-storage-upload", no_argument, NULL, 1116 },
 		{},
 	};
 
@@ -1169,6 +1170,10 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		}
 		case 1115:
 			opts.object_storage_path_style = true;
+			break;
+		case 1116:
+			opts.object_storage_upload = true;
+			opts.enable_object_storage = true;
 			break;
 		default:
 			return 2;
