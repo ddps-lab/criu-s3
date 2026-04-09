@@ -1692,6 +1692,91 @@ int object_storage_multipart_abort(const char *object_key, const char *upload_id
 
 /*
  * =================================================================================
+ * GET Object — fetch entire file (for metadata files with unknown size)
+ * =================================================================================
+ */
+
+int object_storage_get_object(const char *object_key, void **out_data, unsigned long *out_length)
+{
+	struct object_url_info url_info;
+	struct MemoryStruct chunk;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	struct curl_slist *headers = NULL;
+
+	if (!object_key || !out_data || !out_length) {
+		pr_err("get_object: NULL parameter\n");
+		return -1;
+	}
+
+	*out_data = NULL;
+	*out_length = 0;
+
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	curl_handle = _get_curl_handle();
+	if (!curl_handle)
+		return -1;
+
+	chunk.memory = malloc(1);
+	chunk.size = 0;
+	chunk.capacity = 0;
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, url_info.url);
+	curl_easy_setopt(curl_handle, CURLOPT_HTTPGET, 1L);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &chunk);
+
+	/* SigV4: GET without Range header */
+	if (_build_auth_headers("GET", url_info.auth_host, url_info.canonical_uri,
+			       NULL, EMPTY_PAYLOAD_HASH, NULL, -1, &headers) != 0) {
+		free(chunk.memory);
+		return -1;
+	}
+	if (headers)
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	pr_debug("GET %s (full object)\n", url_info.url);
+
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (headers)
+		curl_slist_free_all(headers);
+
+	if (res != CURLE_OK) {
+		pr_err("GET %s failed: %s\n", object_key, curl_easy_strerror(res));
+		free(chunk.memory);
+		return -1;
+	}
+
+	if (http_code == 404) {
+		pr_debug("GET %s: not found (HTTP 404)\n", object_key);
+		free(chunk.memory);
+		return -ENOENT;
+	}
+
+	if (http_code < 200 || http_code >= 300) {
+		pr_err("GET %s failed with HTTP %ld\n", object_key, http_code);
+		free(chunk.memory);
+		return -1;
+	}
+
+	pr_debug("GET %s: %lu bytes (HTTP %ld)\n", object_key, (unsigned long)chunk.size, http_code);
+	*out_data = chunk.memory;
+	*out_length = chunk.size;
+	return 0;
+}
+
+/*
+ * =================================================================================
  * Fetch Range (existing)
  * =================================================================================
  */

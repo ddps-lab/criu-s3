@@ -128,6 +128,17 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 int object_storage_put_object(const char *object_key, const void *data, unsigned long length);
 
 /*
+ * Fetch an entire object from object storage (for metadata files with unknown size)
+ *
+ * @param object_key: The key/path of the object
+ * @param out_data: Output pointer to allocated buffer (caller must free)
+ * @param out_length: Output size of fetched data
+ *
+ * Returns 0 on success, -ENOENT if not found, -1 on other failure
+ */
+int object_storage_get_object(const char *object_key, void **out_data, unsigned long *out_length);
+
+/*
  * Multipart upload API — for large files (pages-*.img, > 5MB)
  *
  * Usage:
