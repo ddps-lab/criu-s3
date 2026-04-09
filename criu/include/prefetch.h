@@ -18,9 +18,7 @@ struct prefetch_stats {
 	unsigned long completed;
 	unsigned long failed;
 	unsigned long cache_stored;
-	unsigned long pattern_count;
 	unsigned long ahead_count;
-	unsigned long background_count;
 	unsigned long bytes_prefetched;
 };
 
@@ -60,6 +58,5 @@ void prefetch_get_stats(struct prefetch_stats *stats);
 void prefetch_reset_stats(void);
 
 /* Get idle worker count */
-int prefetch_get_idle_workers(void);
 
 #endif /* __CR_PREFETCH_H__ */
