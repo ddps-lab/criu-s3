@@ -116,9 +116,9 @@ struct cr_img {
 			int fd; /* should be first to coincide with _x.fd */
 			int type;
 			unsigned long oflags;
-			char *path;
 		};
 	};
+	char *path; /* filename for lazy images and S3 upload tracking */
 };
 
 #define EMPTY_IMG_FD (-404)

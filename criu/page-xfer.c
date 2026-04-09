@@ -18,6 +18,7 @@
 #include "image.h"
 #include "page-xfer.h"
 #include "page-pipe.h"
+#include "object-storage.h"
 #include "util.h"
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
@@ -358,8 +359,10 @@ static void close_page_xfer(struct page_xfer *xfer)
 		xfree(xfer->parent);
 		xfer->parent = NULL;
 	}
-	close_image(xfer->pi);
-	close_image(xfer->pmi);
+	if (xfer->pi)
+		close_image(xfer->pi);
+	if (xfer->pmi)
+		close_image(xfer->pmi);
 }
 
 static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
@@ -402,7 +405,44 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 			goto err_pi;
 		}
 
-		ret = open_page_read_at(pfd, img_id, xfer->parent, pr_flags);
+		/*
+		 * When object-storage-upload is enabled, parent dir may be
+		 * empty (S3-only mode). Swap prefix to parent's so that
+		 * do_open_image() S3 fallback fetches from the right prefix.
+		 */
+		if (opts.object_storage_upload) {
+			void *prefix_data = NULL;
+			unsigned long prefix_len = 0;
+			char *parent_prefix = NULL;
+			char *saved_prefix;
+			int s3_ret;
+
+			s3_ret = object_storage_get_object("parent-prefix",
+							   &prefix_data, &prefix_len);
+			if (s3_ret == 0 && prefix_data && prefix_len > 0) {
+				parent_prefix = xmalloc(prefix_len + 1);
+				if (parent_prefix) {
+					memcpy(parent_prefix, prefix_data, prefix_len);
+					parent_prefix[prefix_len] = '\0';
+				}
+			}
+			if (prefix_data)
+				free(prefix_data);
+
+			if (parent_prefix) {
+				pr_info("page-xfer: using parent prefix: %s\n", parent_prefix);
+				saved_prefix = opts.object_storage_object_prefix;
+				opts.object_storage_object_prefix = parent_prefix;
+				ret = open_page_read_at(pfd, img_id, xfer->parent, pr_flags);
+				opts.object_storage_object_prefix = saved_prefix;
+				xfree(parent_prefix);
+			} else {
+				ret = open_page_read_at(pfd, img_id, xfer->parent, pr_flags);
+			}
+		} else {
+			ret = open_page_read_at(pfd, img_id, xfer->parent, pr_flags);
+		}
+
 		if (ret <= 0) {
 			pr_perror("No parent image found, though parent directory is set");
 			xfree(xfer->parent);
@@ -426,6 +466,304 @@ err_pmi:
 	return -1;
 }
 
+/*
+ * S3 upload wrapper functions (dual-write: local + S3).
+ * Local xfer functions handle the actual file I/O.
+ * S3 functions upload pages data via multipart and pagemap via put_object.
+ */
+
+#define OBJECT_STORAGE_PART_SIZE (8 * 1024 * 1024) /* 8MB per multipart part */
+
+static int _flush_object_storage_part(struct page_xfer *xfer)
+{
+	char etag[256];
+	int ret;
+
+	if (xfer->object_storage.etags_count >= xfer->object_storage.etags_cap) {
+		int new_cap = xfer->object_storage.etags_cap * 2;
+		char **new_etags = xrealloc(xfer->object_storage.etags, new_cap * sizeof(char *));
+		if (!new_etags)
+			return -1;
+		xfer->object_storage.etags = new_etags;
+		xfer->object_storage.etags_cap = new_cap;
+	}
+
+	xfer->object_storage.part_number++;
+	ret = object_storage_multipart_upload_part(
+		xfer->object_storage.pages_key, xfer->object_storage.upload_id,
+		xfer->object_storage.part_number,
+		xfer->object_storage.part_buf, xfer->object_storage.part_buf_used,
+		etag, sizeof(etag));
+	if (ret < 0) {
+		pr_err("object_storage: multipart upload part %d failed\n",
+		       xfer->object_storage.part_number);
+		return -1;
+	}
+	xfer->object_storage.etags[xfer->object_storage.etags_count] = xstrdup(etag);
+	xfer->object_storage.etags_count++;
+	xfer->object_storage.part_buf_used = 0;
+	return 0;
+}
+
+static int write_pages_object_storage(struct page_xfer *xfer, int p, unsigned long len)
+{
+	unsigned long remaining;
+	ssize_t nread;
+	int ret;
+
+	/*
+	 * Read pages from pipe directly into buffer for both local write
+	 * and object storage upload. We read from the pipe into a temp buffer,
+	 * write to local file, and accumulate in the part buffer for upload.
+	 */
+	remaining = len;
+	while (remaining > 0) {
+		unsigned long chunk_size;
+		unsigned long space;
+		char *dst;
+
+		space = xfer->object_storage.part_buf_cap - xfer->object_storage.part_buf_used;
+		chunk_size = remaining < space ? remaining : space;
+
+		/* Read from pipe into part buffer */
+		dst = (char *)xfer->object_storage.part_buf + xfer->object_storage.part_buf_used;
+		nread = read(p, dst, chunk_size);
+		if (nread <= 0) {
+			pr_err("object_storage: failed to read from pipe\n");
+			return -1;
+		}
+
+		/* Write to local pages file (skip in S3-only mode) */
+		if (xfer->pi) {
+			ssize_t nw;
+			unsigned long wr = 0;
+			while (wr < (unsigned long)nread) {
+				nw = write(img_raw_fd(xfer->pi), dst + wr, nread - wr);
+				if (nw <= 0) {
+					pr_err("object_storage: failed to write to local pages file\n");
+					return -1;
+				}
+				wr += nw;
+			}
+		}
+
+		xfer->object_storage.part_buf_used += nread;
+		remaining -= nread;
+
+		/* Flush part when buffer is full */
+		if (xfer->object_storage.part_buf_used >= OBJECT_STORAGE_PART_SIZE) {
+			ret = _flush_object_storage_part(xfer);
+			if (ret < 0)
+				return ret;
+		}
+	}
+
+	return 0;
+}
+
+static int write_pagemap_object_storage(struct page_xfer *xfer, struct iovec *iov, u32 flags)
+{
+	/* Write to local file first */
+	return write_pagemap_loc(xfer, iov, flags);
+	/* Pagemap is uploaded on close via put_object from the local file */
+}
+
+static void close_page_xfer_object_storage(struct page_xfer *xfer)
+{
+	int i;
+
+	if (xfer->object_storage.active) {
+		/* Flush remaining part buffer */
+		if (xfer->object_storage.part_buf_used > 0 || xfer->object_storage.part_number == 0) {
+			char etag[256];
+			int ret;
+
+			if (xfer->object_storage.etags_count >= xfer->object_storage.etags_cap) {
+				int new_cap = xfer->object_storage.etags_cap + 1;
+				char **new_etags = xrealloc(xfer->object_storage.etags, new_cap * sizeof(char *));
+				if (new_etags) {
+					xfer->object_storage.etags = new_etags;
+					xfer->object_storage.etags_cap = new_cap;
+				}
+			}
+
+			if (xfer->object_storage.part_buf_used > 0 || xfer->object_storage.part_number == 0) {
+				xfer->object_storage.part_number++;
+				ret = object_storage_multipart_upload_part(
+					xfer->object_storage.pages_key, xfer->object_storage.upload_id,
+					xfer->object_storage.part_number,
+					xfer->object_storage.part_buf,
+					xfer->object_storage.part_buf_used > 0 ? xfer->object_storage.part_buf_used : 0,
+					etag, sizeof(etag));
+				if (ret < 0) {
+					pr_err("object_storage: final part upload failed, aborting\n");
+					object_storage_multipart_abort(xfer->object_storage.pages_key,
+								       xfer->object_storage.upload_id);
+					goto cleanup;
+				}
+				xfer->object_storage.etags[xfer->object_storage.etags_count] = xstrdup(etag);
+				xfer->object_storage.etags_count++;
+			}
+		}
+
+		/* Complete multipart upload */
+		if (xfer->object_storage.etags_count > 0) {
+			int ret;
+			ret = object_storage_multipart_complete(
+				xfer->object_storage.pages_key, xfer->object_storage.upload_id,
+				xfer->object_storage.etags_count, (const char **)xfer->object_storage.etags);
+			if (ret < 0)
+				pr_err("object_storage: multipart complete failed for %s\n", xfer->object_storage.pages_key);
+		}
+
+		/*
+		 * Upload pagemap: close local files first to flush buffered writes,
+		 * then reopen the pagemap file to read and upload to object storage.
+		 */
+		{
+			char pagemap_key_copy[512];
+			snprintf(pagemap_key_copy, sizeof(pagemap_key_copy), "%s",
+				 xfer->object_storage.pagemap_key);
+
+			/* Close local files (flushes buffers) */
+			close_page_xfer(xfer);
+
+			/* Reopen pagemap from images-dir and upload */
+			{
+				int pmi_fd;
+				off_t pmi_size;
+
+				pmi_fd = openat(get_service_fd(IMG_FD_OFF), pagemap_key_copy, O_RDONLY);
+				if (pmi_fd >= 0) {
+					pmi_size = lseek(pmi_fd, 0, SEEK_END);
+					if (pmi_size > 0) {
+						void *pmi_data;
+						ssize_t nr;
+						unsigned long rd;
+
+						lseek(pmi_fd, 0, SEEK_SET);
+						pmi_data = xmalloc(pmi_size);
+						if (pmi_data) {
+							rd = 0;
+							while (rd < (unsigned long)pmi_size) {
+								nr = read(pmi_fd, (char *)pmi_data + rd,
+									  pmi_size - rd);
+								if (nr <= 0)
+									break;
+								rd += nr;
+							}
+							if (rd == (unsigned long)pmi_size)
+								object_storage_put_object(pagemap_key_copy,
+											  pmi_data, pmi_size);
+							xfree(pmi_data);
+						}
+					}
+					close(pmi_fd);
+				}
+			}
+		}
+
+		goto cleanup_storage;
+
+cleanup:
+		/* Close local files (if not already closed above) */
+		close_page_xfer(xfer);
+
+cleanup_storage:
+		/* Free etags */
+		for (i = 0; i < xfer->object_storage.etags_count; i++)
+			xfree(xfer->object_storage.etags[i]);
+		xfree(xfer->object_storage.etags);
+		xfree(xfer->object_storage.part_buf);
+		xfer->object_storage.active = 0;
+	}
+}
+
+static int open_page_object_storage_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
+{
+	int ret;
+
+	/*
+	 * Open local xfer first (creates pagemap + pages files locally).
+	 * We need local pagemap for pb_write_one() buffering.
+	 * Pages file is only needed in dual-write mode.
+	 */
+	ret = open_page_local_xfer(xfer, fd_type, img_id);
+	if (ret < 0)
+		return ret;
+
+	/* Initialize object storage upload state */
+	memset(&xfer->object_storage, 0, sizeof(xfer->object_storage));
+
+	/*
+	 * Construct object storage keys from actual local filenames.
+	 * pages file uses sequential page_ids (1,2,3...), not PID.
+	 * pagemap file uses PID (img_id). Use path from cr_img if available.
+	 */
+	if (xfer->pi && xfer->pi->path) {
+		snprintf(xfer->object_storage.pages_key, sizeof(xfer->object_storage.pages_key),
+			 "%s", xfer->pi->path);
+	} else {
+		snprintf(xfer->object_storage.pages_key, sizeof(xfer->object_storage.pages_key),
+			 "pages-%lu.img", img_id);
+	}
+	if (xfer->pmi && xfer->pmi->path) {
+		snprintf(xfer->object_storage.pagemap_key, sizeof(xfer->object_storage.pagemap_key),
+			 "%s", xfer->pmi->path);
+	} else {
+		snprintf(xfer->object_storage.pagemap_key, sizeof(xfer->object_storage.pagemap_key),
+			 "pagemap-%lu.img", img_id);
+	}
+
+	/*
+	 * Close local pages file — pages data goes only to object storage.
+	 * This eliminates disk I/O for the bulk data (pages are 99%+ of size).
+	 * Pagemap stays local for pb_write_one() buffering, uploaded on close.
+	 */
+	if (xfer->pi) {
+		close_image(xfer->pi);
+		xfer->pi = NULL;
+	}
+
+	/* Allocate part buffer */
+	xfer->object_storage.part_buf_cap = OBJECT_STORAGE_PART_SIZE;
+	xfer->object_storage.part_buf = xmalloc(OBJECT_STORAGE_PART_SIZE);
+	if (!xfer->object_storage.part_buf)
+		return -1;
+	xfer->object_storage.part_buf_used = 0;
+	xfer->object_storage.part_number = 0;
+
+	/* Allocate etags array */
+	xfer->object_storage.etags_cap = 64;
+	xfer->object_storage.etags = xmalloc(xfer->object_storage.etags_cap * sizeof(char *));
+	if (!xfer->object_storage.etags) {
+		xfree(xfer->object_storage.part_buf);
+		return -1;
+	}
+	xfer->object_storage.etags_count = 0;
+
+	/* Initiate multipart upload for pages */
+	ret = object_storage_multipart_init(xfer->object_storage.pages_key,
+					    xfer->object_storage.upload_id,
+					    sizeof(xfer->object_storage.upload_id));
+	if (ret < 0) {
+		pr_err("object_storage: failed to initiate multipart upload for %s\n",
+		       xfer->object_storage.pages_key);
+		xfree(xfer->object_storage.part_buf);
+		xfree(xfer->object_storage.etags);
+		return -1;
+	}
+
+	xfer->object_storage.active = 1;
+
+	/* Override write/close functions with S3 wrappers */
+	xfer->write_pagemap = write_pagemap_object_storage;
+	xfer->write_pages = write_pages_object_storage;
+	xfer->close = close_page_xfer_object_storage;
+
+	return 0;
+}
+
 int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 {
 	xfer->offset = 0;
@@ -433,6 +771,8 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, img_id);
+	else if (opts.object_storage_upload)
+		return open_page_object_storage_xfer(xfer, fd_type, img_id);
 	else
 		return open_page_local_xfer(xfer, fd_type, img_id);
 }

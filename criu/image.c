@@ -19,6 +19,7 @@
 #include "proc_parse.h"
 #include "img-streamer.h"
 #include "namespaces.h"
+#include "object-storage.h"
 
 bool ns_per_id = false;
 bool img_common_magic = true;
@@ -306,24 +307,47 @@ InventoryEntry *get_parent_inventory(void)
 	struct cr_img *img;
 	InventoryEntry *ie;
 	int dir;
+	char *saved_prefix = NULL;
+	char *parent_prefix = NULL;
 
 	if (open_parent(get_service_fd(IMG_FD_OFF), &dir)) {
-		/*
-		 * We print the warning below to be notified that we had some
-		 * unexpected problem on open. For instance we have a parent
-		 * directory but have no access. Having no parent inventory
-		 * when also having no parent directory is an expected case of
-		 * first dump iteration.
-		 */
 		pr_warn("Failed to open parent directory\n");
 		return NULL;
 	}
 	if (dir < 0)
 		return NULL;
 
+	/*
+	 * When object storage is enabled, swap prefix to parent's
+	 * so that S3 fallback fetches from the correct location.
+	 */
+	if (opts.enable_object_storage) {
+		void *prefix_data = NULL;
+		unsigned long prefix_len = 0;
+		int s3_ret;
+
+		s3_ret = object_storage_get_object("parent-prefix",
+						   &prefix_data, &prefix_len);
+		if (s3_ret == 0 && prefix_data && prefix_len > 0) {
+			parent_prefix = xmalloc(prefix_len + 1);
+			if (parent_prefix) {
+				memcpy(parent_prefix, prefix_data, prefix_len);
+				parent_prefix[prefix_len] = '\0';
+				saved_prefix = opts.object_storage_object_prefix;
+				opts.object_storage_object_prefix = parent_prefix;
+			}
+		}
+		if (prefix_data)
+			free(prefix_data);
+	}
+
 	img = open_image_at(dir, CR_FD_INVENTORY, O_RSTR);
 	if (!img) {
 		pr_warn("Failed to open parent pre-dump inventory image\n");
+		if (saved_prefix) {
+			opts.object_storage_object_prefix = saved_prefix;
+			xfree(parent_prefix);
+		}
 		close(dir);
 		return NULL;
 	}
@@ -331,8 +355,18 @@ InventoryEntry *get_parent_inventory(void)
 	if (pb_read_one(img, &ie, PB_INVENTORY) < 0) {
 		pr_warn("Failed to read parent pre-dump inventory entry\n");
 		close_image(img);
+		if (saved_prefix) {
+			opts.object_storage_object_prefix = saved_prefix;
+			xfree(parent_prefix);
+		}
 		close(dir);
 		return NULL;
+	}
+
+	/* Restore original prefix */
+	if (saved_prefix) {
+		opts.object_storage_object_prefix = saved_prefix;
+		xfree(parent_prefix);
 	}
 
 	if (!ie->has_dump_uptime) {
@@ -508,6 +542,7 @@ struct cr_img *open_image_at(int dfd, int type, unsigned long flags, ...)
 	img = xmalloc(sizeof(*img));
 	if (!img)
 		return NULL;
+	img->path = NULL;
 
 	oflags = flags | imgset_template[type].oflags;
 
@@ -618,10 +653,57 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 		ret = userns_call(userns_openat, UNS_FDOUT, &pa, sizeof(struct openat_args), dfd);
 		if (ret < 0)
 			errno = pa.err;
+	} else if (opts.object_storage_upload && (flags & O_CREAT)) {
+		/*
+		 * Object storage upload mode: use memfd instead of local file.
+		 * All writes go to memory, uploaded to S3 on close_image().
+		 * Eliminates disk I/O entirely for metadata files.
+		 */
+		ret = memfd_create(path, 0);
 	} else
 		ret = openat(dfd, path, flags, CR_FD_PERM);
 	if (ret < 0) {
 		if (!(flags & O_CREAT) && (errno == ENOENT || ret == -ENOENT)) {
+			/*
+			 * File not found locally. If object storage is enabled,
+			 * try fetching from S3 and create a memfd for it.
+			 */
+			if (opts.enable_object_storage) {
+				void *s3_data = NULL;
+				unsigned long s3_len = 0;
+				int s3_ret;
+				int mfd;
+
+				s3_ret = object_storage_get_object(path, &s3_data, &s3_len);
+				if (s3_ret == 0 && s3_data && s3_len > 0) {
+					mfd = memfd_create(path, 0);
+					if (mfd >= 0) {
+						unsigned long wr = 0;
+						ssize_t nw;
+
+						while (wr < s3_len) {
+							nw = write(mfd, (char *)s3_data + wr, s3_len - wr);
+							if (nw <= 0)
+								break;
+							wr += nw;
+						}
+						free(s3_data);
+						if (wr == s3_len) {
+							lseek(mfd, 0, SEEK_SET);
+							ret = mfd;
+							pr_info("Fetched %s from object storage (%lu bytes)\n",
+								path, s3_len);
+							goto got_fd;
+						}
+						close(mfd);
+					} else {
+						free(s3_data);
+					}
+				} else if (s3_data) {
+					free(s3_data);
+				}
+			}
+
 			pr_info("No %s image\n", path);
 			img->_x.fd = EMPTY_IMG_FD;
 			goto skip_magic;
@@ -631,7 +713,19 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 		goto err;
 	}
 
+got_fd:
+
 	img->_x.fd = ret;
+
+	/*
+	 * When object-storage-upload is enabled and we're writing (O_DUMP),
+	 * save the filename so close_image() can upload to S3.
+	 * We reuse the 'path' field that's normally only used for lazy images.
+	 */
+	if (opts.object_storage_upload && (flags & O_CREAT)) {
+		img->path = xstrdup(path);
+	}
+
 	if (oflags & O_NOBUF)
 		bfd_setraw(&img->_x);
 	else {
@@ -688,8 +782,57 @@ void close_image(struct cr_img *img)
 		 */
 		unlinkat(get_service_fd(IMG_FD_OFF), img->path, 0);
 		xfree(img->path);
-	} else if (!empty_image(img))
-		bclose(&img->_x);
+	} else if (!empty_image(img)) {
+		/*
+		 * Upload metadata files to S3 on close (dual-write).
+		 * Skip pages-*.img as those are handled by page-xfer S3 backend.
+		 */
+		if (opts.object_storage_upload && img->path &&
+		    strncmp(img->path, "pages-", 6) != 0) {
+			int fd;
+			off_t file_size;
+
+			/*
+			 * Dup the fd before bclose() closes it, so we can
+			 * read back the written data for S3 upload.
+			 * Works with both memfd (S3-only) and local files (dual-write).
+			 */
+			fd = dup(img->_x.fd);
+			bclose(&img->_x);
+
+			if (fd >= 0) {
+				file_size = lseek(fd, 0, SEEK_END);
+				if (file_size > 0) {
+					void *buf;
+					ssize_t nr;
+					unsigned long rd;
+
+					lseek(fd, 0, SEEK_SET);
+					buf = xmalloc(file_size);
+					if (buf) {
+						rd = 0;
+						while (rd < (unsigned long)file_size) {
+							nr = read(fd, (char *)buf + rd,
+								  file_size - rd);
+							if (nr <= 0)
+								break;
+							rd += nr;
+						}
+						if (rd == (unsigned long)file_size)
+							object_storage_put_object(
+								img->path, buf, file_size);
+						xfree(buf);
+					}
+				}
+				close(fd);
+			}
+			xfree(img->path);
+		} else {
+			if (img->path)
+				xfree(img->path);
+			bclose(&img->_x);
+		}
+	}
 
 	xfree(img);
 }
@@ -701,6 +844,7 @@ struct cr_img *img_from_fd(int fd)
 	img = xmalloc(sizeof(*img));
 	if (img) {
 		img->_x.fd = fd;
+		img->path = NULL;
 		bfd_setraw(&img->_x);
 	}
 
@@ -734,19 +878,131 @@ int open_image_dir(char *dir, int mode)
 			goto err;
 	} else if (opts.img_parent) {
 		if (faccessat(fd, opts.img_parent, R_OK, 0)) {
-			pr_perror("Invalid parent image directory provided");
-			goto err;
+			if (!opts.enable_object_storage) {
+				pr_perror("Invalid parent image directory provided");
+				goto err;
+			}
+			pr_info("Parent dir %s not found locally, skipping symlink (object storage mode)\n",
+				opts.img_parent);
+		} else {
+			ret = symlinkat(opts.img_parent, fd, CR_PARENT_LINK);
+			if (ret < 0 && errno != EEXIST) {
+				pr_perror("Can't link parent snapshot");
+				goto err;
+			}
+
+			if (opts.img_parent[0] == '/')
+				pr_warn("Absolute paths for parent links "
+					"may not work on restore!\n");
 		}
 
-		ret = symlinkat(opts.img_parent, fd, CR_PARENT_LINK);
-		if (ret < 0 && errno != EEXIST) {
-			pr_perror("Can't link parent snapshot");
-			goto err;
-		}
+		/*
+		 * Upload parent prefix info to S3 so restore can find parent.
+		 * Convention: resolve --prev-images-dir relative to current prefix.
+		 * E.g., prefix="ckpt/dump2/", parent="../dump1/" → "ckpt/dump1/"
+		 */
+		if (opts.object_storage_upload && opts.object_storage_object_prefix) {
+			char parent_prefix[1024];
+			const char *cur = opts.object_storage_object_prefix;
+			const char *rel = opts.img_parent;
+			size_t cur_len;
+			size_t pp_len;
 
-		if (opts.img_parent[0] == '/')
-			pr_warn("Absolute paths for parent links "
-				"may not work on restore!\n");
+			/* Copy current prefix and resolve relative path */
+			snprintf(parent_prefix, sizeof(parent_prefix), "%s", cur);
+			cur_len = strlen(parent_prefix);
+			/* Remove trailing slash */
+			if (cur_len > 0 && parent_prefix[cur_len - 1] == '/')
+				parent_prefix[--cur_len] = '\0';
+
+			/* Process "../" segments */
+			while (strncmp(rel, "../", 3) == 0) {
+				char *last_slash;
+				rel += 3;
+				last_slash = strrchr(parent_prefix, '/');
+				if (last_slash)
+					*last_slash = '\0';
+				else
+					parent_prefix[0] = '\0';
+			}
+			/* Append remaining relative path */
+			if (rel[0]) {
+				pp_len = strlen(parent_prefix);
+				if (pp_len > 0)
+					snprintf(parent_prefix + pp_len,
+						 sizeof(parent_prefix) - pp_len, "/%s", rel);
+				else
+					snprintf(parent_prefix, sizeof(parent_prefix), "%s", rel);
+			}
+			/* Ensure trailing slash */
+			pp_len = strlen(parent_prefix);
+			if (pp_len > 0 && parent_prefix[pp_len - 1] != '/') {
+				parent_prefix[pp_len] = '/';
+				parent_prefix[pp_len + 1] = '\0';
+			}
+
+			pr_info("Uploading parent prefix marker: %s\n", parent_prefix);
+			object_storage_put_object("parent-prefix",
+						  parent_prefix, strlen(parent_prefix));
+		}
+	}
+
+	/*
+	 * On restore: if images-dir contains a parent-prefix file
+	 * (downloaded from S3) but no parent symlink, reconstruct
+	 * the parent symlink from parent-prefix content.
+	 *
+	 * parent-prefix contains the S3 prefix of the parent dump
+	 * (e.g., "chain/dump1/"). We extract the directory name
+	 * (e.g., "dump1") and create a symlink "../dump1" → parent.
+	 */
+	if (mode == O_RSTR && !opts.img_parent) {
+		struct stat st;
+		if (fstatat(fd, CR_PARENT_LINK, &st, AT_SYMLINK_NOFOLLOW) != 0 &&
+		    errno == ENOENT) {
+			/* No parent symlink — check for parent-prefix file */
+			int ppfd;
+			ppfd = openat(fd, "parent-prefix", O_RDONLY);
+			if (ppfd >= 0) {
+				char pp_buf[1024];
+				ssize_t nr;
+				nr = read(ppfd, pp_buf, sizeof(pp_buf) - 1);
+				close(ppfd);
+				if (nr > 0) {
+					char *last_slash;
+					char *dir_name;
+					char symlink_target[1024];
+
+					pp_buf[nr] = '\0';
+					/* Remove trailing slash/newline */
+					while (nr > 0 && (pp_buf[nr-1] == '/' || pp_buf[nr-1] == '\n'))
+						pp_buf[--nr] = '\0';
+
+					/* Extract last component: "chain/dump1" → "dump1" */
+					last_slash = strrchr(pp_buf, '/');
+					dir_name = last_slash ? last_slash + 1 : pp_buf;
+
+					/* Create symlink: ../dump1 */
+					snprintf(symlink_target, sizeof(symlink_target),
+						 "../%.1020s", dir_name);
+
+					/* Verify target exists */
+					if (faccessat(fd, symlink_target, R_OK, 0) == 0) {
+						ret = symlinkat(symlink_target, fd, CR_PARENT_LINK);
+						if (ret == 0 || errno == EEXIST)
+							pr_info("Reconstructed parent symlink: %s\n",
+								symlink_target);
+						else
+							pr_warn("Failed to create parent symlink %s\n",
+								symlink_target);
+					} else {
+						pr_debug("Parent dir %s not found locally, "
+							 "skipping symlink reconstruction\n",
+							 symlink_target);
+					}
+				}
+			}
+		}
 	}
 
 	return 0;

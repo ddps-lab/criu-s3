@@ -177,30 +177,37 @@ static const char *_strip_scheme(const char *url)
 }
 
 /*
- * Build SigV4 authentication headers for a GET request with Range header.
+ * Build SigV4 authentication headers for an S3 request.
  *
  * Parameters:
  *   access_key    - AWS access key ID (or session access key for Express)
  *   secret_key    - AWS secret access key (or session secret key for Express)
  *   session_token - Session token (NULL for standard S3/MinIO)
  *   region        - AWS region (e.g., "us-east-1")
- *   host          - Host header value, scheme-free (e.g., "bucket.s3.amazonaws.com" or "minio:9000")
- *   canonical_uri - URI path (e.g., "/object/key" or "/bucket/object/key")
- *   range_value   - Range header value (e.g., "bytes=0-4095")
+ *   method        - HTTP method ("GET", "PUT", "POST", "DELETE")
+ *   host          - Host header value, scheme-free (e.g., "bucket.s3.amazonaws.com")
+ *   canonical_uri - URI path (e.g., "/object/key")
+ *   query_string  - Canonical query string (NULL or "" for none)
+ *   content_sha256 - SHA256 hex of request body (use EMPTY_PAYLOAD_HASH for no body)
+ *   range_value   - Range header value (NULL if not applicable)
+ *   content_length - Content-Length value (-1 if not applicable)
  *   headers       - Output: curl_slist with Authorization, X-Amz-Date, etc.
  *
  * Returns 0 on success, -1 on failure.
  */
+#define EMPTY_PAYLOAD_HASH "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
 static int _build_sigv4_headers(const char *access_key, const char *secret_key,
 				const char *session_token, const char *region,
-				const char *host, const char *canonical_uri,
-				const char *range_value, struct curl_slist **headers)
+				const char *method, const char *host,
+				const char *canonical_uri, const char *query_string,
+				const char *content_sha256, const char *range_value,
+				long content_length, struct curl_slist **headers)
 {
 	char amz_date[17];
 	char date_stamp[9];
-	char payload_hash[65];
 	char canonical_headers[4096];
-	char signed_headers[128];
+	char signed_headers[256];
 	char canonical_request[8192];
 	char canonical_request_hash[65];
 	char string_to_sign[512];
@@ -211,52 +218,82 @@ static int _build_sigv4_headers(const char *access_key, const char *secret_key,
 	char x_amz_content_sha256_header[100];
 	time_t now;
 	struct tm *tm_gmt;
-	const char *method = "GET";
 	const char *service = "s3";
-	const char *canonical_querystring = "";
+	const char *qs = (query_string && query_string[0]) ? query_string : "";
 	unsigned char *signing_key;
 	unsigned int signing_key_len;
 	unsigned char *signature_raw;
 	unsigned int signature_raw_len;
 	int i;
+	int pos;
 
 	now = time(NULL);
 	tm_gmt = gmtime(&now);
 	strftime(amz_date, sizeof(amz_date), "%Y%m%dT%H%M%SZ", tm_gmt);
 	strftime(date_stamp, sizeof(date_stamp), "%Y%m%d", tm_gmt);
 
-	/* Payload hash (empty for GET) */
-	_sha256_hex("", 0, payload_hash);
+	/*
+	 * Build signed headers and canonical headers.
+	 * Headers MUST be sorted alphabetically by name.
+	 * Conditionally include: content-length, range, x-amz-s3session-token.
+	 */
+	pos = 0;
+	signed_headers[0] = '\0';
+	canonical_headers[0] = '\0';
 
-	/* Build signed headers string and canonical headers */
+	/*
+	 * Note: content-length is NOT included in signed headers.
+	 * curl sets Content-Length automatically. Including it in the
+	 * signature causes SignatureDoesNotMatch on AWS S3 because
+	 * curl may format the value differently than our signed version.
+	 */
+
+	/* host (always) */
+	pos += snprintf(canonical_headers + pos, sizeof(canonical_headers) - pos,
+			"host:%s\n", host);
+	strncat(signed_headers, "host;", sizeof(signed_headers) - strlen(signed_headers) - 1);
+
+	/* range (only for GET with range) */
+	if (range_value) {
+		pos += snprintf(canonical_headers + pos, sizeof(canonical_headers) - pos,
+				"range:%s\n", range_value);
+		strncat(signed_headers, "range;", sizeof(signed_headers) - strlen(signed_headers) - 1);
+	}
+
+	/* x-amz-content-sha256 (always) */
+	pos += snprintf(canonical_headers + pos, sizeof(canonical_headers) - pos,
+			"x-amz-content-sha256:%s\n", content_sha256);
+	strncat(signed_headers, "x-amz-content-sha256;", sizeof(signed_headers) - strlen(signed_headers) - 1);
+
+	/* x-amz-date (always) */
+	pos += snprintf(canonical_headers + pos, sizeof(canonical_headers) - pos,
+			"x-amz-date:%s\n", amz_date);
+	strncat(signed_headers, "x-amz-date;", sizeof(signed_headers) - strlen(signed_headers) - 1);
+
+	/* x-amz-s3session-token (Express One Zone only) */
 	if (session_token) {
-		snprintf(signed_headers, sizeof(signed_headers),
-			 "host;range;x-amz-content-sha256;x-amz-date;x-amz-s3session-token");
-		snprintf(canonical_headers, sizeof(canonical_headers),
-			 "host:%s\n"
-			 "range:%s\n"
-			 "x-amz-content-sha256:%s\n"
-			 "x-amz-date:%s\n"
-			 "x-amz-s3session-token:%s\n",
-			 host, range_value, payload_hash, amz_date, session_token);
-	} else {
-		snprintf(signed_headers, sizeof(signed_headers),
-			 "host;range;x-amz-content-sha256;x-amz-date");
-		snprintf(canonical_headers, sizeof(canonical_headers),
-			 "host:%s\n"
-			 "range:%s\n"
-			 "x-amz-content-sha256:%s\n"
-			 "x-amz-date:%s\n",
-			 host, range_value, payload_hash, amz_date);
+		pos += snprintf(canonical_headers + pos, sizeof(canonical_headers) - pos,
+				"x-amz-s3session-token:%s\n", session_token);
+		strncat(signed_headers, "x-amz-s3session-token;", sizeof(signed_headers) - strlen(signed_headers) - 1);
+	}
+
+	/* Remove trailing semicolon from signed_headers */
+	{
+		size_t sh_len = strlen(signed_headers);
+		if (sh_len > 0 && signed_headers[sh_len - 1] == ';')
+			signed_headers[sh_len - 1] = '\0';
 	}
 
 	/* Build canonical request */
 	snprintf(canonical_request, sizeof(canonical_request), "%s\n%s\n%s\n%s\n%s\n%s",
-		 method, canonical_uri, canonical_querystring,
-		 canonical_headers, signed_headers, payload_hash);
+		 method, canonical_uri, qs,
+		 canonical_headers, signed_headers, content_sha256);
 
 	/* Hash canonical request */
 	_sha256_hex(canonical_request, strlen(canonical_request), canonical_request_hash);
+
+	pr_debug("SigV4 canonical_request:\n---\n%s\n---\nhash: %s\n",
+		 canonical_request, canonical_request_hash);
 
 	/* Build credential scope and string to sign */
 	snprintf(credential_scope, sizeof(credential_scope), "%s/%s/%s/aws4_request",
@@ -287,13 +324,15 @@ static int _build_sigv4_headers(const char *access_key, const char *secret_key,
 		 "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
 		 access_key, credential_scope, signed_headers, signature_hex);
 
-	/* Append headers */
+	/* Append headers to curl_slist */
 	snprintf(x_amz_date_header, sizeof(x_amz_date_header), "X-Amz-Date: %s", amz_date);
 	*headers = curl_slist_append(*headers, x_amz_date_header);
 
 	snprintf(x_amz_content_sha256_header, sizeof(x_amz_content_sha256_header),
-		 "X-Amz-Content-Sha256: %s", payload_hash);
+		 "X-Amz-Content-Sha256: %s", content_sha256);
 	*headers = curl_slist_append(*headers, x_amz_content_sha256_header);
+
+	/* Content-Length is set by curl automatically via CURLOPT_INFILESIZE_LARGE */
 
 	if (session_token) {
 		char token_header[2100];
@@ -311,34 +350,40 @@ static int _build_sigv4_headers(const char *access_key, const char *secret_key,
  * Build authentication headers for object storage requests.
  * Single entry point for all auth methods — dispatches to provider-specific implementations.
  *
- * Currently supports:
- *   - AWS SigV4 (S3, S3 Express One Zone, MinIO, S3-compatible)
- *
- * Future extension points (add branches here):
- *   - Azure Blob Storage: SharedKey / SAS token
- *   - GCP Cloud Storage: OAuth2 Bearer token
- *   - S3-compatible with HMAC: reuses _build_sigv4_headers()
+ * Parameters:
+ *   method        - HTTP method ("GET", "PUT", "POST", "DELETE")
+ *   host          - Host header value, scheme-free
+ *   canonical_uri - URI path
+ *   query_string  - Canonical query string (NULL or "" for none)
+ *   content_sha256 - SHA256 hex of body (EMPTY_PAYLOAD_HASH for no body)
+ *   range_value   - Range header value (NULL if not applicable)
+ *   content_length - Content-Length (-1 if not applicable)
+ *   headers       - Output: curl_slist
  */
-static int _build_auth_headers(const char *host, const char *canonical_uri,
-			       const char *range_value, struct curl_slist **headers)
+static int _build_auth_headers(const char *method, const char *host,
+			       const char *canonical_uri, const char *query_string,
+			       const char *content_sha256, const char *range_value,
+			       long content_length, struct curl_slist **headers)
 {
 	if (opts.express_one_zone && opts.aws_access_key && opts.aws_secret_key) {
-		/* AWS S3 Express One Zone: SigV4 with temporary session credentials */
 		pr_debug("Auth: SigV4 with Express One Zone session credentials\n");
 		return _build_sigv4_headers(g_session_access_key, g_session_secret_key,
 					    g_session_token, opts.aws_region,
-					    host, canonical_uri, range_value, headers);
+					    method, host, canonical_uri, query_string,
+					    content_sha256, range_value,
+					    content_length, headers);
 	}
 
 	if (opts.aws_access_key && opts.aws_secret_key) {
-		/* AWS S3 / MinIO / S3-compatible: SigV4 with IAM credentials */
 		pr_debug("Auth: SigV4 with standard credentials\n");
 		return _build_sigv4_headers(opts.aws_access_key, opts.aws_secret_key,
 					    NULL, opts.aws_region,
-					    host, canonical_uri, range_value, headers);
+					    method, host, canonical_uri, query_string,
+					    content_sha256, range_value,
+					    content_length, headers);
 	}
 
-	/* No credentials — anonymous access (e.g., public bucket) */
+	/* No credentials — anonymous access */
 	return 0;
 }
 
@@ -1036,6 +1081,705 @@ void object_storage_cleanup(void)
 	pr_info("Object Storage client cleaned up (libcurl, PID: %d)\n", getpid());
 }
 
+/*
+ * =================================================================================
+ * URL Construction Helper
+ * =================================================================================
+ *
+ * Constructs S3 URL, auth host, and canonical URI from object key and options.
+ * Shared by fetch_range, put_object, and multipart operations.
+ */
+struct object_url_info {
+	char url[2048];
+	char auth_host[512];
+	char canonical_uri[2048];
+	char full_object_path[1024];
+};
+
+static int _construct_object_url(const char *object_key, struct object_url_info *info)
+{
+	char normalized_prefix[512];
+	const char *endpoint_url;
+	const char *hostname;
+
+	memset(info, 0, sizeof(*info));
+
+	/* Normalize the object prefix */
+	if (opts.object_storage_object_prefix) {
+		const char *original_prefix = opts.object_storage_object_prefix;
+		size_t prefix_len = strlen(original_prefix);
+		if (prefix_len == 1 && original_prefix[0] == '/') {
+			normalized_prefix[0] = '\0';
+		} else if (prefix_len > 0) {
+			const char *start = original_prefix;
+			size_t copy_len = prefix_len;
+			if (original_prefix[0] == '/') {
+				start++;
+				copy_len--;
+			}
+			snprintf(normalized_prefix, sizeof(normalized_prefix), "%.*s", (int)copy_len, start);
+			if (copy_len > 0 && normalized_prefix[copy_len - 1] != '/') {
+				size_t current_len = strlen(normalized_prefix);
+				if (current_len < sizeof(normalized_prefix) - 1) {
+					normalized_prefix[current_len] = '/';
+					normalized_prefix[current_len + 1] = '\0';
+				}
+			}
+		} else {
+			normalized_prefix[0] = '\0';
+		}
+	} else {
+		normalized_prefix[0] = '\0';
+	}
+
+	/* Handle endpoint URL and extract hostname */
+	endpoint_url = opts.object_storage_endpoint_url;
+	hostname = _strip_scheme(endpoint_url);
+
+	/* Build full object path */
+	if (normalized_prefix[0] != '\0' && strncmp(object_key, normalized_prefix, strlen(normalized_prefix)) == 0) {
+		snprintf(info->full_object_path, sizeof(info->full_object_path), "%s", object_key);
+	} else {
+		snprintf(info->full_object_path, sizeof(info->full_object_path), "%s%s", normalized_prefix, object_key);
+	}
+
+	/* Construct URL */
+	if (opts.express_one_zone) {
+		snprintf(info->url, sizeof(info->url), "https://%s.%s/%s",
+			 opts.object_storage_bucket, opts.object_storage_endpoint_url, info->full_object_path);
+	} else if (opts.object_storage_bucket && opts.object_storage_bucket[0] != '\0') {
+		if (opts.object_storage_path_style) {
+			if (hostname != endpoint_url) {
+				snprintf(info->url, sizeof(info->url), "%.*s%s/%s/%s",
+					 (int)(hostname - endpoint_url), endpoint_url,
+					 hostname, opts.object_storage_bucket, info->full_object_path);
+			} else {
+				snprintf(info->url, sizeof(info->url), "https://%s/%s/%s",
+					 hostname, opts.object_storage_bucket, info->full_object_path);
+			}
+		} else {
+			if (hostname != endpoint_url) {
+				snprintf(info->url, sizeof(info->url), "%.*s%s.%s/%s",
+					 (int)(hostname - endpoint_url), endpoint_url,
+					 opts.object_storage_bucket, hostname, info->full_object_path);
+			} else {
+				snprintf(info->url, sizeof(info->url), "https://%s.%s/%s",
+					 opts.object_storage_bucket, hostname, info->full_object_path);
+			}
+		}
+	} else {
+		if (hostname != endpoint_url) {
+			snprintf(info->url, sizeof(info->url), "%s/%s", endpoint_url, info->full_object_path);
+		} else {
+			snprintf(info->url, sizeof(info->url), "https://%s/%s", hostname, info->full_object_path);
+		}
+	}
+
+	/* Construct auth host */
+	if (opts.express_one_zone) {
+		snprintf(info->auth_host, sizeof(info->auth_host), "%s.%s",
+			 opts.object_storage_bucket, opts.object_storage_endpoint_url);
+	} else if (opts.object_storage_path_style ||
+		   !opts.object_storage_bucket || !opts.object_storage_bucket[0]) {
+		snprintf(info->auth_host, sizeof(info->auth_host), "%s", hostname);
+	} else {
+		snprintf(info->auth_host, sizeof(info->auth_host), "%s.%s",
+			 opts.object_storage_bucket, hostname);
+	}
+	/* Strip trailing slash from auth_host */
+	{
+		size_t hlen = strlen(info->auth_host);
+		if (hlen > 0 && info->auth_host[hlen - 1] == '/')
+			info->auth_host[hlen - 1] = '\0';
+	}
+
+	/* Construct canonical URI */
+	if (!opts.express_one_zone && opts.object_storage_path_style &&
+	    opts.object_storage_bucket && opts.object_storage_bucket[0]) {
+		snprintf(info->canonical_uri, sizeof(info->canonical_uri), "/%s/%s",
+			 opts.object_storage_bucket, info->full_object_path);
+	} else {
+		snprintf(info->canonical_uri, sizeof(info->canonical_uri), "/%s", info->full_object_path);
+	}
+
+	return 0;
+}
+
+/*
+ * Get curl handle appropriate for current thread context.
+ * Returns NULL on failure.
+ */
+static CURL *_get_curl_handle(void)
+{
+	CURL *handle;
+
+	if (!is_main_thread()) {
+		handle = get_thread_curl_handle();
+		if (!handle)
+			pr_err("Failed to get thread-local curl handle\n");
+		return handle;
+	}
+
+	handle = get_curl_handle_for_current_process();
+	if (!handle) {
+		pr_warn("Failed to get process curl handle, using one-time handle\n");
+		handle = curl_easy_init();
+		if (handle)
+			set_fixed_curl_options(handle);
+		return handle;
+	}
+
+	curl_easy_reset(handle);
+	set_fixed_curl_options(handle);
+	return handle;
+}
+
+/*
+ * =================================================================================
+ * PUT Object — Simple upload for small files (metadata, pagemap, etc.)
+ * =================================================================================
+ */
+
+/* Read callback for curl PUT upload */
+struct UploadContext {
+	const char *data;
+	unsigned long size;
+	unsigned long offset;
+};
+
+static size_t _upload_read_callback(char *ptr, size_t size, size_t nmemb, void *userdata)
+{
+	struct UploadContext *ctx = (struct UploadContext *)userdata;
+	size_t remaining = ctx->size - ctx->offset;
+	size_t to_copy = size * nmemb;
+	if (to_copy > remaining)
+		to_copy = remaining;
+	memcpy(ptr, ctx->data + ctx->offset, to_copy);
+	ctx->offset += to_copy;
+	return to_copy;
+}
+
+int object_storage_put_object(const char *object_key, const void *data, unsigned long length)
+{
+	struct object_url_info url_info;
+	struct UploadContext upload_ctx;
+	struct MemoryStruct response;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	struct curl_slist *headers = NULL;
+	char content_sha256[65];
+
+	if (!object_key || !data) {
+		pr_err("put_object: NULL object_key or data\n");
+		return -1;
+	}
+
+	/* Ensure valid session for Express One Zone */
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	/* Construct URL */
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	/* Compute SHA256 of the body */
+	_sha256_hex((const char *)data, length, content_sha256);
+
+	/* Get curl handle */
+	curl_handle = _get_curl_handle();
+	if (!curl_handle)
+		return -1;
+
+	/* Setup upload context */
+	upload_ctx.data = (const char *)data;
+	upload_ctx.size = length;
+	upload_ctx.offset = 0;
+
+	/* Setup response buffer */
+	response.memory = malloc(1);
+	response.size = 0;
+	response.capacity = 0;
+
+	/* Configure curl for PUT */
+	curl_easy_setopt(curl_handle, CURLOPT_URL, url_info.url);
+	curl_easy_setopt(curl_handle, CURLOPT_UPLOAD, 1L);
+	curl_easy_setopt(curl_handle, CURLOPT_READFUNCTION, _upload_read_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_READDATA, &upload_ctx);
+	curl_easy_setopt(curl_handle, CURLOPT_INFILESIZE_LARGE, (curl_off_t)length);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &response);
+
+	/* Build auth headers */
+	if (_build_auth_headers("PUT", url_info.auth_host, url_info.canonical_uri, NULL,
+			       content_sha256, NULL, (long)length, &headers) != 0) {
+		free(response.memory);
+		return -1;
+	}
+	if (headers)
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	pr_info("PUT %s (%lu bytes)\n", url_info.url, length);
+
+	/* Execute */
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (headers)
+		curl_slist_free_all(headers);
+
+	if (res != CURLE_OK) {
+		pr_err("PUT failed: %s\n", curl_easy_strerror(res));
+		free(response.memory);
+		return -1;
+	}
+
+	if (http_code < 200 || http_code >= 300) {
+		pr_err("PUT failed with HTTP %ld: %.*s\n", http_code,
+		       (int)response.size, response.memory);
+		free(response.memory);
+		return -1;
+	}
+
+	pr_info("PUT %s succeeded (HTTP %ld)\n", object_key, http_code);
+	free(response.memory);
+	return 0;
+}
+
+/*
+ * =================================================================================
+ * Multipart Upload — for large files (pages-*.img, typically > 5MB)
+ * =================================================================================
+ */
+
+int object_storage_multipart_init(const char *object_key, char *upload_id, size_t id_len)
+{
+	struct object_url_info url_info;
+	struct MemoryStruct response;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	struct curl_slist *headers = NULL;
+	char full_url[2200];
+
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	/* Append ?uploads to URL */
+	snprintf(full_url, sizeof(full_url), "%s?uploads", url_info.url);
+
+	curl_handle = _get_curl_handle();
+	if (!curl_handle)
+		return -1;
+
+	response.memory = malloc(1);
+	response.size = 0;
+	response.capacity = 0;
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, full_url);
+	curl_easy_setopt(curl_handle, CURLOPT_POST, 1L);
+	curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, 0L);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &response);
+
+	/* SigV4: POST with empty body, query_string = "uploads=" */
+	if (_build_auth_headers("POST", url_info.auth_host, url_info.canonical_uri,
+			       "uploads=", EMPTY_PAYLOAD_HASH, NULL, 0, &headers) != 0) {
+		free(response.memory);
+		return -1;
+	}
+	if (headers)
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (headers)
+		curl_slist_free_all(headers);
+
+	if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+		pr_err("Multipart init failed: curl=%s http=%ld body=%.*s\n",
+		       curl_easy_strerror(res), http_code, (int)response.size, response.memory);
+		free(response.memory);
+		return -1;
+	}
+
+	/* Parse UploadId from XML response */
+	if (_parse_xml_tag(response.memory, "UploadId", upload_id, id_len) != 0) {
+		pr_err("Failed to parse UploadId from response: %.*s\n",
+		       (int)response.size, response.memory);
+		free(response.memory);
+		return -1;
+	}
+
+	pr_info("Multipart upload initiated: %s uploadId=%s\n", object_key, upload_id);
+	free(response.memory);
+	return 0;
+}
+
+int object_storage_multipart_upload_part(const char *object_key, const char *upload_id,
+					 int part_num, const void *data, unsigned long length,
+					 char *etag, size_t etag_len)
+{
+	struct object_url_info url_info;
+	struct UploadContext upload_ctx;
+	struct MemoryStruct response;
+	struct MemoryStruct header_buf;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	struct curl_slist *headers = NULL;
+	char full_url[2400];
+	char query_string[512];
+	char content_sha256[65];
+	char *etag_hdr;
+
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	snprintf(full_url, sizeof(full_url), "%s?partNumber=%d&uploadId=%s",
+		 url_info.url, part_num, upload_id);
+	/* Query string must be sorted alphabetically for SigV4 */
+	snprintf(query_string, sizeof(query_string), "partNumber=%d&uploadId=%s",
+		 part_num, upload_id);
+
+	_sha256_hex((const char *)data, length, content_sha256);
+
+	curl_handle = _get_curl_handle();
+	if (!curl_handle)
+		return -1;
+
+	upload_ctx.data = (const char *)data;
+	upload_ctx.size = length;
+	upload_ctx.offset = 0;
+
+	response.memory = malloc(1);
+	response.size = 0;
+	response.capacity = 0;
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, full_url);
+	curl_easy_setopt(curl_handle, CURLOPT_UPLOAD, 1L);
+	curl_easy_setopt(curl_handle, CURLOPT_READFUNCTION, _upload_read_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_READDATA, &upload_ctx);
+	curl_easy_setopt(curl_handle, CURLOPT_INFILESIZE_LARGE, (curl_off_t)length);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &response);
+
+	/* We need ETag from response headers */
+	header_buf.memory = malloc(1);
+	header_buf.size = 0;
+	header_buf.capacity = 0;
+	curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_HEADERDATA, &header_buf);
+
+	if (_build_auth_headers("PUT", url_info.auth_host, url_info.canonical_uri,
+			       query_string, content_sha256, NULL, (long)length, &headers) != 0) {
+		free(response.memory);
+		free(header_buf.memory);
+		return -1;
+	}
+	if (headers)
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (headers)
+		curl_slist_free_all(headers);
+
+	if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+		pr_err("Upload part %d failed: curl=%s http=%ld\n",
+		       part_num, curl_easy_strerror(res), http_code);
+		free(response.memory);
+		free(header_buf.memory);
+		return -1;
+	}
+
+	/* Extract ETag from response headers */
+	etag_hdr = strcasestr(header_buf.memory, "ETag:");
+	if (etag_hdr) {
+		size_t ei;
+		etag_hdr += 5;
+		while (*etag_hdr == ' ' || *etag_hdr == '\t')
+			etag_hdr++;
+		for (ei = 0; etag_hdr[ei] && etag_hdr[ei] != '\r' && etag_hdr[ei] != '\n' && ei < etag_len - 1; ei++)
+			etag[ei] = etag_hdr[ei];
+		etag[ei] = '\0';
+	} else {
+		pr_err("No ETag in upload part response headers\n");
+		free(response.memory);
+		free(header_buf.memory);
+		return -1;
+	}
+
+	pr_debug("Uploaded part %d (%lu bytes), ETag=%s\n", part_num, length, etag);
+	free(response.memory);
+	free(header_buf.memory);
+	return 0;
+}
+
+int object_storage_multipart_complete(const char *object_key, const char *upload_id,
+				      int n_parts, const char **etags)
+{
+	struct object_url_info url_info;
+	struct UploadContext upload_ctx;
+	struct MemoryStruct response;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	struct curl_slist *headers = NULL;
+	char full_url[2400];
+	char query_string[512];
+	char content_sha256[65];
+	char *xml_body;
+	size_t xml_len;
+	size_t xml_pos;
+	int i;
+
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	snprintf(full_url, sizeof(full_url), "%s?uploadId=%s", url_info.url, upload_id);
+	snprintf(query_string, sizeof(query_string), "uploadId=%s", upload_id);
+
+	/* Build XML body: <CompleteMultipartUpload><Part>...</Part>...</> */
+	xml_len = 128 + n_parts * 256;
+	xml_body = malloc(xml_len);
+	if (!xml_body)
+		return -1;
+
+	xml_pos = 0;
+	xml_pos += snprintf(xml_body + xml_pos, xml_len - xml_pos,
+			    "<CompleteMultipartUpload>");
+	for (i = 0; i < n_parts; i++) {
+		xml_pos += snprintf(xml_body + xml_pos, xml_len - xml_pos,
+				    "<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>",
+				    i + 1, etags[i]);
+	}
+	xml_pos += snprintf(xml_body + xml_pos, xml_len - xml_pos,
+			    "</CompleteMultipartUpload>");
+	xml_len = xml_pos;
+
+	_sha256_hex(xml_body, xml_len, content_sha256);
+
+	curl_handle = _get_curl_handle();
+	if (!curl_handle) {
+		free(xml_body);
+		return -1;
+	}
+
+	upload_ctx.data = xml_body;
+	upload_ctx.size = xml_len;
+	upload_ctx.offset = 0;
+
+	response.memory = malloc(1);
+	response.size = 0;
+	response.capacity = 0;
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, full_url);
+	curl_easy_setopt(curl_handle, CURLOPT_POST, 1L);
+	curl_easy_setopt(curl_handle, CURLOPT_READFUNCTION, _upload_read_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_READDATA, &upload_ctx);
+	curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)xml_len);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &response);
+
+	if (_build_auth_headers("POST", url_info.auth_host, url_info.canonical_uri,
+			       query_string, content_sha256, NULL, (long)xml_len, &headers) != 0) {
+		free(xml_body);
+		free(response.memory);
+		return -1;
+	}
+	/* Content-Type for the completion XML */
+	headers = curl_slist_append(headers, "Content-Type: application/xml");
+	curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (headers)
+		curl_slist_free_all(headers);
+	free(xml_body);
+
+	if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+		pr_err("Multipart complete failed: curl=%s http=%ld body=%.*s\n",
+		       curl_easy_strerror(res), http_code, (int)response.size, response.memory);
+		free(response.memory);
+		return -1;
+	}
+
+	pr_info("Multipart upload completed: %s (%d parts)\n", object_key, n_parts);
+	free(response.memory);
+	return 0;
+}
+
+int object_storage_multipart_abort(const char *object_key, const char *upload_id)
+{
+	struct object_url_info url_info;
+	struct MemoryStruct response;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	struct curl_slist *headers = NULL;
+	char full_url[2400];
+	char query_string[512];
+
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	snprintf(full_url, sizeof(full_url), "%s?uploadId=%s", url_info.url, upload_id);
+	snprintf(query_string, sizeof(query_string), "uploadId=%s", upload_id);
+
+	curl_handle = _get_curl_handle();
+	if (!curl_handle)
+		return -1;
+
+	response.memory = malloc(1);
+	response.size = 0;
+	response.capacity = 0;
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, full_url);
+	curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "DELETE");
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &response);
+
+	if (_build_auth_headers("DELETE", url_info.auth_host, url_info.canonical_uri,
+			       query_string, EMPTY_PAYLOAD_HASH, NULL, -1, &headers) != 0) {
+		free(response.memory);
+		return -1;
+	}
+	if (headers)
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (headers)
+		curl_slist_free_all(headers);
+	free(response.memory);
+
+	if (res != CURLE_OK) {
+		pr_warn("Multipart abort failed: %s\n", curl_easy_strerror(res));
+		return -1;
+	}
+
+	pr_info("Multipart upload aborted: %s\n", object_key);
+	return 0;
+}
+
+/*
+ * =================================================================================
+ * GET Object — fetch entire file (for metadata files with unknown size)
+ * =================================================================================
+ */
+
+int object_storage_get_object(const char *object_key, void **out_data, unsigned long *out_length)
+{
+	struct object_url_info url_info;
+	struct MemoryStruct chunk;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	struct curl_slist *headers = NULL;
+
+	if (!object_key || !out_data || !out_length) {
+		pr_err("get_object: NULL parameter\n");
+		return -1;
+	}
+
+	*out_data = NULL;
+	*out_length = 0;
+
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	curl_handle = _get_curl_handle();
+	if (!curl_handle)
+		return -1;
+
+	chunk.memory = malloc(1);
+	chunk.size = 0;
+	chunk.capacity = 0;
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, url_info.url);
+	curl_easy_setopt(curl_handle, CURLOPT_HTTPGET, 1L);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &chunk);
+
+	/* SigV4: GET without Range header */
+	if (_build_auth_headers("GET", url_info.auth_host, url_info.canonical_uri,
+			       NULL, EMPTY_PAYLOAD_HASH, NULL, -1, &headers) != 0) {
+		free(chunk.memory);
+		return -1;
+	}
+	if (headers)
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	pr_debug("GET %s (full object)\n", url_info.url);
+
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (headers)
+		curl_slist_free_all(headers);
+
+	if (res != CURLE_OK) {
+		pr_err("GET %s failed: %s\n", object_key, curl_easy_strerror(res));
+		free(chunk.memory);
+		return -1;
+	}
+
+	if (http_code == 404) {
+		pr_debug("GET %s: not found (HTTP 404)\n", object_key);
+		free(chunk.memory);
+		return -ENOENT;
+	}
+
+	if (http_code < 200 || http_code >= 300) {
+		pr_err("GET %s failed with HTTP %ld\n", object_key, http_code);
+		free(chunk.memory);
+		return -1;
+	}
+
+	pr_debug("GET %s: %lu bytes (HTTP %ld)\n", object_key, (unsigned long)chunk.size, http_code);
+	*out_data = chunk.memory;
+	*out_length = chunk.size;
+	return 0;
+}
+
+/*
+ * =================================================================================
+ * Fetch Range (existing)
+ * =================================================================================
+ */
+
 int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer)
 {
 	CURL *curl_handle;
@@ -1257,7 +2001,8 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 		snprintf(range_header_value, sizeof(range_header_value), "bytes=%lu-%lu",
 			 offset, offset + length - 1);
 
-		if (_build_auth_headers(auth_host, auth_canonical_uri, range_header_value, &headers) != 0) {
+		if (_build_auth_headers("GET", auth_host, auth_canonical_uri, NULL,
+				       EMPTY_PAYLOAD_HASH, range_header_value, -1, &headers) != 0) {
 			free(error_response.memory);
 			return -1;
 		}

@@ -254,6 +254,7 @@ struct cr_options {
 
 	/* Object storage options */
 	bool enable_object_storage;
+	bool object_storage_upload;
 	char *object_storage_endpoint_url;
 	char *object_storage_bucket;
 	char *object_storage_object_prefix;

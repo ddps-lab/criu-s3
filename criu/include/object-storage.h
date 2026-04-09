@@ -117,6 +117,45 @@ int object_storage_init(void);
 int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer);
 
 /*
+ * Upload an object to object storage (simple PUT, for files < 5GB)
+ *
+ * @param object_key: The key/path for the object in the bucket
+ * @param data: Pointer to data to upload
+ * @param length: Size of data in bytes
+ *
+ * Returns 0 on success, -1 on failure
+ */
+int object_storage_put_object(const char *object_key, const void *data, unsigned long length);
+
+/*
+ * Fetch an entire object from object storage (for metadata files with unknown size)
+ *
+ * @param object_key: The key/path of the object
+ * @param out_data: Output pointer to allocated buffer (caller must free)
+ * @param out_length: Output size of fetched data
+ *
+ * Returns 0 on success, -ENOENT if not found, -1 on other failure
+ */
+int object_storage_get_object(const char *object_key, void **out_data, unsigned long *out_length);
+
+/*
+ * Multipart upload API — for large files (pages-*.img, > 5MB)
+ *
+ * Usage:
+ *   1. multipart_init()        → get upload_id
+ *   2. multipart_upload_part() → repeat for each part (min 5MB except last)
+ *   3. multipart_complete()    → finalize with etags
+ *   On error: multipart_abort() to clean up
+ */
+int object_storage_multipart_init(const char *object_key, char *upload_id, size_t id_len);
+int object_storage_multipart_upload_part(const char *object_key, const char *upload_id,
+					 int part_num, const void *data, unsigned long length,
+					 char *etag, size_t etag_len);
+int object_storage_multipart_complete(const char *object_key, const char *upload_id,
+				      int n_parts, const char **etags);
+int object_storage_multipart_abort(const char *object_key, const char *upload_id);
+
+/*
  * Clean up the object storage client and release resources
  */
 void object_storage_cleanup(void);
