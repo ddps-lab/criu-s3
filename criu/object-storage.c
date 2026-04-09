@@ -1351,6 +1351,347 @@ int object_storage_put_object(const char *object_key, const void *data, unsigned
 
 /*
  * =================================================================================
+ * Multipart Upload — for large files (pages-*.img, typically > 5MB)
+ * =================================================================================
+ */
+
+int object_storage_multipart_init(const char *object_key, char *upload_id, size_t id_len)
+{
+	struct object_url_info url_info;
+	struct MemoryStruct response;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	struct curl_slist *headers = NULL;
+	char full_url[2200];
+
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	/* Append ?uploads to URL */
+	snprintf(full_url, sizeof(full_url), "%s?uploads", url_info.url);
+
+	curl_handle = _get_curl_handle();
+	if (!curl_handle)
+		return -1;
+
+	response.memory = malloc(1);
+	response.size = 0;
+	response.capacity = 0;
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, full_url);
+	curl_easy_setopt(curl_handle, CURLOPT_POST, 1L);
+	curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, 0L);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &response);
+
+	/* SigV4: POST with empty body, query_string = "uploads=" */
+	if (_build_auth_headers("POST", url_info.auth_host, url_info.canonical_uri,
+			       "uploads=", EMPTY_PAYLOAD_HASH, NULL, 0, &headers) != 0) {
+		free(response.memory);
+		return -1;
+	}
+	if (headers)
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (headers)
+		curl_slist_free_all(headers);
+
+	if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+		pr_err("Multipart init failed: curl=%s http=%ld body=%.*s\n",
+		       curl_easy_strerror(res), http_code, (int)response.size, response.memory);
+		free(response.memory);
+		return -1;
+	}
+
+	/* Parse UploadId from XML response */
+	if (_parse_xml_tag(response.memory, "UploadId", upload_id, id_len) != 0) {
+		pr_err("Failed to parse UploadId from response: %.*s\n",
+		       (int)response.size, response.memory);
+		free(response.memory);
+		return -1;
+	}
+
+	pr_info("Multipart upload initiated: %s uploadId=%s\n", object_key, upload_id);
+	free(response.memory);
+	return 0;
+}
+
+int object_storage_multipart_upload_part(const char *object_key, const char *upload_id,
+					 int part_num, const void *data, unsigned long length,
+					 char *etag, size_t etag_len)
+{
+	struct object_url_info url_info;
+	struct UploadContext upload_ctx;
+	struct MemoryStruct response;
+	struct MemoryStruct header_buf;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	struct curl_slist *headers = NULL;
+	char full_url[2400];
+	char query_string[512];
+	char content_sha256[65];
+	char *etag_hdr;
+
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	snprintf(full_url, sizeof(full_url), "%s?partNumber=%d&uploadId=%s",
+		 url_info.url, part_num, upload_id);
+	/* Query string must be sorted alphabetically for SigV4 */
+	snprintf(query_string, sizeof(query_string), "partNumber=%d&uploadId=%s",
+		 part_num, upload_id);
+
+	_sha256_hex((const char *)data, length, content_sha256);
+
+	curl_handle = _get_curl_handle();
+	if (!curl_handle)
+		return -1;
+
+	upload_ctx.data = (const char *)data;
+	upload_ctx.size = length;
+	upload_ctx.offset = 0;
+
+	response.memory = malloc(1);
+	response.size = 0;
+	response.capacity = 0;
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, full_url);
+	curl_easy_setopt(curl_handle, CURLOPT_UPLOAD, 1L);
+	curl_easy_setopt(curl_handle, CURLOPT_READFUNCTION, _upload_read_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_READDATA, &upload_ctx);
+	curl_easy_setopt(curl_handle, CURLOPT_INFILESIZE_LARGE, (curl_off_t)length);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &response);
+
+	/* We need ETag from response headers */
+	header_buf.memory = malloc(1);
+	header_buf.size = 0;
+	header_buf.capacity = 0;
+	curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_HEADERDATA, &header_buf);
+
+	if (_build_auth_headers("PUT", url_info.auth_host, url_info.canonical_uri,
+			       query_string, content_sha256, NULL, (long)length, &headers) != 0) {
+		free(response.memory);
+		free(header_buf.memory);
+		return -1;
+	}
+	if (headers)
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (headers)
+		curl_slist_free_all(headers);
+
+	if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+		pr_err("Upload part %d failed: curl=%s http=%ld\n",
+		       part_num, curl_easy_strerror(res), http_code);
+		free(response.memory);
+		free(header_buf.memory);
+		return -1;
+	}
+
+	/* Extract ETag from response headers */
+	etag_hdr = strcasestr(header_buf.memory, "ETag:");
+	if (etag_hdr) {
+		size_t ei;
+		etag_hdr += 5;
+		while (*etag_hdr == ' ' || *etag_hdr == '\t')
+			etag_hdr++;
+		for (ei = 0; etag_hdr[ei] && etag_hdr[ei] != '\r' && etag_hdr[ei] != '\n' && ei < etag_len - 1; ei++)
+			etag[ei] = etag_hdr[ei];
+		etag[ei] = '\0';
+	} else {
+		pr_err("No ETag in upload part response headers\n");
+		free(response.memory);
+		free(header_buf.memory);
+		return -1;
+	}
+
+	pr_debug("Uploaded part %d (%lu bytes), ETag=%s\n", part_num, length, etag);
+	free(response.memory);
+	free(header_buf.memory);
+	return 0;
+}
+
+int object_storage_multipart_complete(const char *object_key, const char *upload_id,
+				      int n_parts, const char **etags)
+{
+	struct object_url_info url_info;
+	struct UploadContext upload_ctx;
+	struct MemoryStruct response;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	struct curl_slist *headers = NULL;
+	char full_url[2400];
+	char query_string[512];
+	char content_sha256[65];
+	char *xml_body;
+	size_t xml_len;
+	size_t xml_pos;
+	int i;
+
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	snprintf(full_url, sizeof(full_url), "%s?uploadId=%s", url_info.url, upload_id);
+	snprintf(query_string, sizeof(query_string), "uploadId=%s", upload_id);
+
+	/* Build XML body: <CompleteMultipartUpload><Part>...</Part>...</> */
+	xml_len = 128 + n_parts * 256;
+	xml_body = malloc(xml_len);
+	if (!xml_body)
+		return -1;
+
+	xml_pos = 0;
+	xml_pos += snprintf(xml_body + xml_pos, xml_len - xml_pos,
+			    "<CompleteMultipartUpload>");
+	for (i = 0; i < n_parts; i++) {
+		xml_pos += snprintf(xml_body + xml_pos, xml_len - xml_pos,
+				    "<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>",
+				    i + 1, etags[i]);
+	}
+	xml_pos += snprintf(xml_body + xml_pos, xml_len - xml_pos,
+			    "</CompleteMultipartUpload>");
+	xml_len = xml_pos;
+
+	_sha256_hex(xml_body, xml_len, content_sha256);
+
+	curl_handle = _get_curl_handle();
+	if (!curl_handle) {
+		free(xml_body);
+		return -1;
+	}
+
+	upload_ctx.data = xml_body;
+	upload_ctx.size = xml_len;
+	upload_ctx.offset = 0;
+
+	response.memory = malloc(1);
+	response.size = 0;
+	response.capacity = 0;
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, full_url);
+	curl_easy_setopt(curl_handle, CURLOPT_POST, 1L);
+	curl_easy_setopt(curl_handle, CURLOPT_READFUNCTION, _upload_read_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_READDATA, &upload_ctx);
+	curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)xml_len);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &response);
+
+	if (_build_auth_headers("POST", url_info.auth_host, url_info.canonical_uri,
+			       query_string, content_sha256, NULL, (long)xml_len, &headers) != 0) {
+		free(xml_body);
+		free(response.memory);
+		return -1;
+	}
+	/* Content-Type for the completion XML */
+	headers = curl_slist_append(headers, "Content-Type: application/xml");
+	curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (headers)
+		curl_slist_free_all(headers);
+	free(xml_body);
+
+	if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+		pr_err("Multipart complete failed: curl=%s http=%ld body=%.*s\n",
+		       curl_easy_strerror(res), http_code, (int)response.size, response.memory);
+		free(response.memory);
+		return -1;
+	}
+
+	pr_info("Multipart upload completed: %s (%d parts)\n", object_key, n_parts);
+	free(response.memory);
+	return 0;
+}
+
+int object_storage_multipart_abort(const char *object_key, const char *upload_id)
+{
+	struct object_url_info url_info;
+	struct MemoryStruct response;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	struct curl_slist *headers = NULL;
+	char full_url[2400];
+	char query_string[512];
+
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	snprintf(full_url, sizeof(full_url), "%s?uploadId=%s", url_info.url, upload_id);
+	snprintf(query_string, sizeof(query_string), "uploadId=%s", upload_id);
+
+	curl_handle = _get_curl_handle();
+	if (!curl_handle)
+		return -1;
+
+	response.memory = malloc(1);
+	response.size = 0;
+	response.capacity = 0;
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, full_url);
+	curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "DELETE");
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &response);
+
+	if (_build_auth_headers("DELETE", url_info.auth_host, url_info.canonical_uri,
+			       query_string, EMPTY_PAYLOAD_HASH, NULL, -1, &headers) != 0) {
+		free(response.memory);
+		return -1;
+	}
+	if (headers)
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (headers)
+		curl_slist_free_all(headers);
+	free(response.memory);
+
+	if (res != CURLE_OK) {
+		pr_warn("Multipart abort failed: %s\n", curl_easy_strerror(res));
+		return -1;
+	}
+
+	pr_info("Multipart upload aborted: %s\n", object_key);
+	return 0;
+}
+
+/*
+ * =================================================================================
  * Fetch Range (existing)
  * =================================================================================
  */

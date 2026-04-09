@@ -128,6 +128,23 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 int object_storage_put_object(const char *object_key, const void *data, unsigned long length);
 
 /*
+ * Multipart upload API — for large files (pages-*.img, > 5MB)
+ *
+ * Usage:
+ *   1. multipart_init()        → get upload_id
+ *   2. multipart_upload_part() → repeat for each part (min 5MB except last)
+ *   3. multipart_complete()    → finalize with etags
+ *   On error: multipart_abort() to clean up
+ */
+int object_storage_multipart_init(const char *object_key, char *upload_id, size_t id_len);
+int object_storage_multipart_upload_part(const char *object_key, const char *upload_id,
+					 int part_num, const void *data, unsigned long length,
+					 char *etag, size_t etag_len);
+int object_storage_multipart_complete(const char *object_key, const char *upload_id,
+				      int n_parts, const char **etags);
+int object_storage_multipart_abort(const char *object_key, const char *upload_id);
+
+/*
  * Clean up the object storage client and release resources
  */
 void object_storage_cleanup(void);
