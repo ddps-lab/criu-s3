@@ -405,7 +405,44 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 			goto err_pi;
 		}
 
-		ret = open_page_read_at(pfd, img_id, xfer->parent, pr_flags);
+		/*
+		 * When object-storage-upload is enabled, parent dir may be
+		 * empty (S3-only mode). Swap prefix to parent's so that
+		 * do_open_image() S3 fallback fetches from the right prefix.
+		 */
+		if (opts.object_storage_upload) {
+			void *prefix_data = NULL;
+			unsigned long prefix_len = 0;
+			char *parent_prefix = NULL;
+			char *saved_prefix;
+			int s3_ret;
+
+			s3_ret = object_storage_get_object("parent-prefix",
+							   &prefix_data, &prefix_len);
+			if (s3_ret == 0 && prefix_data && prefix_len > 0) {
+				parent_prefix = xmalloc(prefix_len + 1);
+				if (parent_prefix) {
+					memcpy(parent_prefix, prefix_data, prefix_len);
+					parent_prefix[prefix_len] = '\0';
+				}
+			}
+			if (prefix_data)
+				free(prefix_data);
+
+			if (parent_prefix) {
+				pr_info("page-xfer: using parent prefix: %s\n", parent_prefix);
+				saved_prefix = opts.object_storage_object_prefix;
+				opts.object_storage_object_prefix = parent_prefix;
+				ret = open_page_read_at(pfd, img_id, xfer->parent, pr_flags);
+				opts.object_storage_object_prefix = saved_prefix;
+				xfree(parent_prefix);
+			} else {
+				ret = open_page_read_at(pfd, img_id, xfer->parent, pr_flags);
+			}
+		} else {
+			ret = open_page_read_at(pfd, img_id, xfer->parent, pr_flags);
+		}
+
 		if (ret <= 0) {
 			pr_perror("No parent image found, though parent directory is set");
 			xfree(xfer->parent);

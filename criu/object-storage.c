@@ -241,12 +241,12 @@ static int _build_sigv4_headers(const char *access_key, const char *secret_key,
 	signed_headers[0] = '\0';
 	canonical_headers[0] = '\0';
 
-	/* content-length (only for PUT/POST with body) */
-	if (content_length >= 0) {
-		pos += snprintf(canonical_headers + pos, sizeof(canonical_headers) - pos,
-				"content-length:%ld\n", content_length);
-		strncat(signed_headers, "content-length;", sizeof(signed_headers) - strlen(signed_headers) - 1);
-	}
+	/*
+	 * Note: content-length is NOT included in signed headers.
+	 * curl sets Content-Length automatically. Including it in the
+	 * signature causes SignatureDoesNotMatch on AWS S3 because
+	 * curl may format the value differently than our signed version.
+	 */
 
 	/* host (always) */
 	pos += snprintf(canonical_headers + pos, sizeof(canonical_headers) - pos,
@@ -292,6 +292,9 @@ static int _build_sigv4_headers(const char *access_key, const char *secret_key,
 	/* Hash canonical request */
 	_sha256_hex(canonical_request, strlen(canonical_request), canonical_request_hash);
 
+	pr_debug("SigV4 canonical_request:\n---\n%s\n---\nhash: %s\n",
+		 canonical_request, canonical_request_hash);
+
 	/* Build credential scope and string to sign */
 	snprintf(credential_scope, sizeof(credential_scope), "%s/%s/%s/aws4_request",
 		 date_stamp, region, service);
@@ -329,11 +332,7 @@ static int _build_sigv4_headers(const char *access_key, const char *secret_key,
 		 "X-Amz-Content-Sha256: %s", content_sha256);
 	*headers = curl_slist_append(*headers, x_amz_content_sha256_header);
 
-	if (content_length >= 0) {
-		char cl_header[64];
-		snprintf(cl_header, sizeof(cl_header), "Content-Length: %ld", content_length);
-		*headers = curl_slist_append(*headers, cl_header);
-	}
+	/* Content-Length is set by curl automatically via CURLOPT_INFILESIZE_LARGE */
 
 	if (session_token) {
 		char token_header[2100];

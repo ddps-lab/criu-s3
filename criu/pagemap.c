@@ -700,7 +700,41 @@ static int try_open_parent(int dfd, unsigned long id, struct page_read *pr, int 
 		goto err;
 	if (pfd < 0) {
 		/*
-		 * No local parent directory. If object storage is enabled,
+		 * No local parent symlink. Try to reconstruct from
+		 * parent-prefix file (present when downloaded from S3).
+		 */
+		int ppfd;
+		ppfd = openat(dfd, "parent-prefix", O_RDONLY);
+		if (ppfd >= 0) {
+			char pp_buf[1024];
+			ssize_t nr;
+			nr = read(ppfd, pp_buf, sizeof(pp_buf) - 1);
+			close(ppfd);
+			if (nr > 0) {
+				char *last_slash;
+				char *dir_name;
+				char symtgt[1024];
+
+				pp_buf[nr] = '\0';
+				while (nr > 0 && (pp_buf[nr-1] == '/' || pp_buf[nr-1] == '\n'))
+					pp_buf[--nr] = '\0';
+				last_slash = strrchr(pp_buf, '/');
+				dir_name = last_slash ? last_slash + 1 : pp_buf;
+				snprintf(symtgt, sizeof(symtgt), "../%.1020s", dir_name);
+
+				if (faccessat(dfd, symtgt, R_OK, 0) == 0) {
+					if (symlinkat(symtgt, dfd, CR_PARENT_LINK) == 0 || errno == EEXIST) {
+						pr_info("Reconstructed parent symlink in sub-dir: %s\n", symtgt);
+						/* Retry open_parent */
+						if (open_parent(dfd, &pfd) == 0 && pfd >= 0)
+							goto have_parent;
+					}
+				}
+			}
+		}
+
+		/*
+		 * Still no parent. If object storage is enabled,
 		 * try to fetch parent-prefix marker from S3 and set up
 		 * parent page_read with the parent's S3 prefix.
 		 */
@@ -791,6 +825,7 @@ static int try_open_parent(int dfd, unsigned long id, struct page_read *pr, int 
 		goto out;
 	}
 
+have_parent:
 	parent = xmalloc(sizeof(*parent));
 	if (!parent)
 		goto err_cl;

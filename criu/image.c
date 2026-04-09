@@ -307,24 +307,47 @@ InventoryEntry *get_parent_inventory(void)
 	struct cr_img *img;
 	InventoryEntry *ie;
 	int dir;
+	char *saved_prefix = NULL;
+	char *parent_prefix = NULL;
 
 	if (open_parent(get_service_fd(IMG_FD_OFF), &dir)) {
-		/*
-		 * We print the warning below to be notified that we had some
-		 * unexpected problem on open. For instance we have a parent
-		 * directory but have no access. Having no parent inventory
-		 * when also having no parent directory is an expected case of
-		 * first dump iteration.
-		 */
 		pr_warn("Failed to open parent directory\n");
 		return NULL;
 	}
 	if (dir < 0)
 		return NULL;
 
+	/*
+	 * When object storage is enabled, swap prefix to parent's
+	 * so that S3 fallback fetches from the correct location.
+	 */
+	if (opts.enable_object_storage) {
+		void *prefix_data = NULL;
+		unsigned long prefix_len = 0;
+		int s3_ret;
+
+		s3_ret = object_storage_get_object("parent-prefix",
+						   &prefix_data, &prefix_len);
+		if (s3_ret == 0 && prefix_data && prefix_len > 0) {
+			parent_prefix = xmalloc(prefix_len + 1);
+			if (parent_prefix) {
+				memcpy(parent_prefix, prefix_data, prefix_len);
+				parent_prefix[prefix_len] = '\0';
+				saved_prefix = opts.object_storage_object_prefix;
+				opts.object_storage_object_prefix = parent_prefix;
+			}
+		}
+		if (prefix_data)
+			free(prefix_data);
+	}
+
 	img = open_image_at(dir, CR_FD_INVENTORY, O_RSTR);
 	if (!img) {
 		pr_warn("Failed to open parent pre-dump inventory image\n");
+		if (saved_prefix) {
+			opts.object_storage_object_prefix = saved_prefix;
+			xfree(parent_prefix);
+		}
 		close(dir);
 		return NULL;
 	}
@@ -332,8 +355,18 @@ InventoryEntry *get_parent_inventory(void)
 	if (pb_read_one(img, &ie, PB_INVENTORY) < 0) {
 		pr_warn("Failed to read parent pre-dump inventory entry\n");
 		close_image(img);
+		if (saved_prefix) {
+			opts.object_storage_object_prefix = saved_prefix;
+			xfree(parent_prefix);
+		}
 		close(dir);
 		return NULL;
+	}
+
+	/* Restore original prefix */
+	if (saved_prefix) {
+		opts.object_storage_object_prefix = saved_prefix;
+		xfree(parent_prefix);
 	}
 
 	if (!ie->has_dump_uptime) {
@@ -911,6 +944,64 @@ int open_image_dir(char *dir, int mode)
 			pr_info("Uploading parent prefix marker: %s\n", parent_prefix);
 			object_storage_put_object("parent-prefix",
 						  parent_prefix, strlen(parent_prefix));
+		}
+	}
+
+	/*
+	 * On restore: if images-dir contains a parent-prefix file
+	 * (downloaded from S3) but no parent symlink, reconstruct
+	 * the parent symlink from parent-prefix content.
+	 *
+	 * parent-prefix contains the S3 prefix of the parent dump
+	 * (e.g., "chain/dump1/"). We extract the directory name
+	 * (e.g., "dump1") and create a symlink "../dump1" → parent.
+	 */
+	if (mode == O_RSTR && !opts.img_parent) {
+		struct stat st;
+		if (fstatat(fd, CR_PARENT_LINK, &st, AT_SYMLINK_NOFOLLOW) != 0 &&
+		    errno == ENOENT) {
+			/* No parent symlink — check for parent-prefix file */
+			int ppfd;
+			ppfd = openat(fd, "parent-prefix", O_RDONLY);
+			if (ppfd >= 0) {
+				char pp_buf[1024];
+				ssize_t nr;
+				nr = read(ppfd, pp_buf, sizeof(pp_buf) - 1);
+				close(ppfd);
+				if (nr > 0) {
+					char *last_slash;
+					char *dir_name;
+					char symlink_target[1024];
+
+					pp_buf[nr] = '\0';
+					/* Remove trailing slash/newline */
+					while (nr > 0 && (pp_buf[nr-1] == '/' || pp_buf[nr-1] == '\n'))
+						pp_buf[--nr] = '\0';
+
+					/* Extract last component: "chain/dump1" → "dump1" */
+					last_slash = strrchr(pp_buf, '/');
+					dir_name = last_slash ? last_slash + 1 : pp_buf;
+
+					/* Create symlink: ../dump1 */
+					snprintf(symlink_target, sizeof(symlink_target),
+						 "../%.1020s", dir_name);
+
+					/* Verify target exists */
+					if (faccessat(fd, symlink_target, R_OK, 0) == 0) {
+						ret = symlinkat(symlink_target, fd, CR_PARENT_LINK);
+						if (ret == 0 || errno == EEXIST)
+							pr_info("Reconstructed parent symlink: %s\n",
+								symlink_target);
+						else
+							pr_warn("Failed to create parent symlink %s\n",
+								symlink_target);
+					} else {
+						pr_debug("Parent dir %s not found locally, "
+							 "skipping symlink reconstruction\n",
+							 symlink_target);
+					}
+				}
+			}
 		}
 	}
 
