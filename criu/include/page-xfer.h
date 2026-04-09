@@ -45,6 +45,21 @@ struct page_xfer {
 		};
 	};
 
+	/* S3 upload state (used alongside local when --object-storage-upload) */
+	struct {
+		char upload_id[256];
+		char pages_key[512];
+		char pagemap_key[512];
+		void *part_buf;
+		unsigned long part_buf_used;
+		unsigned long part_buf_cap;
+		int part_number;
+		char **etags;
+		int etags_count;
+		int etags_cap;
+		int active;		/* 1 if S3 upload is in progress */
+	} s3;
+
 	struct page_read *parent;
 };
 

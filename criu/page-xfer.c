@@ -18,6 +18,7 @@
 #include "image.h"
 #include "page-xfer.h"
 #include "page-pipe.h"
+#include "object-storage.h"
 #include "util.h"
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
@@ -426,6 +427,271 @@ err_pmi:
 	return -1;
 }
 
+/*
+ * S3 upload wrapper functions (dual-write: local + S3).
+ * Local xfer functions handle the actual file I/O.
+ * S3 functions upload pages data via multipart and pagemap via put_object.
+ */
+
+#define S3_PART_SIZE (8 * 1024 * 1024) /* 8MB per multipart part */
+
+static int write_pages_s3(struct page_xfer *xfer, int p, unsigned long len)
+{
+	unsigned long remaining;
+	ssize_t nread;
+	int ret;
+
+	/* First, write to local file via splice */
+	ret = write_pages_loc(xfer, p, len);
+	if (ret < 0)
+		return ret;
+
+	if (!xfer->s3.active)
+		return 0;
+
+	/*
+	 * Also read from the pages image we just wrote to buffer for S3 upload.
+	 * Since splice already consumed the pipe, we read back from the local
+	 * pages image file. Seek to the position before the splice.
+	 */
+	{
+		off_t cur_pos;
+		void *read_buf;
+
+		cur_pos = lseek(img_raw_fd(xfer->pi), 0, SEEK_CUR);
+		if (cur_pos < 0 || (unsigned long)cur_pos < len) {
+			pr_err("S3: failed to seek back in pages image\n");
+			return -1;
+		}
+		lseek(img_raw_fd(xfer->pi), cur_pos - len, SEEK_SET);
+
+		read_buf = xmalloc(len);
+		if (!read_buf)
+			return -1;
+
+		remaining = len;
+		while (remaining > 0) {
+			nread = read(img_raw_fd(xfer->pi), read_buf + (len - remaining), remaining);
+			if (nread <= 0) {
+				pr_err("S3: failed to read back pages data\n");
+				xfree(read_buf);
+				return -1;
+			}
+			remaining -= nread;
+		}
+
+		/* Seek back to end */
+		lseek(img_raw_fd(xfer->pi), cur_pos, SEEK_SET);
+
+		/* Accumulate in part buffer, flush when >= S3_PART_SIZE */
+		{
+			unsigned long src_off = 0;
+			while (src_off < len) {
+				unsigned long space = xfer->s3.part_buf_cap - xfer->s3.part_buf_used;
+				unsigned long to_copy = len - src_off;
+
+				if (to_copy > space)
+					to_copy = space;
+				memcpy((char *)xfer->s3.part_buf + xfer->s3.part_buf_used,
+				       (char *)read_buf + src_off, to_copy);
+				xfer->s3.part_buf_used += to_copy;
+				src_off += to_copy;
+
+				if (xfer->s3.part_buf_used >= S3_PART_SIZE) {
+					char etag[256];
+
+					/* Grow etags array if needed */
+					if (xfer->s3.etags_count >= xfer->s3.etags_cap) {
+						int new_cap = xfer->s3.etags_cap * 2;
+						char **new_etags = xrealloc(xfer->s3.etags, new_cap * sizeof(char *));
+						if (!new_etags) {
+							xfree(read_buf);
+							return -1;
+						}
+						xfer->s3.etags = new_etags;
+						xfer->s3.etags_cap = new_cap;
+					}
+
+					xfer->s3.part_number++;
+					ret = object_storage_multipart_upload_part(
+						xfer->s3.pages_key, xfer->s3.upload_id,
+						xfer->s3.part_number,
+						xfer->s3.part_buf, xfer->s3.part_buf_used,
+						etag, sizeof(etag));
+					if (ret < 0) {
+						pr_err("S3: multipart upload part %d failed\n",
+						       xfer->s3.part_number);
+						xfree(read_buf);
+						return -1;
+					}
+					xfer->s3.etags[xfer->s3.etags_count] = xstrdup(etag);
+					xfer->s3.etags_count++;
+					xfer->s3.part_buf_used = 0;
+				}
+			}
+		}
+		xfree(read_buf);
+	}
+
+	return 0;
+}
+
+static int write_pagemap_s3(struct page_xfer *xfer, struct iovec *iov, u32 flags)
+{
+	/* Write to local file first */
+	return write_pagemap_loc(xfer, iov, flags);
+	/* Pagemap is uploaded on close via put_object from the local file */
+}
+
+static void close_page_xfer_s3(struct page_xfer *xfer)
+{
+	int i;
+
+	if (xfer->s3.active) {
+		/* Flush remaining part buffer */
+		if (xfer->s3.part_buf_used > 0 || xfer->s3.part_number == 0) {
+			char etag[256];
+			int ret;
+
+			if (xfer->s3.etags_count >= xfer->s3.etags_cap) {
+				int new_cap = xfer->s3.etags_cap + 1;
+				char **new_etags = xrealloc(xfer->s3.etags, new_cap * sizeof(char *));
+				if (new_etags) {
+					xfer->s3.etags = new_etags;
+					xfer->s3.etags_cap = new_cap;
+				}
+			}
+
+			if (xfer->s3.part_buf_used > 0 || xfer->s3.part_number == 0) {
+				xfer->s3.part_number++;
+				ret = object_storage_multipart_upload_part(
+					xfer->s3.pages_key, xfer->s3.upload_id,
+					xfer->s3.part_number,
+					xfer->s3.part_buf,
+					xfer->s3.part_buf_used > 0 ? xfer->s3.part_buf_used : 0,
+					etag, sizeof(etag));
+				if (ret < 0) {
+					pr_err("S3: final part upload failed, aborting\n");
+					object_storage_multipart_abort(xfer->s3.pages_key,
+								       xfer->s3.upload_id);
+					goto cleanup;
+				}
+				xfer->s3.etags[xfer->s3.etags_count] = xstrdup(etag);
+				xfer->s3.etags_count++;
+			}
+		}
+
+		/* Complete multipart upload */
+		if (xfer->s3.etags_count > 0) {
+			int ret;
+			ret = object_storage_multipart_complete(
+				xfer->s3.pages_key, xfer->s3.upload_id,
+				xfer->s3.etags_count, (const char **)xfer->s3.etags);
+			if (ret < 0)
+				pr_err("S3: multipart complete failed for %s\n", xfer->s3.pages_key);
+		}
+
+		/* Upload pagemap from local file via put_object */
+		if (xfer->pmi) {
+			off_t pmi_size;
+			void *pmi_data;
+			int pmi_fd;
+
+			pmi_fd = img_raw_fd(xfer->pmi);
+			pmi_size = lseek(pmi_fd, 0, SEEK_END);
+			if (pmi_size > 0) {
+				ssize_t nr;
+				unsigned long rd;
+
+				lseek(pmi_fd, 0, SEEK_SET);
+				pmi_data = xmalloc(pmi_size);
+				if (pmi_data) {
+					rd = 0;
+					while (rd < (unsigned long)pmi_size) {
+						nr = read(pmi_fd, (char *)pmi_data + rd, pmi_size - rd);
+						if (nr <= 0)
+							break;
+						rd += nr;
+					}
+					if (rd == (unsigned long)pmi_size) {
+						object_storage_put_object(xfer->s3.pagemap_key,
+									  pmi_data, pmi_size);
+					}
+					xfree(pmi_data);
+				}
+			}
+		}
+
+cleanup:
+		/* Free etags */
+		for (i = 0; i < xfer->s3.etags_count; i++)
+			xfree(xfer->s3.etags[i]);
+		xfree(xfer->s3.etags);
+		xfree(xfer->s3.part_buf);
+		xfer->s3.active = 0;
+	}
+
+	/* Close local files */
+	close_page_xfer(xfer);
+}
+
+static int open_page_s3_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
+{
+	int ret;
+
+	/* First, open local xfer as usual */
+	ret = open_page_local_xfer(xfer, fd_type, img_id);
+	if (ret < 0)
+		return ret;
+
+	/* Initialize S3 upload state */
+	memset(&xfer->s3, 0, sizeof(xfer->s3));
+
+	/* Construct S3 keys using the image filenames */
+	snprintf(xfer->s3.pages_key, sizeof(xfer->s3.pages_key),
+		 "pages-%lu.img", img_id);
+	snprintf(xfer->s3.pagemap_key, sizeof(xfer->s3.pagemap_key),
+		 "pagemap-%lu.img", img_id);
+
+	/* Allocate part buffer */
+	xfer->s3.part_buf_cap = S3_PART_SIZE;
+	xfer->s3.part_buf = xmalloc(S3_PART_SIZE);
+	if (!xfer->s3.part_buf)
+		return -1;
+	xfer->s3.part_buf_used = 0;
+	xfer->s3.part_number = 0;
+
+	/* Allocate etags array */
+	xfer->s3.etags_cap = 64;
+	xfer->s3.etags = xmalloc(xfer->s3.etags_cap * sizeof(char *));
+	if (!xfer->s3.etags) {
+		xfree(xfer->s3.part_buf);
+		return -1;
+	}
+	xfer->s3.etags_count = 0;
+
+	/* Initiate multipart upload for pages */
+	ret = object_storage_multipart_init(xfer->s3.pages_key,
+					    xfer->s3.upload_id,
+					    sizeof(xfer->s3.upload_id));
+	if (ret < 0) {
+		pr_err("S3: failed to initiate multipart upload for %s\n",
+		       xfer->s3.pages_key);
+		xfree(xfer->s3.part_buf);
+		xfree(xfer->s3.etags);
+		return -1;
+	}
+
+	xfer->s3.active = 1;
+
+	/* Override write/close functions with S3 wrappers */
+	xfer->write_pagemap = write_pagemap_s3;
+	xfer->write_pages = write_pages_s3;
+	xfer->close = close_page_xfer_s3;
+
+	return 0;
+}
+
 int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 {
 	xfer->offset = 0;
@@ -433,6 +699,8 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, img_id);
+	else if (opts.object_storage_upload)
+		return open_page_s3_xfer(xfer, fd_type, img_id);
 	else
 		return open_page_local_xfer(xfer, fd_type, img_id);
 }
