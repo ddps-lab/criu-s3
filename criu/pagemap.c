@@ -696,8 +696,16 @@ static int try_open_parent(int dfd, unsigned long id, struct page_read *pr, int 
 
 	if (open_parent(dfd, &pfd))
 		goto err;
-	if (pfd < 0)
+	if (pfd < 0) {
+		/*
+		 * No local parent directory. If object storage is enabled,
+		 * skip parent — the current image's pagemap and pages will
+		 * be fetched from S3 via do_open_image() fallback and
+		 * maybe_read_page_object_storage() respectively.
+		 * Parent chain resolution is not needed when all data is on S3.
+		 */
 		goto out;
+	}
 
 	parent = xmalloc(sizeof(*parent));
 	if (!parent)

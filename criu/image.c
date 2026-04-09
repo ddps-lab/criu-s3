@@ -623,6 +623,46 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 		ret = openat(dfd, path, flags, CR_FD_PERM);
 	if (ret < 0) {
 		if (!(flags & O_CREAT) && (errno == ENOENT || ret == -ENOENT)) {
+			/*
+			 * File not found locally. If object storage is enabled,
+			 * try fetching from S3 and create a memfd for it.
+			 */
+			if (opts.enable_object_storage) {
+				void *s3_data = NULL;
+				unsigned long s3_len = 0;
+				int s3_ret;
+				int mfd;
+
+				s3_ret = object_storage_get_object(path, &s3_data, &s3_len);
+				if (s3_ret == 0 && s3_data && s3_len > 0) {
+					mfd = memfd_create(path, 0);
+					if (mfd >= 0) {
+						unsigned long wr = 0;
+						ssize_t nw;
+
+						while (wr < s3_len) {
+							nw = write(mfd, (char *)s3_data + wr, s3_len - wr);
+							if (nw <= 0)
+								break;
+							wr += nw;
+						}
+						free(s3_data);
+						if (wr == s3_len) {
+							lseek(mfd, 0, SEEK_SET);
+							ret = mfd;
+							pr_info("Fetched %s from object storage (%lu bytes)\n",
+								path, s3_len);
+							goto got_fd;
+						}
+						close(mfd);
+					} else {
+						free(s3_data);
+					}
+				} else if (s3_data) {
+					free(s3_data);
+				}
+			}
+
 			pr_info("No %s image\n", path);
 			img->_x.fd = EMPTY_IMG_FD;
 			goto skip_magic;
@@ -631,6 +671,8 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 		pr_perror("Unable to open %s", path);
 		goto err;
 	}
+
+got_fd:
 
 	img->_x.fd = ret;
 
