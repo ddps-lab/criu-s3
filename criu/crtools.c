@@ -598,6 +598,7 @@ usage:
 	       "  --no-semi-sync-iov            disable semi-synchronous IOV fetch\n"
 	       "                                (fall back to page-by-page fetch for ablation)\n"
 	       "  --async-prefetch              enable asynchronous IOV prefetching\n"
+	       "  --no-hot-vma-seed            disable hot VMA priority seeding\n"
 	       "  --prefetch-workers N          number of prefetch worker threads (default: 8)\n"
 	       "  --cache-limit N               page cache size limit in MB (default: 0=unlimited)\n"
 	       "\n"

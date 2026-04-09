@@ -23,6 +23,8 @@
 #include "xmalloc.h"
 #include "object-storage.h"
 #include "cr_options.h"
+#include "servicefd.h"
+#include "image.h"
 #include "common/list.h"
 #include "rbtree.h"
 #include "util.h"
@@ -704,15 +706,128 @@ void prefetch_cleanup(void)
 	pr_info("Prefetch system cleaned up\n");
 }
 
+/*
+ * Load hot VMA metadata from hot-vmas.json in images directory.
+ * Marks IOVs overlapping with hot VMA ranges as is_hot=true.
+ * Tries local file first, then S3 fallback.
+ * Returns number of hot IOVs found, or 0 if file not found.
+ */
+static int load_hot_vma_metadata(void)
+{
+	char *data = NULL;
+	unsigned long data_len = 0;
+	int hot_count = 0;
+	int fd;
+	char *p;
+
+	/* Try local file first */
+	fd = openat(get_service_fd(IMG_FD_OFF), "hot-vmas.json", O_RDONLY);
+	if (fd >= 0) {
+		off_t fsize = lseek(fd, 0, SEEK_END);
+		if (fsize > 0) {
+			lseek(fd, 0, SEEK_SET);
+			data = xmalloc(fsize + 1);
+			if (data) {
+				if (read(fd, data, fsize) == fsize)
+					data_len = fsize;
+				else {
+					xfree(data);
+					data = NULL;
+				}
+			}
+		}
+		close(fd);
+	}
+
+	/* S3 fallback */
+	if (!data && opts.enable_object_storage) {
+		void *s3_data = NULL;
+		int ret = object_storage_get_object("hot-vmas.json", &s3_data, &data_len);
+		if (ret == 0 && s3_data && data_len > 0) {
+			data = xmalloc(data_len + 1);
+			if (data) {
+				memcpy(data, s3_data, data_len);
+			}
+			free(s3_data);
+		} else {
+			if (s3_data)
+				free(s3_data);
+		}
+	}
+
+	if (!data || data_len == 0) {
+		pr_info("No hot-vmas.json found, using sequential priority\n");
+		return 0;
+	}
+
+	data[data_len] = '\0';
+
+	/* Simple parser: find "start": "0x..." and "end": "0x..." in excluded array */
+	p = strstr(data, "\"excluded\"");
+	if (!p) {
+		pr_warn("hot-vmas.json: no 'excluded' field\n");
+		xfree(data);
+		return 0;
+	}
+
+	while ((p = strstr(p, "\"start\"")) != NULL) {
+		unsigned long start = 0, end = 0;
+		char *s;
+		int i;
+
+		/* Parse start */
+		s = strstr(p, "0x");
+		if (s)
+			start = strtoul(s, NULL, 16);
+		p = s ? s + 1 : p + 7;
+
+		/* Parse end */
+		s = strstr(p, "\"end\"");
+		if (!s)
+			break;
+		s = strstr(s, "0x");
+		if (s)
+			end = strtoul(s, NULL, 16);
+		p = s ? s + 1 : p + 5;
+
+		if (start == 0 || end == 0 || end <= start)
+			continue;
+
+		pr_info("Hot VMA range: 0x%lx - 0x%lx (%lu MB)\n",
+			start, end, (end - start) / (1024 * 1024));
+
+		/* Mark overlapping IOVs as hot */
+		pthread_mutex_lock(&iov_meta_lock);
+		for (i = 0; i < total_iovs; i++) {
+			struct iov_meta *meta = iov_index_map[i];
+			if (!meta)
+				continue;
+			if (meta->iov_start < end && meta->iov_end > start) {
+				meta->is_hot = true;
+				hot_count++;
+			}
+		}
+		pthread_mutex_unlock(&iov_meta_lock);
+	}
+
+	xfree(data);
+	pr_info("Marked %d IOVs as hot from hot-vmas.json\n", hot_count);
+	return hot_count;
+}
+
 /* Pre-queue all IOVs for controller-based prefetch */
 int prefetch_prequeue_all_iovs(void *lpi, unsigned int pages_img_id)
 {
-	int i, queued = 0;
+	int i, queued = 0, hot_queued = 0;
 
 	if (!global_lpi || !iov_index_map) {
 		pr_err("CONTROLLER: Cannot pre-queue - IOV metadata not initialized\n");
 		return -EINVAL;
 	}
+
+	/* Load hot VMA metadata and mark IOVs (if enabled) */
+	if (opts.hot_vma_seed)
+		load_hot_vma_metadata();
 
 	pr_info("CONTROLLER: Pre-queueing all IOVs (total: %d)\n", total_iovs);
 
@@ -746,22 +861,25 @@ int prefetch_prequeue_all_iovs(void *lpi, unsigned int pages_img_id)
 		req->pages_img_id = pages_img_id;
 		req->iov_index = i;
 
-		/* Initial priority: First 32 = MEDIUM (50), rest = LOW (20) */
-		if (i < 32) {
-			initial_priority = 50;  /* PRIORITY_MEDIUM */
-			list_add_tail(&req->list, &queue_medium);
+		/* Priority based on hot VMA metadata */
+		if (meta->is_hot) {
+			initial_priority = PRIORITY_PATTERN;  /* 90 = highest */
+			list_add_tail(&req->list, &queue_high);
+			hot_queued++;
 		} else {
 			initial_priority = 20;  /* PRIORITY_LOW */
 			list_add_tail(&req->list, &queue_low);
 		}
 
 		req->priority = initial_priority;
+		meta->state = IOV_QUEUED;
 
 		/* Add to hash table for O(1) lookup */
 		if (hash_table_insert(&request_hash_table, i, req) < 0) {
 			pr_warn("CONTROLLER: Failed to insert IOV[%d] into hash table\n", i);
 			list_del(&req->list);
 			xfree(req);
+			meta->state = IOV_NOT_REQUESTED;
 			continue;
 		}
 
@@ -770,8 +888,8 @@ int prefetch_prequeue_all_iovs(void *lpi, unsigned int pages_img_id)
 
 	pthread_mutex_unlock(&queue_lock);
 
-	pr_info("CONTROLLER: Pre-queued %d IOVs (filtered %d small IOVs)\n",
-		queued, total_iovs - queued);
+	pr_info("CONTROLLER: Pre-queued %d IOVs (%d hot, %d sequential, filtered %d small)\n",
+		queued, hot_queued, queued - hot_queued, total_iovs - queued);
 
 	return queued;
 }

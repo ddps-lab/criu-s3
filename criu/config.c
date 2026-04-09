@@ -740,6 +740,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "object-storage-path-style", no_argument, NULL, 1115 },
 		{ "object-storage-upload", no_argument, NULL, 1116 },
 		{ "no-semi-sync-iov", no_argument, NULL, 1117 },
+		{ "no-hot-vma-seed", no_argument, NULL, 1118 },
 		{},
 	};
 
@@ -1115,6 +1116,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			break;
 		case 1109:
 			opts.async_prefetch = true;
+			opts.hot_vma_seed = true;
 			break;
 		case 1110:
 			opts.prefetch_workers = atoi(optarg);
@@ -1180,6 +1182,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			break;
 		case 1117:
 			opts.semi_sync_iov = false;
+			break;
+		case 1118:
+			opts.hot_vma_seed = false;
 			break;
 		default:
 			return 2;
