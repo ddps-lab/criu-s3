@@ -748,7 +748,7 @@ void close_image(struct cr_img *img)
 		 */
 		if (opts.object_storage_upload && img->path &&
 		    strncmp(img->path, "pages-", 6) != 0) {
-			int fd = img_raw_fd(img);
+			int fd;
 			off_t file_size;
 
 			/* Flush buffered writes first */
