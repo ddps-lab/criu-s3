@@ -810,6 +810,11 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 			iov_array[i].iov_start = iov->start;
 			iov_array[i].iov_end = iov->end;
 
+			if (i < 5 || (i >= num_iovs - 3)) {
+				lp_debug(lpi, "prefetch_init IOV[%d]: start=0x%lx end=0x%lx img_start=0x%lx\n",
+					 i, iov->start, iov->end, iov->img_start);
+			}
+
 			/* Calculate actual file offset using seek_pagemap */
 			lpi->pr.reset(&lpi->pr);
 			if (lpi->pr.seek_pagemap(&lpi->pr, iov->img_start) > 0) {
@@ -820,6 +825,20 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 				iov_array[i].file_offset = 0;
 			}
 			i++;
+		}
+
+		/* Log first IOV addresses after seek_pagemap calls */
+		{
+			struct lazy_iov *check_iov;
+			int j = 0;
+			list_for_each_entry(check_iov, &lpi->iovs, l) {
+				if (j < 5) {
+					lp_debug(lpi, "AFTER seek: IOV[%d] start=0x%lx end=0x%lx\n",
+						 j, check_iov->start, check_iov->end);
+				}
+				j++;
+			}
+			lp_debug(lpi, "AFTER seek: total IOVs in list = %d (was %d)\n", j, num_iovs);
 		}
 
 		/* Initialize prefetch IOV metadata */

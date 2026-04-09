@@ -175,22 +175,30 @@ static int proximity_window = PROXIMITY_WINDOW_DEFAULT;
 /* ========== IOV Metadata Functions (Phase 2) ========== */
 
 /* Compare function for RB-tree insertion */
-static struct iov_meta *iov_meta_search(unsigned long iov_start)
+/*
+ * Search for IOV metadata containing the given address.
+ * When called with an exact iov_start, returns exact match.
+ * When called with a fault address (may be inside IOV), performs range search.
+ */
+static struct iov_meta *iov_meta_search(unsigned long addr)
 {
 	struct rb_node *node = iov_meta_tree.rb_node;
+	struct iov_meta *candidate = NULL;
 
 	while (node) {
 		struct iov_meta *meta = rb_entry(node, struct iov_meta, node);
 
-		if (iov_start < meta->iov_start)
+		if (addr < meta->iov_start) {
 			node = node->rb_left;
-		else if (iov_start > meta->iov_start)
+		} else if (addr >= meta->iov_end) {
 			node = node->rb_right;
-		else
+		} else {
+			/* addr >= iov_start && addr < iov_end → inside this IOV */
 			return meta;
+		}
 	}
 
-	return NULL;
+	return candidate; /* NULL if not found */
 }
 
 /* Insert IOV metadata into RB-tree */
