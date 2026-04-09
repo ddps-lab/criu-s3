@@ -58,7 +58,7 @@ struct page_xfer {
 		int etags_count;
 		int etags_cap;
 		int active;		/* 1 if S3 upload is in progress */
-	} s3;
+	} object_storage;
 
 	struct page_read *parent;
 };

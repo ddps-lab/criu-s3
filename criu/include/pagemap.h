@@ -81,6 +81,9 @@ struct page_read {
 	int curr_pme;
 
 	struct list_head async;
+
+	/* S3 object prefix override for this page_read (NULL = use global) */
+	char *object_storage_prefix;
 };
 
 /* flags for ->read_pages */

@@ -479,12 +479,14 @@ static int maybe_read_page_object_storage(struct page_read *pr, unsigned long va
 	pr_info("Object Storage: Reading %d pages (len: %lu) from %s at offset %lu for vaddr %lx\n",
 	        nr, len, image_name, pr->pi_off, vaddr);
 
-	/* Construct the object key with prefix if available */
-	if (opts.object_storage_object_prefix && strlen(opts.object_storage_object_prefix) > 0) {
-		snprintf(object_key, sizeof(object_key), "%s%s",
-		         opts.object_storage_object_prefix, image_name);
-	} else {
-		snprintf(object_key, sizeof(object_key), "%s", image_name);
+	/* Construct the object key: use per-page_read prefix if set, else global */
+	{
+		const char *prefix = pr->object_storage_prefix ? pr->object_storage_prefix : opts.object_storage_object_prefix;
+		if (prefix && strlen(prefix) > 0) {
+			snprintf(object_key, sizeof(object_key), "%s%s", prefix, image_name);
+		} else {
+			snprintf(object_key, sizeof(object_key), "%s", image_name);
+		}
 	}
 
 	/* Fetch data from object storage */
@@ -699,11 +701,93 @@ static int try_open_parent(int dfd, unsigned long id, struct page_read *pr, int 
 	if (pfd < 0) {
 		/*
 		 * No local parent directory. If object storage is enabled,
-		 * skip parent — the current image's pagemap and pages will
-		 * be fetched from S3 via do_open_image() fallback and
-		 * maybe_read_page_object_storage() respectively.
-		 * Parent chain resolution is not needed when all data is on S3.
+		 * try to fetch parent-prefix marker from S3 and set up
+		 * parent page_read with the parent's S3 prefix.
 		 */
+		if (opts.enable_object_storage) {
+			void *prefix_data = NULL;
+			unsigned long prefix_len = 0;
+			int s3_ret;
+			char *parent_prefix;
+			char *tmpdir;
+			int tfd;
+
+			s3_ret = object_storage_get_object("parent-prefix",
+							   &prefix_data, &prefix_len);
+			if (s3_ret != 0 || !prefix_data || prefix_len == 0) {
+				if (prefix_data)
+					free(prefix_data);
+				pr_debug("No parent-prefix on S3, no parent chain\n");
+				goto out;
+			}
+
+			/* Null-terminate the prefix */
+			parent_prefix = xmalloc(prefix_len + 1);
+			if (!parent_prefix) {
+				free(prefix_data);
+				goto out;
+			}
+			memcpy(parent_prefix, prefix_data, prefix_len);
+			parent_prefix[prefix_len] = '\0';
+			free(prefix_data);
+
+			pr_info("Found parent prefix on S3: %s\n", parent_prefix);
+
+			/*
+			 * Create a tmpdir and fetch parent metadata from S3.
+			 * We temporarily swap the global prefix to parent prefix,
+			 * open page_read (which triggers S3 fallback for metadata),
+			 * then restore the original prefix.
+			 */
+			tmpdir = xstrdup("/tmp/criu-parent-XXXXXX");
+			if (!tmpdir || !mkdtemp(tmpdir)) {
+				xfree(parent_prefix);
+				xfree(tmpdir);
+				goto out;
+			}
+
+			tfd = open(tmpdir, O_RDONLY | O_DIRECTORY);
+			if (tfd < 0) {
+				xfree(parent_prefix);
+				xfree(tmpdir);
+				goto out;
+			}
+
+			parent = xmalloc(sizeof(*parent));
+			if (!parent) {
+				close(tfd);
+				xfree(parent_prefix);
+				xfree(tmpdir);
+				goto out;
+			}
+
+			/* Swap prefix to parent's, open page_read, restore */
+			{
+				char *saved_prefix = opts.object_storage_object_prefix;
+				opts.object_storage_object_prefix = parent_prefix;
+				ret = open_page_read_at(tfd, id, parent, pr_flags);
+				opts.object_storage_object_prefix = saved_prefix;
+			}
+
+			close(tfd);
+
+			if (ret <= 0) {
+				pr_debug("Could not open parent page_read from S3\n");
+				xfree(parent);
+				parent = NULL;
+			} else {
+				/* Set per-page_read prefix for parent pages fetch */
+				parent->object_storage_prefix = parent_prefix;
+				parent_prefix = NULL; /* ownership transferred */
+			}
+
+			if (parent_prefix)
+				xfree(parent_prefix);
+
+			/* Clean up tmpdir (files are in memfd, not on disk) */
+			rmdir(tmpdir);
+			xfree(tmpdir);
+		}
 		goto out;
 	}
 
@@ -849,6 +933,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	INIT_LIST_HEAD(&pr->async);
 	pr->pe = NULL;
 	pr->parent = NULL;
+	pr->object_storage_prefix = NULL;
 	pr->cvaddr = 0;
 	pr->pi_off = 0;
 	pr->bunch.iov_len = 0;

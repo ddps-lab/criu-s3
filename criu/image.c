@@ -834,19 +834,73 @@ int open_image_dir(char *dir, int mode)
 			goto err;
 	} else if (opts.img_parent) {
 		if (faccessat(fd, opts.img_parent, R_OK, 0)) {
-			pr_perror("Invalid parent image directory provided");
-			goto err;
+			if (!opts.enable_object_storage) {
+				pr_perror("Invalid parent image directory provided");
+				goto err;
+			}
+			pr_info("Parent dir %s not found locally, skipping symlink (object storage mode)\n",
+				opts.img_parent);
+		} else {
+			ret = symlinkat(opts.img_parent, fd, CR_PARENT_LINK);
+			if (ret < 0 && errno != EEXIST) {
+				pr_perror("Can't link parent snapshot");
+				goto err;
+			}
+
+			if (opts.img_parent[0] == '/')
+				pr_warn("Absolute paths for parent links "
+					"may not work on restore!\n");
 		}
 
-		ret = symlinkat(opts.img_parent, fd, CR_PARENT_LINK);
-		if (ret < 0 && errno != EEXIST) {
-			pr_perror("Can't link parent snapshot");
-			goto err;
-		}
+		/*
+		 * Upload parent prefix info to S3 so restore can find parent.
+		 * Convention: resolve --prev-images-dir relative to current prefix.
+		 * E.g., prefix="ckpt/dump2/", parent="../dump1/" → "ckpt/dump1/"
+		 */
+		if (opts.object_storage_upload && opts.object_storage_object_prefix) {
+			char parent_prefix[1024];
+			const char *cur = opts.object_storage_object_prefix;
+			const char *rel = opts.img_parent;
+			size_t cur_len;
+			size_t pp_len;
 
-		if (opts.img_parent[0] == '/')
-			pr_warn("Absolute paths for parent links "
-				"may not work on restore!\n");
+			/* Copy current prefix and resolve relative path */
+			snprintf(parent_prefix, sizeof(parent_prefix), "%s", cur);
+			cur_len = strlen(parent_prefix);
+			/* Remove trailing slash */
+			if (cur_len > 0 && parent_prefix[cur_len - 1] == '/')
+				parent_prefix[--cur_len] = '\0';
+
+			/* Process "../" segments */
+			while (strncmp(rel, "../", 3) == 0) {
+				char *last_slash;
+				rel += 3;
+				last_slash = strrchr(parent_prefix, '/');
+				if (last_slash)
+					*last_slash = '\0';
+				else
+					parent_prefix[0] = '\0';
+			}
+			/* Append remaining relative path */
+			if (rel[0]) {
+				pp_len = strlen(parent_prefix);
+				if (pp_len > 0)
+					snprintf(parent_prefix + pp_len,
+						 sizeof(parent_prefix) - pp_len, "/%s", rel);
+				else
+					snprintf(parent_prefix, sizeof(parent_prefix), "%s", rel);
+			}
+			/* Ensure trailing slash */
+			pp_len = strlen(parent_prefix);
+			if (pp_len > 0 && parent_prefix[pp_len - 1] != '/') {
+				parent_prefix[pp_len] = '/';
+				parent_prefix[pp_len + 1] = '\0';
+			}
+
+			pr_info("Uploading parent prefix marker: %s\n", parent_prefix);
+			object_storage_put_object("parent-prefix",
+						  parent_prefix, strlen(parent_prefix));
+		}
 	}
 
 	return 0;

@@ -433,9 +433,9 @@ err_pmi:
  * S3 functions upload pages data via multipart and pagemap via put_object.
  */
 
-#define S3_PART_SIZE (8 * 1024 * 1024) /* 8MB per multipart part */
+#define OBJECT_STORAGE_PART_SIZE (8 * 1024 * 1024) /* 8MB per multipart part */
 
-static int write_pages_s3(struct page_xfer *xfer, int p, unsigned long len)
+static int write_pages_object_storage(struct page_xfer *xfer, int p, unsigned long len)
 {
 	unsigned long remaining;
 	ssize_t nread;
@@ -446,7 +446,7 @@ static int write_pages_s3(struct page_xfer *xfer, int p, unsigned long len)
 	if (ret < 0)
 		return ret;
 
-	if (!xfer->s3.active)
+	if (!xfer->object_storage.active)
 		return 0;
 
 	/*
@@ -460,7 +460,7 @@ static int write_pages_s3(struct page_xfer *xfer, int p, unsigned long len)
 
 		cur_pos = lseek(img_raw_fd(xfer->pi), 0, SEEK_CUR);
 		if (cur_pos < 0 || (unsigned long)cur_pos < len) {
-			pr_err("S3: failed to seek back in pages image\n");
+			pr_err("object_storage: failed to seek back in pages image\n");
 			return -1;
 		}
 		lseek(img_raw_fd(xfer->pi), cur_pos - len, SEEK_SET);
@@ -473,7 +473,7 @@ static int write_pages_s3(struct page_xfer *xfer, int p, unsigned long len)
 		while (remaining > 0) {
 			nread = read(img_raw_fd(xfer->pi), read_buf + (len - remaining), remaining);
 			if (nread <= 0) {
-				pr_err("S3: failed to read back pages data\n");
+				pr_err("object_storage: failed to read back pages data\n");
 				xfree(read_buf);
 				return -1;
 			}
@@ -483,50 +483,50 @@ static int write_pages_s3(struct page_xfer *xfer, int p, unsigned long len)
 		/* Seek back to end */
 		lseek(img_raw_fd(xfer->pi), cur_pos, SEEK_SET);
 
-		/* Accumulate in part buffer, flush when >= S3_PART_SIZE */
+		/* Accumulate in part buffer, flush when >= OBJECT_STORAGE_PART_SIZE */
 		{
 			unsigned long src_off = 0;
 			while (src_off < len) {
-				unsigned long space = xfer->s3.part_buf_cap - xfer->s3.part_buf_used;
+				unsigned long space = xfer->object_storage.part_buf_cap - xfer->object_storage.part_buf_used;
 				unsigned long to_copy = len - src_off;
 
 				if (to_copy > space)
 					to_copy = space;
-				memcpy((char *)xfer->s3.part_buf + xfer->s3.part_buf_used,
+				memcpy((char *)xfer->object_storage.part_buf + xfer->object_storage.part_buf_used,
 				       (char *)read_buf + src_off, to_copy);
-				xfer->s3.part_buf_used += to_copy;
+				xfer->object_storage.part_buf_used += to_copy;
 				src_off += to_copy;
 
-				if (xfer->s3.part_buf_used >= S3_PART_SIZE) {
+				if (xfer->object_storage.part_buf_used >= OBJECT_STORAGE_PART_SIZE) {
 					char etag[256];
 
 					/* Grow etags array if needed */
-					if (xfer->s3.etags_count >= xfer->s3.etags_cap) {
-						int new_cap = xfer->s3.etags_cap * 2;
-						char **new_etags = xrealloc(xfer->s3.etags, new_cap * sizeof(char *));
+					if (xfer->object_storage.etags_count >= xfer->object_storage.etags_cap) {
+						int new_cap = xfer->object_storage.etags_cap * 2;
+						char **new_etags = xrealloc(xfer->object_storage.etags, new_cap * sizeof(char *));
 						if (!new_etags) {
 							xfree(read_buf);
 							return -1;
 						}
-						xfer->s3.etags = new_etags;
-						xfer->s3.etags_cap = new_cap;
+						xfer->object_storage.etags = new_etags;
+						xfer->object_storage.etags_cap = new_cap;
 					}
 
-					xfer->s3.part_number++;
+					xfer->object_storage.part_number++;
 					ret = object_storage_multipart_upload_part(
-						xfer->s3.pages_key, xfer->s3.upload_id,
-						xfer->s3.part_number,
-						xfer->s3.part_buf, xfer->s3.part_buf_used,
+						xfer->object_storage.pages_key, xfer->object_storage.upload_id,
+						xfer->object_storage.part_number,
+						xfer->object_storage.part_buf, xfer->object_storage.part_buf_used,
 						etag, sizeof(etag));
 					if (ret < 0) {
-						pr_err("S3: multipart upload part %d failed\n",
-						       xfer->s3.part_number);
+						pr_err("object_storage: multipart upload part %d failed\n",
+						       xfer->object_storage.part_number);
 						xfree(read_buf);
 						return -1;
 					}
-					xfer->s3.etags[xfer->s3.etags_count] = xstrdup(etag);
-					xfer->s3.etags_count++;
-					xfer->s3.part_buf_used = 0;
+					xfer->object_storage.etags[xfer->object_storage.etags_count] = xstrdup(etag);
+					xfer->object_storage.etags_count++;
+					xfer->object_storage.part_buf_used = 0;
 				}
 			}
 		}
@@ -536,59 +536,59 @@ static int write_pages_s3(struct page_xfer *xfer, int p, unsigned long len)
 	return 0;
 }
 
-static int write_pagemap_s3(struct page_xfer *xfer, struct iovec *iov, u32 flags)
+static int write_pagemap_object_storage(struct page_xfer *xfer, struct iovec *iov, u32 flags)
 {
 	/* Write to local file first */
 	return write_pagemap_loc(xfer, iov, flags);
 	/* Pagemap is uploaded on close via put_object from the local file */
 }
 
-static void close_page_xfer_s3(struct page_xfer *xfer)
+static void close_page_xfer_object_storage(struct page_xfer *xfer)
 {
 	int i;
 
-	if (xfer->s3.active) {
+	if (xfer->object_storage.active) {
 		/* Flush remaining part buffer */
-		if (xfer->s3.part_buf_used > 0 || xfer->s3.part_number == 0) {
+		if (xfer->object_storage.part_buf_used > 0 || xfer->object_storage.part_number == 0) {
 			char etag[256];
 			int ret;
 
-			if (xfer->s3.etags_count >= xfer->s3.etags_cap) {
-				int new_cap = xfer->s3.etags_cap + 1;
-				char **new_etags = xrealloc(xfer->s3.etags, new_cap * sizeof(char *));
+			if (xfer->object_storage.etags_count >= xfer->object_storage.etags_cap) {
+				int new_cap = xfer->object_storage.etags_cap + 1;
+				char **new_etags = xrealloc(xfer->object_storage.etags, new_cap * sizeof(char *));
 				if (new_etags) {
-					xfer->s3.etags = new_etags;
-					xfer->s3.etags_cap = new_cap;
+					xfer->object_storage.etags = new_etags;
+					xfer->object_storage.etags_cap = new_cap;
 				}
 			}
 
-			if (xfer->s3.part_buf_used > 0 || xfer->s3.part_number == 0) {
-				xfer->s3.part_number++;
+			if (xfer->object_storage.part_buf_used > 0 || xfer->object_storage.part_number == 0) {
+				xfer->object_storage.part_number++;
 				ret = object_storage_multipart_upload_part(
-					xfer->s3.pages_key, xfer->s3.upload_id,
-					xfer->s3.part_number,
-					xfer->s3.part_buf,
-					xfer->s3.part_buf_used > 0 ? xfer->s3.part_buf_used : 0,
+					xfer->object_storage.pages_key, xfer->object_storage.upload_id,
+					xfer->object_storage.part_number,
+					xfer->object_storage.part_buf,
+					xfer->object_storage.part_buf_used > 0 ? xfer->object_storage.part_buf_used : 0,
 					etag, sizeof(etag));
 				if (ret < 0) {
-					pr_err("S3: final part upload failed, aborting\n");
-					object_storage_multipart_abort(xfer->s3.pages_key,
-								       xfer->s3.upload_id);
+					pr_err("object_storage: final part upload failed, aborting\n");
+					object_storage_multipart_abort(xfer->object_storage.pages_key,
+								       xfer->object_storage.upload_id);
 					goto cleanup;
 				}
-				xfer->s3.etags[xfer->s3.etags_count] = xstrdup(etag);
-				xfer->s3.etags_count++;
+				xfer->object_storage.etags[xfer->object_storage.etags_count] = xstrdup(etag);
+				xfer->object_storage.etags_count++;
 			}
 		}
 
 		/* Complete multipart upload */
-		if (xfer->s3.etags_count > 0) {
+		if (xfer->object_storage.etags_count > 0) {
 			int ret;
 			ret = object_storage_multipart_complete(
-				xfer->s3.pages_key, xfer->s3.upload_id,
-				xfer->s3.etags_count, (const char **)xfer->s3.etags);
+				xfer->object_storage.pages_key, xfer->object_storage.upload_id,
+				xfer->object_storage.etags_count, (const char **)xfer->object_storage.etags);
 			if (ret < 0)
-				pr_err("S3: multipart complete failed for %s\n", xfer->s3.pages_key);
+				pr_err("object_storage: multipart complete failed for %s\n", xfer->object_storage.pages_key);
 		}
 
 		/* Upload pagemap from local file via put_object */
@@ -614,7 +614,7 @@ static void close_page_xfer_s3(struct page_xfer *xfer)
 						rd += nr;
 					}
 					if (rd == (unsigned long)pmi_size) {
-						object_storage_put_object(xfer->s3.pagemap_key,
+						object_storage_put_object(xfer->object_storage.pagemap_key,
 									  pmi_data, pmi_size);
 					}
 					xfree(pmi_data);
@@ -624,18 +624,18 @@ static void close_page_xfer_s3(struct page_xfer *xfer)
 
 cleanup:
 		/* Free etags */
-		for (i = 0; i < xfer->s3.etags_count; i++)
-			xfree(xfer->s3.etags[i]);
-		xfree(xfer->s3.etags);
-		xfree(xfer->s3.part_buf);
-		xfer->s3.active = 0;
+		for (i = 0; i < xfer->object_storage.etags_count; i++)
+			xfree(xfer->object_storage.etags[i]);
+		xfree(xfer->object_storage.etags);
+		xfree(xfer->object_storage.part_buf);
+		xfer->object_storage.active = 0;
 	}
 
 	/* Close local files */
 	close_page_xfer(xfer);
 }
 
-static int open_page_s3_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
+static int open_page_object_storage_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 {
 	int ret;
 
@@ -644,50 +644,50 @@ static int open_page_s3_xfer(struct page_xfer *xfer, int fd_type, unsigned long 
 	if (ret < 0)
 		return ret;
 
-	/* Initialize S3 upload state */
-	memset(&xfer->s3, 0, sizeof(xfer->s3));
+	/* Initialize object storage upload state */
+	memset(&xfer->object_storage, 0, sizeof(xfer->object_storage));
 
 	/* Construct S3 keys using the image filenames */
-	snprintf(xfer->s3.pages_key, sizeof(xfer->s3.pages_key),
+	snprintf(xfer->object_storage.pages_key, sizeof(xfer->object_storage.pages_key),
 		 "pages-%lu.img", img_id);
-	snprintf(xfer->s3.pagemap_key, sizeof(xfer->s3.pagemap_key),
+	snprintf(xfer->object_storage.pagemap_key, sizeof(xfer->object_storage.pagemap_key),
 		 "pagemap-%lu.img", img_id);
 
 	/* Allocate part buffer */
-	xfer->s3.part_buf_cap = S3_PART_SIZE;
-	xfer->s3.part_buf = xmalloc(S3_PART_SIZE);
-	if (!xfer->s3.part_buf)
+	xfer->object_storage.part_buf_cap = OBJECT_STORAGE_PART_SIZE;
+	xfer->object_storage.part_buf = xmalloc(OBJECT_STORAGE_PART_SIZE);
+	if (!xfer->object_storage.part_buf)
 		return -1;
-	xfer->s3.part_buf_used = 0;
-	xfer->s3.part_number = 0;
+	xfer->object_storage.part_buf_used = 0;
+	xfer->object_storage.part_number = 0;
 
 	/* Allocate etags array */
-	xfer->s3.etags_cap = 64;
-	xfer->s3.etags = xmalloc(xfer->s3.etags_cap * sizeof(char *));
-	if (!xfer->s3.etags) {
-		xfree(xfer->s3.part_buf);
+	xfer->object_storage.etags_cap = 64;
+	xfer->object_storage.etags = xmalloc(xfer->object_storage.etags_cap * sizeof(char *));
+	if (!xfer->object_storage.etags) {
+		xfree(xfer->object_storage.part_buf);
 		return -1;
 	}
-	xfer->s3.etags_count = 0;
+	xfer->object_storage.etags_count = 0;
 
 	/* Initiate multipart upload for pages */
-	ret = object_storage_multipart_init(xfer->s3.pages_key,
-					    xfer->s3.upload_id,
-					    sizeof(xfer->s3.upload_id));
+	ret = object_storage_multipart_init(xfer->object_storage.pages_key,
+					    xfer->object_storage.upload_id,
+					    sizeof(xfer->object_storage.upload_id));
 	if (ret < 0) {
-		pr_err("S3: failed to initiate multipart upload for %s\n",
-		       xfer->s3.pages_key);
-		xfree(xfer->s3.part_buf);
-		xfree(xfer->s3.etags);
+		pr_err("object_storage: failed to initiate multipart upload for %s\n",
+		       xfer->object_storage.pages_key);
+		xfree(xfer->object_storage.part_buf);
+		xfree(xfer->object_storage.etags);
 		return -1;
 	}
 
-	xfer->s3.active = 1;
+	xfer->object_storage.active = 1;
 
 	/* Override write/close functions with S3 wrappers */
-	xfer->write_pagemap = write_pagemap_s3;
-	xfer->write_pages = write_pages_s3;
-	xfer->close = close_page_xfer_s3;
+	xfer->write_pagemap = write_pagemap_object_storage;
+	xfer->write_pages = write_pages_object_storage;
+	xfer->close = close_page_xfer_object_storage;
 
 	return 0;
 }
@@ -700,7 +700,7 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, img_id);
 	else if (opts.object_storage_upload)
-		return open_page_s3_xfer(xfer, fd_type, img_id);
+		return open_page_object_storage_xfer(xfer, fd_type, img_id);
 	else
 		return open_page_local_xfer(xfer, fd_type, img_id);
 }
