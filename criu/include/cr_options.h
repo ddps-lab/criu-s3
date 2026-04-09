@@ -266,7 +266,8 @@ struct cr_options {
 	char *aws_secret_key;
 	char *aws_region;
 
-	/* Async prefetch options */
+	/* Lazy restore options */
+	bool semi_sync_iov;		/* semi-synchronous IOV fetch (default: true when object storage) */
 	bool async_prefetch;
 	int prefetch_workers;
 	unsigned long cache_limit_mb;

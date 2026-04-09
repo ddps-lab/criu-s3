@@ -739,6 +739,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "no-parent-range", required_argument, 0, 1114 },
 		{ "object-storage-path-style", no_argument, NULL, 1115 },
 		{ "object-storage-upload", no_argument, NULL, 1116 },
+		{ "no-semi-sync-iov", no_argument, NULL, 1117 },
 		{},
 	};
 
@@ -1089,6 +1090,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			return 2;
 		case 1101:
 			opts.enable_object_storage = true;
+			opts.semi_sync_iov = true;
 			break;
 		case 1102:
 			SET_CHAR_OPTS(object_storage_endpoint_url, optarg);
@@ -1174,6 +1176,10 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		case 1116:
 			opts.object_storage_upload = true;
 			opts.enable_object_storage = true;
+			opts.semi_sync_iov = true;
+			break;
+		case 1117:
+			opts.semi_sync_iov = false;
 			break;
 		default:
 			return 2;

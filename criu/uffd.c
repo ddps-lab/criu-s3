@@ -1278,7 +1278,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	}
 
 	/* === IOV-based semi-synchronous logic === */
-	if (opts.enable_object_storage && opts.lazy_pages) {
+	if (opts.enable_object_storage && opts.lazy_pages && opts.semi_sync_iov) {
 		void *cached_data = NULL;
 		enum cache_result cache_result = CACHE_MISS;
 		int iov_index = -1;
