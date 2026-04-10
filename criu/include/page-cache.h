@@ -44,6 +44,9 @@ void cache_cleanup(void);
  */
 int cache_wait_for_room(size_t incoming_size);
 
+/* Refine cache limit after total lazy bytes are known */
+void cache_update_limit(unsigned long total_lazy_bytes);
+
 /* Signal that prefetch system is shutting down (unblocks waiting workers) */
 void cache_set_shutdown(void);
 

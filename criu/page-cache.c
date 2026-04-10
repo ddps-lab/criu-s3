@@ -258,6 +258,49 @@ int cache_init(unsigned long max_memory_mb, unsigned long total_lazy_bytes)
 	return 0;
 }
 
+void cache_update_limit(unsigned long total_lazy_bytes)
+{
+	size_t new_max;
+	size_t from_lazy;
+	size_t avail;
+	size_t floor;
+
+	if (!cache_state.initialized)
+		return;
+
+	/* If user set explicit --cache-limit, don't override */
+	if (cache_state.max_bytes != 256UL * 1024 * 1024 &&
+	    cache_state.max_bytes != 0)
+		return;
+
+	floor = 256UL * 1024 * 1024;
+	avail = get_available_memory();
+	from_lazy = total_lazy_bytes / 3;
+
+	if (avail / 4 > floor)
+		new_max = avail / 4;
+	else
+		new_max = floor;
+
+	if (from_lazy > 0 && from_lazy < new_max)
+		new_max = from_lazy;
+
+	if (new_max < floor)
+		new_max = floor;
+
+	pthread_mutex_lock(&cache_state.lock);
+	cache_state.max_bytes = new_max;
+	cache_state.high_watermark = new_max * 85 / 100;
+	cache_state.low_watermark = new_max * 60 / 100;
+	pthread_mutex_unlock(&cache_state.lock);
+
+	pr_info("Cache limit updated: max=%lu MB, high=%lu MB, low=%lu MB (lazy total=%lu MB)\n",
+		new_max / (1024 * 1024),
+		cache_state.high_watermark / (1024 * 1024),
+		cache_state.low_watermark / (1024 * 1024),
+		total_lazy_bytes / (1024 * 1024));
+}
+
 void cache_cleanup(void)
 {
 	struct rb_node *node;

@@ -1726,6 +1726,17 @@ int cr_lazy_pages(bool daemon)
 		return -1;
 	}
 
+	/* Now that all lpis are populated, update cache limit with actual lazy bytes */
+	if (opts.async_prefetch) {
+		struct lazy_pages_info *lpi;
+		unsigned long total_lazy_bytes = 0;
+
+		list_for_each_entry(lpi, &lpis, l)
+			total_lazy_bytes += lpi->total_pages * page_size();
+
+		cache_update_limit(total_lazy_bytes);
+	}
+
 	if (opts.use_page_server) {
 		if (connect_to_page_server_to_recv(epollfd)) {
 			xfree(events);
