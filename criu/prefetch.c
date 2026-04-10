@@ -44,14 +44,35 @@
 
 /* Pattern detection information */
 
-/* Explicit IOV state machine */
+/*
+ * IOV state machine.
+ *
+ * All transitions protected by iov_meta_lock unless noted.
+ *
+ * NOT_REQUESTED ──[prequeue]──→ QUEUED ──[worker dequeue]──→ FETCHING
+ *       ↑                                                       │
+ *       │                           ┌───────────────────────────┤
+ *       │                    [fetch fail]              [fetch ok]
+ *       │                           │                       │
+ *       ├───────────── NOT_REQUESTED                    CACHED
+ *       │                                                   │
+ *       │                                            [fault hit]
+ *       │                                                   ↓
+ *       │                                              RESTORED (terminal)
+ *       │
+ *       └──[eviction]── NOT_REQUESTED
+ *
+ * FAULTED: fault handler started sync fetch (UFFDIO_COPY pending).
+ *          Worker skips cache_store if state is FAULTED or RESTORED.
+ * RESTORED: UFFDIO_COPY completed. Terminal. No further transitions.
+ */
 enum iov_state {
-	IOV_NOT_REQUESTED,   /* Initial state after metadata init */
+	IOV_NOT_REQUESTED,   /* Initial or post-eviction/failure */
 	IOV_QUEUED,          /* In prefetch queue, waiting for worker */
 	IOV_FETCHING,        /* Worker is actively fetching from S3 */
 	IOV_CACHED,          /* Data in page cache, awaiting UFFDIO_COPY */
 	IOV_RESTORED,        /* Installed in address space (terminal) */
-	IOV_FAULTED          /* Removed from queue due to on-demand fault */
+	IOV_FAULTED          /* Sync fetch started, worker should skip */
 };
 
 /* IOV metadata for tracking state */
@@ -103,6 +124,7 @@ static bool workers_running = false;
 static struct list_head queue_high = LIST_HEAD_INIT(queue_high);     /* >= 70 */
 static struct list_head queue_medium = LIST_HEAD_INIT(queue_medium); /* 40-69 */
 static struct list_head queue_low = LIST_HEAD_INIT(queue_low);       /* < 40 */
+static int queue_size = 0;  /* Maintained counter, avoids O(n) iteration */
 static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 
@@ -133,14 +155,10 @@ struct controller_stats {
 static struct controller_stats controller_stats;
 static pthread_mutex_t controller_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Proximity-based removal configuration (base values for adaptive calculation) */
-#define PROXIMITY_WINDOW_DEFAULT 8
-#define PROXIMITY_WINDOW_SEQUENTIAL 8  /* Base value for formula-based scaling */
-#define PROXIMITY_WINDOW_RANDOM 4
-
-/* Adaptive queue management */
-#define TARGET_QUEUE_SIZE 64  /* Target queue size for steady state */
-#define BASE_PROMOTION_DISTANCE 64  /* Base promotion distance */
+/* Controller tuning */
+#define PROXIMITY_WINDOW 8           /* Forward IOVs to remove on fault */
+#define ENABLE_PROXIMITY_REMOVAL 1   /* Feature flag: set 0 to disable */
+#define PROMOTE_DISTANCE 32          /* Fixed: promote next N IOVs on fault */
 
 /* ========== IOV Metadata Functions ========== */
 
@@ -395,12 +413,15 @@ static struct prefetch_request *dequeue_request(void)
 	if (!list_empty(&queue_high)) {
 		req = list_first_entry(&queue_high, struct prefetch_request, list);
 		list_del(&req->list);
+		queue_size--;
 	} else if (!list_empty(&queue_medium)) {
 		req = list_first_entry(&queue_medium, struct prefetch_request, list);
 		list_del(&req->list);
+		queue_size--;
 	} else if (!list_empty(&queue_low)) {
 		req = list_first_entry(&queue_low, struct prefetch_request, list);
 		list_del(&req->list);
+		queue_size--;
 	}
 
 	pthread_mutex_unlock(&queue_lock);
@@ -932,6 +953,7 @@ int prefetch_prequeue_all_iovs(void *lpi, unsigned int pages_img_id)
 		queued++;
 	}
 
+	queue_size += queued;
 	pthread_mutex_unlock(&queue_lock);
 
 	pr_info("CONTROLLER: Pre-queued %d IOVs (%d hot, %d sequential, filtered %d small)\n",
@@ -1063,8 +1085,6 @@ void prefetch_on_fault(void *lpi, int iov_index)
 {
 	struct iov_meta *meta;
 	int i;
-	int current_queue_size;
-	int promote_distance;
 
 	PREFETCH_CONTROLLER_FAULT_LOG(iov_index);
 
@@ -1090,13 +1110,15 @@ void prefetch_on_fault(void *lpi, int iov_index)
 			list_del(&faulted_req->list);
 			hash_table_remove(&request_hash_table, iov_index);
 			xfree(faulted_req);
+			queue_size--;
 			controller_stats.queue_removes++;
 			controller_stats.obsolete_prevented++;
 		}
 	}
 
+#if ENABLE_PROXIMITY_REMOVAL
 	/* 2. Proximity removal: remove next PROXIMITY_WINDOW forward IOVs */
-	for (i = 1; i <= PROXIMITY_WINDOW_DEFAULT; i++) {
+	for (i = 1; i <= PROXIMITY_WINDOW; i++) {
 		int prox_idx = iov_index + i;
 		struct prefetch_request *prox_req;
 		if (prox_idx >= total_iovs)
@@ -1106,28 +1128,20 @@ void prefetch_on_fault(void *lpi, int iov_index)
 			list_del(&prox_req->list);
 			hash_table_remove(&request_hash_table, prox_idx);
 			xfree(prox_req);
+			queue_size--;
 			controller_stats.proximity_removed++;
 		}
 	}
+#endif
 
-	/* 3. Promote ahead IOVs: queue next promote_distance IOVs */
-	current_queue_size = 0;
-	{
-		struct prefetch_request *tmp;
-		list_for_each_entry(tmp, &queue_high, list) current_queue_size++;
-		list_for_each_entry(tmp, &queue_medium, list) current_queue_size++;
-		list_for_each_entry(tmp, &queue_low, list) current_queue_size++;
-	}
-	promote_distance = (current_queue_size < TARGET_QUEUE_SIZE / 2) ? 64 : 32;
-
-	for (i = PROXIMITY_WINDOW_DEFAULT + 1; i <= PROXIMITY_WINDOW_DEFAULT + promote_distance; i++) {
+	/* 3. Promote ahead IOVs: fixed window */
+	for (i = PROXIMITY_WINDOW + 1; i <= PROXIMITY_WINDOW + PROMOTE_DISTANCE; i++) {
 		int ahead_idx = iov_index + i;
 		struct prefetch_request *existing;
 		if (ahead_idx >= total_iovs)
 			break;
 		existing = hash_table_lookup(&request_hash_table, ahead_idx);
 		if (existing) {
-			/* Already queued - promote priority */
 			promote_iov_priority(ahead_idx, PRIORITY_AHEAD);
 			controller_stats.priority_promotions++;
 		}
