@@ -1684,8 +1684,12 @@ int cr_lazy_pages(bool daemon)
 		int num_workers = opts.prefetch_workers > 0 ? opts.prefetch_workers : 8;  /* 8 workers for optimal throughput */
 		unsigned long cache_limit = opts.cache_limit_mb;
 
-		/* Initialize page cache */
-		ret = cache_init(cache_limit);
+		/* Initialize page cache.
+		 * total_lazy_bytes is not yet known (lpis not populated),
+		 * so pass 0. cache_init will use available_memory/4 as cap.
+		 * After all uffd connections are established, we could
+		 * refine the limit, but the conservative default is safe. */
+		ret = cache_init(cache_limit, 0);
 		if (ret < 0) {
 			pr_err("Failed to initialize page cache\n");
 			return -1;

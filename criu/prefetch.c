@@ -484,12 +484,19 @@ static void *prefetch_worker(void *arg)
 
 		/* Fetch from object storage */
 		size = req->iov_end - req->iov_start;
+
+		/* Backpressure: wait if cache + inflight is near limit */
+		if (cache_wait_for_room(size) < 0)
+			break; /* shutdown */
+
 		data = xmalloc(size);
 
 		if (!data) {
 			pr_err("Worker %d: Failed to allocate buffer for IOV\n", worker_id);
 			goto next_request;
 		}
+
+		cache_add_inflight(size);
 
 		/* Fetch from object storage */
 		ret = -1;
@@ -522,7 +529,26 @@ static void *prefetch_worker(void *arg)
 			}
 		}
 
+		cache_remove_inflight(size);
+
 		if (ret == 0) {
+			/* Check if fault handler already processed this IOV */
+			pthread_mutex_lock(&iov_meta_lock);
+			meta = iov_index_map[req->iov_index];
+			if (meta && (meta->state == IOV_FAULTED || meta->state == IOV_RESTORED)) {
+				pthread_mutex_unlock(&iov_meta_lock);
+				xfree(data);
+				data = NULL;
+				pr_debug("Worker %d: IOV[%d] already faulted/restored, skip cache\n",
+					 worker_id, req->iov_index);
+
+				pthread_mutex_lock(&stats_lock);
+				stats.failed++;
+				pthread_mutex_unlock(&stats_lock);
+				goto next_request;
+			}
+			pthread_mutex_unlock(&iov_meta_lock);
+
 			/* Store in cache (cache makes a deep copy) */
 			ret = cache_store_iov(req->iov_start, req->iov_end, req->file_offset,
 					      data, size, true);
@@ -570,10 +596,11 @@ static void *prefetch_worker(void *arg)
 		xfree(data);
 
 next_request:
-		/* Clear prefetching flag */
+		/* Reset state only if still FETCHING (i.e., fetch failed).
+		 * On success, iov_meta_mark_cached() already set IOV_CACHED. */
 		pthread_mutex_lock(&iov_meta_lock);
 		meta = iov_meta_search(req->iov_start);
-		if (meta)
+		if (meta && meta->state == IOV_FETCHING)
 			meta->state = IOV_NOT_REQUESTED;
 		pthread_mutex_unlock(&iov_meta_lock);
 
@@ -643,6 +670,7 @@ void prefetch_cleanup(void)
 
 	/* Stop workers */
 	workers_running = false;
+	cache_set_shutdown(); /* Unblock workers waiting in cache_wait_for_room */
 
 	/* Wake up all workers */
 	pthread_mutex_lock(&queue_lock);
