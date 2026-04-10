@@ -36,6 +36,9 @@ int cache_init(unsigned long max_memory_mb, unsigned long total_lazy_bytes);
 /* Cleanup cache and free all resources */
 void cache_cleanup(void);
 
+/* Refine cache limit after total lazy bytes are known */
+void cache_update_limit(unsigned long total_lazy_bytes);
+
 /*
  * Wait until cache has room for incoming_size bytes.
  * Called by prefetch workers BEFORE allocating fetch buffer.

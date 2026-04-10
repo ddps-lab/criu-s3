@@ -534,7 +534,9 @@ static void *prefetch_worker(void *arg)
 		if (ret == 0) {
 			/* Check if fault handler already processed this IOV */
 			pthread_mutex_lock(&iov_meta_lock);
-			meta = iov_index_map[req->iov_index];
+			meta = NULL;
+			if (req->iov_index >= 0 && req->iov_index < total_iovs)
+				meta = iov_index_map[req->iov_index];
 			if (meta && (meta->state == IOV_FAULTED || meta->state == IOV_RESTORED)) {
 				pthread_mutex_unlock(&iov_meta_lock);
 				xfree(data);
