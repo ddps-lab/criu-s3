@@ -63,7 +63,9 @@ struct iov_meta {
 	enum iov_state state;
 	bool is_hot;         /* Hot VMA from checkpoint metadata */
 
-	int iov_index;       /* Index in IOV array */
+	int iov_index;       /* Index in IOV array (within owning context) */
+	void *lpi;           /* Owning lazy_pages_info context */
+	unsigned int pages_img_id; /* Pages image identity for S3 fetch */
 	struct rb_node node; /* Red-black tree node */
 };
 
@@ -108,9 +110,7 @@ static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 static struct prefetch_stats stats;
 static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Saved lpi pointer for strategies */
-static void *global_lpi = NULL;
-static unsigned int global_pages_img_id = 0;  /* For object storage fetch */
+/* global_lpi and global_pages_img_id removed — now stored per-IOV in iov_meta */
 
 /* ========== Controller Infrastructure ========== */
 
@@ -195,92 +195,89 @@ static int iov_meta_insert(struct iov_meta *new_meta)
 	return 0;
 }
 
-/* Initialize IOV metadata from IOV array */
+/*
+ * Initialize IOV metadata from IOV array.
+ * ACCUMULATES across multiple calls (one per restored process).
+ * Each IOV carries its owning lpi and pages_img_id for context safety.
+ */
 int prefetch_init_iovs(void *lpi, unsigned int pages_img_id, struct iov_info *iovs, int num_iovs)
 {
 	int i;
+	int base_index;
 
 	pthread_mutex_lock(&iov_meta_lock);
 
-	/* Store global lpi reference and pages_img_id */
-	global_lpi = lpi;
-	global_pages_img_id = pages_img_id;
+	/*
+	 * Accumulate: extend iov_index_map instead of resetting.
+	 * Each process's IOVs get indices [base_index .. base_index + num_iovs).
+	 */
+	base_index = total_iovs;
 
-	/* Reset tree if already initialized */
-	if (!RB_EMPTY_ROOT(&iov_meta_tree)) {
-		struct rb_node *node;
-		while ((node = rb_first(&iov_meta_tree))) {
-			struct iov_meta *meta = rb_entry(node, struct iov_meta, node);
-			rb_erase(node, &iov_meta_tree);
-			xfree(meta);
-		}
-	}
+	if (num_iovs > 0) {
+		struct iov_meta **new_map;
+		int new_total = total_iovs + num_iovs;
 
-	/* Reset index map */
-	if (iov_index_map) {
-		xfree(iov_index_map);
-		iov_index_map = NULL;
-	}
-
-	/* Allocate index map */
-	total_iovs = num_iovs;
-	if (total_iovs > 0) {
-		iov_index_map = xzalloc(sizeof(struct iov_meta *) * total_iovs);
-		if (!iov_index_map) {
+		new_map = xzalloc(sizeof(struct iov_meta *) * new_total);
+		if (!new_map) {
 			pthread_mutex_unlock(&iov_meta_lock);
 			pr_err("Failed to allocate IOV index map\n");
 			return -ENOMEM;
 		}
+
+		/* Copy existing entries */
+		if (iov_index_map && total_iovs > 0)
+			memcpy(new_map, iov_index_map, sizeof(struct iov_meta *) * total_iovs);
+
+		xfree(iov_index_map);
+		iov_index_map = new_map;
+		total_iovs = new_total;
 	}
 
 	/* Create metadata for each IOV */
 	for (i = 0; i < num_iovs; i++) {
-		struct iov_meta *meta = xzalloc(sizeof(struct iov_meta));
-		unsigned long size;
+		struct iov_meta *meta;
+		int global_idx;
+
+		meta = xzalloc(sizeof(struct iov_meta));
 		if (!meta) {
 			pr_err("Failed to allocate IOV metadata for index %d\n", i);
 			pthread_mutex_unlock(&iov_meta_lock);
 			return -ENOMEM;
 		}
 
+		global_idx = base_index + i;
 		meta->iov_start = iovs[i].iov_start;
 		meta->iov_end = iovs[i].iov_end;
-		/* file_offset is already calculated in uffd.c */
 		meta->file_offset = iovs[i].file_offset;
 		meta->state = IOV_NOT_REQUESTED;
 		meta->is_hot = false;
-		meta->iov_index = i;
+		meta->iov_index = global_idx;
+		meta->lpi = lpi;
+		meta->pages_img_id = pages_img_id;
 
-		/* Log IOV info for debugging (especially large IOVs) */
-		size = meta->iov_end - meta->iov_start;
-		if (size >= 4 * 1024 * 1024 || (i >= 190 && i <= 195)) {
-			pr_info("IOV[%d]: [0x%lx-0x%lx] size=%lu KB\n",
-				i, meta->iov_start, meta->iov_end, size / 1024);
-		}
-
-		/* Insert into RB-tree */
+		/* Insert into RB-tree (keyed by iov_start) */
 		if (iov_meta_insert(meta) < 0) {
 			xfree(meta);
 			pthread_mutex_unlock(&iov_meta_lock);
-			pr_err("Failed to insert IOV metadata for index %d\n", i);
+			pr_err("Failed to insert IOV metadata for index %d\n", global_idx);
 			return -EEXIST;
 		}
 
 		/* Add to index map */
-		iov_index_map[i] = meta;
+		iov_index_map[global_idx] = meta;
 	}
 
 	pthread_mutex_unlock(&iov_meta_lock);
 
-	pr_debug("IOV metadata initialized: %d IOVs\n", num_iovs);
+	pr_info("IOV metadata accumulated: +%d IOVs (total: %d, base_index: %d)\n",
+		num_iovs, total_iovs, base_index);
 
-	/* Initialize hash table */
-	hash_table_init(&request_hash_table);
-
-	/* Initialize controller stats */
-	memset(&controller_stats, 0, sizeof(controller_stats));
-
-	pr_info("CONTROLLER: Hash table initialized\n");
+	/* Initialize hash table and controller stats only on first call */
+	if (base_index == 0) {
+		hash_table_init(&request_hash_table);
+		memset(&controller_stats, 0, sizeof(controller_stats));
+		pr_info("CONTROLLER: Hash table initialized\n");
+	}
 
 	return 0;
 }
@@ -865,7 +862,7 @@ int prefetch_prequeue_all_iovs(void *lpi, unsigned int pages_img_id)
 {
 	int i, queued = 0, hot_queued = 0;
 
-	if (!global_lpi || !iov_index_map) {
+	if (!iov_index_map || total_iovs == 0) {
 		pr_err("CONTROLLER: Cannot pre-queue - IOV metadata not initialized\n");
 		return -EINVAL;
 	}
@@ -885,6 +882,10 @@ int prefetch_prequeue_all_iovs(void *lpi, unsigned int pages_img_id)
 		int initial_priority;
 
 		if (!meta)
+			continue;
+
+		/* Only queue IOVs belonging to this lpi context */
+		if (meta->lpi != lpi)
 			continue;
 
 		/* Filter small IOVs (< 256KB) */
@@ -987,7 +988,7 @@ int prefetch_queue_iov(void *lpi, unsigned long iov_start, unsigned long iov_end
 	req->iov_start = iov_start;
 	req->iov_end = iov_end;
 	req->file_offset = file_offset;
-	req->pages_img_id = global_pages_img_id;
+	req->pages_img_id = meta ? meta->pages_img_id : 0;
 	req->iov_index = meta ? meta->iov_index : -1;
 	req->priority = priority;
 	INIT_LIST_HEAD(&req->list);
@@ -1072,7 +1073,9 @@ void prefetch_on_fault(void *lpi, int iov_index)
 
 	/* Mark IOV as faulted (sync path will handle it) */
 	pthread_mutex_lock(&iov_meta_lock);
-	meta = iov_index_map[iov_index];
+	meta = NULL;
+	if (iov_index >= 0 && iov_index < total_iovs)
+		meta = iov_index_map[iov_index];
 	if (meta && meta->state < IOV_CACHED)
 		meta->state = IOV_FAULTED;
 	pthread_mutex_unlock(&iov_meta_lock);
