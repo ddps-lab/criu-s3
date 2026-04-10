@@ -667,8 +667,16 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 			/*
 			 * File not found locally. If object storage is enabled,
 			 * try fetching from S3 and create a memfd for it.
+			 *
+			 * Skip pages-*.img: when enable_object_storage is set,
+			 * pages are read on-demand via
+			 * maybe_read_page_object_storage() using range
+			 * requests. Downloading the entire pages file into a
+			 * memfd wastes bandwidth and occupies fd numbers that
+			 * conflict with the restored process.
 			 */
-			if (opts.enable_object_storage) {
+			if (opts.enable_object_storage &&
+			    type != CR_FD_PAGES) {
 				void *s3_data = NULL;
 				unsigned long s3_len = 0;
 				int s3_ret;
@@ -680,6 +688,18 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 					if (mfd >= 0) {
 						unsigned long wr = 0;
 						ssize_t nw;
+						int high_mfd;
+
+						/*
+						 * Move memfd to high fd range to
+						 * avoid conflicts with restored
+						 * process fds during restore.
+						 */
+						high_mfd = fcntl(mfd, F_DUPFD_CLOEXEC, 1024);
+						if (high_mfd >= 0) {
+							close(mfd);
+							mfd = high_mfd;
+						}
 
 						while (wr < s3_len) {
 							nw = write(mfd, (char *)s3_data + wr, s3_len - wr);

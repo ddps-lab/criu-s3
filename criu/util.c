@@ -245,6 +245,17 @@ int reopen_fd_as_safe(char *file, int line, int new_fd, int old_fd, bool allow_r
 		} else if (tmp != new_fd) {
 			close(tmp);
 			pr_err("fd %d already in use (called at %s:%d)\n", new_fd, file, line);
+			{
+				/* Debug: show what occupies the target fd */
+				char link[128], target[256];
+				int n;
+				snprintf(link, sizeof(link), "/proc/self/fd/%d", new_fd);
+				n = readlink(link, target, sizeof(target) - 1);
+				if (n > 0) {
+					target[n] = '\0';
+					pr_err("  fd %d -> %s\n", new_fd, target);
+				}
+			}
 			return -1;
 		}
 

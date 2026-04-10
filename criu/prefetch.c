@@ -126,6 +126,9 @@ struct controller_stats {
 	unsigned long priority_promotions;
 	unsigned long obsolete_prevented;  /* Removed before worker fetched */
 	unsigned long proximity_removed;   /* Removed due to proximity to fault */
+	unsigned long hot_vma_faults;      /* Faults on hot VMA pages */
+	unsigned long cold_vma_faults;     /* Faults on non-hot VMA pages */
+	unsigned long hot_vma_prefetched;  /* Hot VMA IOVs prefetched before fault */
 };
 static struct controller_stats controller_stats;
 static pthread_mutex_t controller_stats_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -531,6 +534,10 @@ static void *prefetch_worker(void *arg)
 				stats.cache_stored++;
 				stats.bytes_prefetched += size;
 				stats.completed++;
+				if (req->iov_index >= 0 && req->iov_index < total_iovs &&
+				    iov_index_map[req->iov_index] &&
+				    iov_index_map[req->iov_index]->is_hot)
+					controller_stats.hot_vma_prefetched++;
 				pthread_mutex_unlock(&stats_lock);
 
 				/* Calculate worker duration and log completion */
@@ -695,12 +702,15 @@ void prefetch_cleanup(void)
 	pthread_mutex_unlock(&stats_lock);
 
 	pthread_mutex_lock(&controller_stats_lock);
-	pr_info("prefetch: CONTROLLER faults=%lu removes=%lu promotes=%lu obsolete=%lu proximity=%lu\n",
+	pr_info("CONTROLLER faults=%lu removes=%lu promotes=%lu obsolete=%lu proximity=%lu hot_faults=%lu cold_faults=%lu hot_prefetched=%lu\n",
 		controller_stats.faults_processed,
 		controller_stats.queue_removes,
 		controller_stats.priority_promotions,
 		controller_stats.obsolete_prevented,
-		controller_stats.proximity_removed);
+		controller_stats.proximity_removed,
+		controller_stats.hot_vma_faults,
+		controller_stats.cold_vma_faults,
+		controller_stats.hot_vma_prefetched);
 	pthread_mutex_unlock(&controller_stats_lock);
 
 	pr_info("Prefetch system cleaned up\n");
@@ -1091,6 +1101,10 @@ void prefetch_on_fault(void *lpi, int iov_index)
 	/* Update stats */
 	pthread_mutex_lock(&stats_lock);
 	controller_stats.faults_processed++;
+	if (meta && meta->is_hot)
+		controller_stats.hot_vma_faults++;
+	else
+		controller_stats.cold_vma_faults++;
 	pthread_mutex_unlock(&stats_lock);
 }
 
