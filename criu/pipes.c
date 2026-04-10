@@ -305,19 +305,8 @@ int open_pipe(struct file_desc *d, int *new_fd)
 		return -1;
 	}
 
-	/*
-	 * Move pipe fds out of user fd range to prevent collisions
-	 * with the restored process's original fd numbers.
-	 * After close_old_fds(), low fds are free and pipe() grabs
-	 * them, but they may belong to the restored process.
-	 */
-	{
-		int hi;
-		hi = fcntl(pfd[0], F_DUPFD_CLOEXEC, 512);
-		if (hi >= 0) { close(pfd[0]); pfd[0] = hi; }
-		hi = fcntl(pfd[1], F_DUPFD_CLOEXEC, 512);
-		if (hi >= 0) { close(pfd[1]); pfd[1] = hi; }
-	}
+	pfd[0] = relocate_internal_fd(pfd[0]);
+	pfd[1] = relocate_internal_fd(pfd[1]);
 
 	ret = restore_pipe_data(CR_FD_PIPES_DATA, pfd[1], pi->pe->pipe_id, pd_hash_pipes);
 	if (ret)

@@ -20,6 +20,7 @@
 #include "log.h"
 #include "cr_options.h"
 #include "object-storage.h"
+#include "servicefd.h"
 
 /*
  * =================================================================================
@@ -548,19 +549,14 @@ static size_t write_router_callback(void *contents, size_t size, size_t nmemb, v
 /* Set fixed curl options that don't change between requests */
 /*
  * Custom socket open callback for libcurl.
- * Moves the socket fd to a high number (>= 1024) so it does not
- * collide with the restored process's file descriptors during
- * CRIU restore.  Without this, curl may grab fd 0, 1, 2, etc.
- * and reopen_fd_as() fails with "fd N already in use".
+ * Moves the socket fd out of the user fd range using the
+ * centralized relocate_internal_fd() policy.
  */
-#define CURL_FD_MIN 1024
-
 static curl_socket_t curl_opensocket_cb(void *clientp,
 					curlsocktype purpose,
 					struct curl_sockaddr *address)
 {
 	curl_socket_t s;
-	int high_fd;
 
 	(void)clientp;
 	(void)purpose;
@@ -569,16 +565,7 @@ static curl_socket_t curl_opensocket_cb(void *clientp,
 	if (s == CURL_SOCKET_BAD)
 		return CURL_SOCKET_BAD;
 
-	if (s < CURL_FD_MIN) {
-		high_fd = fcntl(s, F_DUPFD_CLOEXEC, CURL_FD_MIN);
-		if (high_fd >= 0) {
-			close(s);
-			s = high_fd;
-		}
-		/* If F_DUPFD_CLOEXEC fails, keep the low fd as fallback */
-	}
-
-	return s;
+	return relocate_internal_fd(s);
 }
 
 static void set_fixed_curl_options(CURL *handle)

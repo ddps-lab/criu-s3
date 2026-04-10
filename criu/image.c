@@ -688,18 +688,8 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 					if (mfd >= 0) {
 						unsigned long wr = 0;
 						ssize_t nw;
-						int high_mfd;
 
-						/*
-						 * Move memfd to high fd range to
-						 * avoid conflicts with restored
-						 * process fds during restore.
-						 */
-						high_mfd = fcntl(mfd, F_DUPFD_CLOEXEC, 1024);
-						if (high_mfd >= 0) {
-							close(mfd);
-							mfd = high_mfd;
-						}
+						mfd = relocate_internal_fd(mfd);
 
 						while (wr < s3_len) {
 							nw = write(mfd, (char *)s3_data + wr, s3_len - wr);
