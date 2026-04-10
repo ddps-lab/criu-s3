@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -114,12 +115,62 @@ static struct cache_entry *cache_find_oldest(void)
 }
 
 /* Internal: evict entries to make room for incoming_size */
+/*
+ * Get available system memory in bytes from /proc/meminfo.
+ * Returns 0 on failure.
+ */
+static size_t get_available_memory(void)
+{
+	FILE *f;
+	char line[256];
+	size_t avail = 0;
+
+	f = fopen("/proc/meminfo", "r");
+	if (!f)
+		return 0;
+
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "MemAvailable: %zu kB", &avail) == 1) {
+			avail *= 1024; /* kB to bytes */
+			break;
+		}
+	}
+	fclose(f);
+	return avail;
+}
+
+/* Minimum available memory to maintain (1GB) */
+#define CACHE_MEM_RESERVE (1024UL * 1024 * 1024)
+
 static void cache_evict_to_limit(size_t incoming_size)
 {
-	if (cache_state.max_bytes == 0)
-		return; /* Unlimited */
+	size_t limit;
 
-	while (cache_state.total_bytes + incoming_size > cache_state.max_bytes) {
+	if (cache_state.max_bytes > 0) {
+		limit = cache_state.max_bytes;
+	} else {
+		/*
+		 * Dynamic limit: use available memory minus reserve.
+		 * This prevents OOM when prefetch fills cache faster
+		 * than faults consume it (e.g., 11GB memcached on 16GB VM).
+		 */
+		size_t avail = get_available_memory();
+		if (avail == 0)
+			return;
+		if (avail <= CACHE_MEM_RESERVE) {
+			/* Memory critical: evict aggressively */
+			limit = cache_state.total_bytes > incoming_size ?
+				cache_state.total_bytes - incoming_size : 0;
+		} else {
+			/* Allow cache up to (available - reserve) */
+			size_t allowed = avail - CACHE_MEM_RESERVE;
+			if (cache_state.total_bytes + incoming_size <= allowed)
+				return;
+			limit = allowed;
+		}
+	}
+
+	while (cache_state.total_bytes + incoming_size > limit) {
 		struct cache_entry *oldest = cache_find_oldest();
 		if (!oldest)
 			break;
@@ -202,7 +253,11 @@ enum cache_result cache_lookup_iov_for_fault(unsigned long iov_start, unsigned l
 	entry = cache_lookup_internal(iov_start);
 
 	if (entry && entry->iov_start == iov_start && entry->iov_end == iov_end) {
-		/* Exact match - allocate and copy data to avoid use-after-free */
+		/*
+		 * Exact match - copy data and remove entry from cache.
+		 * Deep copy is needed because prefetch workers may still
+		 * reference the cache tree concurrently.
+		 */
 		void *data_copy = xmalloc(entry->data_size);
 		if (!data_copy) {
 			pr_err("Failed to allocate memory for cache data copy\n");
@@ -215,9 +270,18 @@ enum cache_result cache_lookup_iov_for_fault(unsigned long iov_start, unsigned l
 		cache_state.stats.hits++;
 		result = CACHE_HIT;
 
-		/* Log cache hit for simulation (using -1 as iov_idx since we only have iov_start) */
-		PREFETCH_CACHE_HIT_LOG(-1);
-		pr_debug("Cache HIT: IOV [0x%lx-0x%lx] (%zu bytes)\n", iov_start, iov_end, entry->data_size);
+		/* Remove entry from cache to free memory immediately */
+		{
+			size_t freed_size = entry->data_size;
+			rb_erase(&entry->node, &cache_state.tree);
+			cache_state.total_bytes -= freed_size;
+			xfree(entry->data);
+			xfree(entry);
+
+			PREFETCH_CACHE_HIT_LOG(-1);
+			pr_debug("Cache HIT: IOV [0x%lx-0x%lx] (%zu bytes, removed)\n",
+				 iov_start, iov_end, freed_size);
+		}
 	} else {
 		cache_state.stats.misses++;
 		result = CACHE_MISS;
@@ -308,7 +372,7 @@ int cache_store_iov(unsigned long iov_start, unsigned long iov_end, unsigned lon
 	entry->is_prefetched = is_prefetched;
 	clock_gettime(CLOCK_MONOTONIC, &entry->enqueue_time);
 
-	/* Allocate and copy data */
+	/* Deep copy data into cache entry */
 	entry->data = xmalloc(size);
 	if (!entry->data) {
 		xfree(entry);

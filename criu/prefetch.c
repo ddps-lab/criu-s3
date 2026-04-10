@@ -523,9 +523,11 @@ static void *prefetch_worker(void *arg)
 		}
 
 		if (ret == 0) {
-			/* Store in cache */
+			/* Store in cache (cache makes a deep copy) */
 			ret = cache_store_iov(req->iov_start, req->iov_end, req->file_offset,
 					      data, size, true);
+			xfree(data); /* Always free our buffer after cache_store */
+			data = NULL;
 			if (ret == 0) {
 				/* Update metadata */
 				iov_meta_mark_cached(req->iov_start);
@@ -549,6 +551,7 @@ static void *prefetch_worker(void *arg)
 				pr_debug("PREFETCH: Worker %d: Successfully cached IOV\n", worker_id);
 			} else {
 				pr_err("PREFETCH: Worker %d: Failed to cache IOV\n", worker_id);
+				xfree(data); /* cache_store failed, we still own the data */
 
 				pthread_mutex_lock(&stats_lock);
 				stats.failed++;
@@ -556,6 +559,8 @@ static void *prefetch_worker(void *arg)
 			}
 		} else {
 			pr_err("PREFETCH: Worker %d: Failed to fetch IOV from storage\n", worker_id);
+			xfree(data);
+			data = NULL;
 
 			pthread_mutex_lock(&stats_lock);
 			stats.failed++;
