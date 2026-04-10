@@ -1091,7 +1091,6 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			return 2;
 		case 1101:
 			opts.enable_object_storage = true;
-			opts.semi_sync_iov = true;
 			break;
 		case 1102:
 			SET_CHAR_OPTS(object_storage_endpoint_url, optarg);
@@ -1116,7 +1115,6 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			break;
 		case 1109:
 			opts.async_prefetch = true;
-			opts.hot_vma_seed = true;
 			break;
 		case 1110:
 			opts.prefetch_workers = atoi(optarg);
@@ -1178,13 +1176,12 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		case 1116:
 			opts.object_storage_upload = true;
 			opts.enable_object_storage = true;
-			opts.semi_sync_iov = true;
 			break;
 		case 1117:
-			opts.semi_sync_iov = false;
+			opts.no_semi_sync_iov = true;
 			break;
 		case 1118:
-			opts.hot_vma_seed = false;
+			opts.no_hot_vma_seed = true;
 			break;
 		default:
 			return 2;
@@ -1196,11 +1193,24 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		pr_info("Network lock method from dump will be used in restore\n");
 	}
 
+	/*
+	 * Post-processing: derive defaults for ablation options.
+	 * semi_sync_iov defaults to true when object storage is enabled.
+	 * hot_vma_seed defaults to true when async prefetch is enabled.
+	 * Explicit --no-* flags override these defaults regardless of
+	 * CLI argument order.
+	 */
+	if (opts.enable_object_storage && !opts.no_semi_sync_iov)
+		opts.semi_sync_iov = true;
+	if (opts.async_prefetch && !opts.no_hot_vma_seed)
+		opts.hot_vma_seed = true;
+
 	if (opts.enable_object_storage) {
 		pr_info("Object Storage Enabled\n");
 		pr_info("  Endpoint URL: %s\n", opts.object_storage_endpoint_url ? opts.object_storage_endpoint_url : "(not set)");
 		pr_info("  Bucket: %s\n", opts.object_storage_bucket ? opts.object_storage_bucket : "(not set)");
 		pr_info("  Object Prefix: %s\n", opts.object_storage_object_prefix ? opts.object_storage_object_prefix : "(not set)");
+		pr_info("  Semi-sync IOV: %s\n", opts.semi_sync_iov ? "enabled" : "disabled");
 	}
 
 	if (opts.express_one_zone) {
@@ -1214,6 +1224,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		pr_info("Async Prefetch Enabled\n");
 		pr_info("  Prefetch Workers: %d\n", opts.prefetch_workers);
 		pr_info("  Cache Limit: %lu MB %s\n", opts.cache_limit_mb, opts.cache_limit_mb == 0 ? "(unlimited)" : "");
+		pr_info("  Hot VMA Seed: %s\n", opts.hot_vma_seed ? "enabled" : "disabled");
 	}
 
 	return 0;

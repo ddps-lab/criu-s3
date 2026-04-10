@@ -268,8 +268,10 @@ struct cr_options {
 
 	/* Lazy restore options */
 	bool semi_sync_iov;		/* semi-synchronous IOV fetch (default: true when object storage) */
+	bool no_semi_sync_iov;		/* explicit --no-semi-sync-iov was given */
 	bool async_prefetch;
 	bool hot_vma_seed;		/* hot VMA priority seeding (default: true when async_prefetch) */
+	bool no_hot_vma_seed;		/* explicit --no-hot-vma-seed was given */
 	int prefetch_workers;
 	unsigned long cache_limit_mb;
 
