@@ -997,7 +997,12 @@ static int plant_fd(struct fdinfo_list_entry *fle, int fd)
 {
 	BUG_ON(fle->received);
 	fle->received = 1;
-	return reopen_fd_as(fle->fe->fd, fd);
+	/*
+	 * Use dup2 (nocheck) to allow overwriting fds that may be
+	 * temporarily occupied by internal pipe/socket/memfd fds
+	 * created during S3 metadata fetch or inter-task communication.
+	 */
+	return reopen_fd_as_nocheck(fle->fe->fd, fd);
 }
 
 static int recv_fd_from_peer(struct fdinfo_list_entry *fle)
@@ -1116,7 +1121,13 @@ int setup_and_serve_out(struct fdinfo_list_entry *fle, int new_fd)
 	struct file_desc *d = fle->desc;
 	pid_t pid = fle->pid;
 
-	if (reopen_fd_as(fle->fe->fd, new_fd))
+	/*
+	 * Use dup2 (nocheck) to allow overwriting fds occupied by
+	 * internal resources (pipes, curl sockets, memfds from S3
+	 * metadata fetch).  After close_old_fds(), these internal fds
+	 * can land on any number in the user fd range.
+	 */
+	if (reopen_fd_as_nocheck(fle->fe->fd, new_fd))
 		return -1;
 
 	if (fcntl(fle->fe->fd, F_SETFD, fle->fe->flags) == -1) {
@@ -1293,6 +1304,31 @@ int close_old_fds(void)
 	close_pid_proc();
 
 	return 0;
+}
+
+/*
+ * Reserve fd 0, 1, 2 with /dev/null so that pipe()/socket()
+ * calls during restore do not accidentally grab these fds.
+ * Call close_fd_guards() before fd restoration to release them.
+ */
+void install_fd_guards(void)
+{
+	int devnull = open("/dev/null", O_RDWR);
+	if (devnull >= 0) {
+		if (devnull != 0)
+			dup2(devnull, 0);
+		dup2(devnull, 1);
+		dup2(devnull, 2);
+		if (devnull > 2)
+			close(devnull);
+	}
+}
+
+void close_fd_guards(void)
+{
+	close(0);
+	close(1);
+	close(2);
 }
 
 int prepare_fds(struct pstree_item *me)

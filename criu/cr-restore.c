@@ -641,6 +641,8 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	memzero(ta, args_len);
 
+	close_fd_guards();
+
 	if (prepare_fds(current))
 		return -1;
 
@@ -842,6 +844,7 @@ static int setup_newborn_fds(struct pstree_item *me)
 		 */
 		if (close_old_fds())
 			return -1;
+		install_fd_guards();
 	}
 
 	return 0;
@@ -1663,6 +1666,15 @@ static int __restore_task_with_children(void *_arg)
 		goto err;
 
 	timing_stop(TIME_FORK);
+
+	/*
+	 * Clean up curl resources again after create_children_and_session().
+	 * During fork, parent may fetch child core-*.img from S3, creating
+	 * new curl handles whose sockets can occupy low fds (e.g. fd 0).
+	 * These must be freed before restore_one_task() restores user fds.
+	 */
+	if (opts.enable_object_storage)
+		object_storage_cleanup_and_prepare_for_lazy_pages();
 
 	if (populate_pid_proc())
 		goto err;

@@ -21,13 +21,38 @@ struct cache_stats {
 	unsigned long evictions;
 	unsigned long total_bytes;
 	unsigned long peak_bytes;
+	unsigned long backpressure_waits;
+	unsigned long meminfo_checks;
+	unsigned long prefetch_dropped_race;
 };
 
-/* Initialize cache with memory limit (0 = unlimited) */
-int cache_init(unsigned long max_memory_mb);
+/*
+ * Initialize cache.
+ * max_memory_mb: explicit limit in MB (0 = auto-compute from total_lazy_bytes)
+ * total_lazy_bytes: total size of all lazy pages (used for auto-cap formula)
+ */
+int cache_init(unsigned long max_memory_mb, unsigned long total_lazy_bytes);
 
 /* Cleanup cache and free all resources */
 void cache_cleanup(void);
+
+/* Refine cache limit after total lazy bytes are known */
+void cache_update_limit(unsigned long total_lazy_bytes);
+
+/*
+ * Wait until cache has room for incoming_size bytes.
+ * Called by prefetch workers BEFORE allocating fetch buffer.
+ * Must NOT hold iov_meta_lock or queue_lock when calling.
+ * Returns 0 to proceed, -1 if shutdown.
+ */
+int cache_wait_for_room(size_t incoming_size);
+
+/* Signal that prefetch system is shutting down (unblocks waiting workers) */
+void cache_set_shutdown(void);
+
+/* Track in-flight fetch bytes (worker buffer not yet in cache) */
+void cache_add_inflight(size_t bytes);
+void cache_remove_inflight(size_t bytes);
 
 /* Lookup IOV in cache - returns CACHE_HIT if exact match found
  * On CACHE_HIT: allocates memory and copies data to *data_out. Caller must free.

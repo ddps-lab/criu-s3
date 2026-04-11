@@ -1559,7 +1559,16 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 	if (!pages)
 		return -1;
 
-	ta->vma_ios_fd = img_raw_fd(pages);
+	/*
+	 * When object storage is enabled and pages-*.img is not local,
+	 * open_image returns an empty image.  Pages are read on-demand
+	 * via maybe_read_page_object_storage() using S3 range requests,
+	 * so vma_ios_fd is not needed.
+	 */
+	if (empty_image(pages))
+		ta->vma_ios_fd = -1;
+	else
+		ta->vma_ios_fd = img_raw_fd(pages);
 	return pagemap_render_iovec(&rsti(t)->vma_io, ta);
 }
 

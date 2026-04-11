@@ -168,6 +168,8 @@ extern struct collect_image_info files_cinfo;
 #define files_collected() (files_cinfo.flags & COLLECT_HAPPENED)
 
 extern int close_old_fds(void);
+extern void install_fd_guards(void);
+extern void close_fd_guards(void);
 #ifndef AT_EMPTY_PATH
 #define AT_EMPTY_PATH 0x1000
 #endif

@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -33,21 +34,34 @@ struct cache_entry {
 static struct {
 	struct rb_root tree;
 	pthread_mutex_t lock;
+	pthread_cond_t drain_cond;      /* signaled when bytes drop below low watermark */
 
 	/* Memory tracking */
 	unsigned long total_bytes;
+	unsigned long inflight_bytes;   /* worker fetch buffers not yet in cache */
 	unsigned long max_bytes;
+	unsigned long high_watermark;   /* 85% of max_bytes — workers pause */
+	unsigned long low_watermark;    /* 60% of max_bytes — workers resume */
+
+	/* /proc/meminfo cache */
+	size_t cached_avail_memory;
+	unsigned long last_meminfo_store_count;
 
 	/* Statistics */
 	struct cache_stats stats;
 
 	bool initialized;
+	bool shutdown;
+	bool user_set_limit;    /* true if --cache-limit was explicitly set */
 } cache_state = {
 	.tree = RB_ROOT,
 	.lock = PTHREAD_MUTEX_INITIALIZER,
+	.drain_cond = PTHREAD_COND_INITIALIZER,
 	.total_bytes = 0,
+	.inflight_bytes = 0,
 	.max_bytes = 0,
 	.initialized = false,
+	.shutdown = false,
 };
 
 /* Internal: lookup cache entry by iov_start */
@@ -114,12 +128,68 @@ static struct cache_entry *cache_find_oldest(void)
 }
 
 /* Internal: evict entries to make room for incoming_size */
+/*
+ * Get available system memory in bytes from /proc/meminfo.
+ * Returns 0 on failure.
+ */
+static size_t get_available_memory(void)
+{
+	FILE *f;
+	char line[256];
+	size_t avail = 0;
+
+	f = fopen("/proc/meminfo", "r");
+	if (!f)
+		return 0;
+
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "MemAvailable: %zu kB", &avail) == 1) {
+			avail *= 1024; /* kB to bytes */
+			break;
+		}
+	}
+	fclose(f);
+	return avail;
+}
+
+/* Minimum available memory to maintain (1GB) */
+#define CACHE_MEM_RESERVE (1024UL * 1024 * 1024)
+
+#define MEMINFO_CHECK_INTERVAL_STORES 16
+
 static void cache_evict_to_limit(size_t incoming_size)
 {
-	if (cache_state.max_bytes == 0)
-		return; /* Unlimited */
+	size_t limit;
 
-	while (cache_state.total_bytes + incoming_size > cache_state.max_bytes) {
+	/* Primary: hard cap (always set, either explicit or auto-computed) */
+	limit = cache_state.max_bytes;
+
+	/*
+	 * Secondary safety net: check /proc/meminfo periodically.
+	 * Only if we're within 90% of hard cap AND enough stores have passed.
+	 */
+	if (cache_state.total_bytes + incoming_size > limit * 90 / 100) {
+		unsigned long stores_since;
+
+		stores_since = cache_state.stats.stores - cache_state.last_meminfo_store_count;
+		if (stores_since >= MEMINFO_CHECK_INTERVAL_STORES) {
+			size_t avail = get_available_memory();
+
+			cache_state.stats.meminfo_checks++;
+			cache_state.cached_avail_memory = avail;
+			cache_state.last_meminfo_store_count = cache_state.stats.stores;
+
+			if (avail > 0 && avail <= CACHE_MEM_RESERVE) {
+				/* Memory critical: tighten limit */
+				size_t tighter = cache_state.total_bytes > incoming_size ?
+					cache_state.total_bytes - incoming_size : 0;
+				if (tighter < limit)
+					limit = tighter;
+			}
+		}
+	}
+
+	while (cache_state.total_bytes + incoming_size > limit) {
 		struct cache_entry *oldest = cache_find_oldest();
 		if (!oldest)
 			break;
@@ -134,27 +204,104 @@ static void cache_evict_to_limit(size_t incoming_size)
 		xfree(oldest->data);
 		xfree(oldest);
 	}
+
+	/* Signal workers if eviction brought us below low watermark */
+	if (cache_state.total_bytes < cache_state.low_watermark)
+		pthread_cond_broadcast(&cache_state.drain_cond);
 }
 
-int cache_init(unsigned long max_memory_mb)
+int cache_init(unsigned long max_memory_mb, unsigned long total_lazy_bytes)
 {
 	if (cache_state.initialized)
 		return 0;
 
 	cache_state.tree = RB_ROOT;
 	cache_state.total_bytes = 0;
-	cache_state.max_bytes = max_memory_mb * 1024 * 1024; /* Convert MB to bytes */
-
+	cache_state.inflight_bytes = 0;
+	cache_state.shutdown = false;
 	memset(&cache_state.stats, 0, sizeof(cache_state.stats));
-	cache_state.initialized = true;
 
-	if (max_memory_mb == 0) {
-		pr_info("IOV-based page cache initialized (unlimited memory)\n");
+	cache_state.user_set_limit = (max_memory_mb > 0);
+
+	if (max_memory_mb > 0) {
+		cache_state.max_bytes = max_memory_mb * 1024 * 1024;
 	} else {
-		pr_info("IOV-based page cache initialized (max memory: %lu MB)\n", max_memory_mb);
+		/*
+		 * Auto-compute cache limit:
+		 *   min(total_lazy_bytes / 3, max(256MB, available / 4))
+		 *
+		 * - total_lazy/3: cache more than 1/3 of restore data is wasteful
+		 * - available/4: conservative — init snapshot may be optimistic
+		 *   as process RSS grows during restore
+		 * - Runtime watermark + meminfo secondary check provide additional control
+		 */
+		size_t avail = get_available_memory();
+		size_t from_lazy = total_lazy_bytes / 3;
+		size_t from_avail = avail / 4;
+		size_t floor = 256UL * 1024 * 1024;
+
+		if (from_avail < floor)
+			from_avail = floor;
+		cache_state.max_bytes = (from_lazy < from_avail) ? from_lazy : from_avail;
+		if (cache_state.max_bytes < floor)
+			cache_state.max_bytes = floor;
 	}
 
+	cache_state.high_watermark = cache_state.max_bytes * 85 / 100;
+	cache_state.low_watermark = cache_state.max_bytes * 60 / 100;
+
+	cache_state.initialized = true;
+
+	pr_info("IOV-based page cache initialized (max: %lu MB, high: %lu MB, low: %lu MB, lazy total: %lu MB)\n",
+		cache_state.max_bytes / (1024 * 1024),
+		cache_state.high_watermark / (1024 * 1024),
+		cache_state.low_watermark / (1024 * 1024),
+		total_lazy_bytes / (1024 * 1024));
+
 	return 0;
+}
+
+void cache_update_limit(unsigned long total_lazy_bytes)
+{
+	size_t new_max;
+	size_t from_lazy;
+	size_t avail;
+	size_t floor;
+
+	if (!cache_state.initialized || cache_state.user_set_limit)
+		return;
+
+	if (total_lazy_bytes == 0)
+		return;
+
+	floor = 256UL * 1024 * 1024;
+	avail = get_available_memory();
+	from_lazy = total_lazy_bytes / 3;
+
+	if (avail / 4 > floor)
+		new_max = avail / 4;
+	else
+		new_max = floor;
+
+	if (from_lazy > 0 && from_lazy < new_max)
+		new_max = from_lazy;
+
+	if (new_max < floor)
+		new_max = floor;
+
+	pthread_mutex_lock(&cache_state.lock);
+	cache_state.max_bytes = new_max;
+	cache_state.high_watermark = new_max * 85 / 100;
+	cache_state.low_watermark = new_max * 60 / 100;
+	/* Signal workers that may be blocked with old (smaller) watermarks */
+	pthread_cond_broadcast(&cache_state.drain_cond);
+	pthread_mutex_unlock(&cache_state.lock);
+
+	pr_info("Cache limit updated: max=%lu MB, high=%lu MB, low=%lu MB (lazy total=%lu MB)\n",
+		new_max / (1024 * 1024),
+		cache_state.high_watermark / (1024 * 1024),
+		cache_state.low_watermark / (1024 * 1024),
+		total_lazy_bytes / (1024 * 1024));
 }
 
 void cache_cleanup(void)
@@ -180,10 +327,73 @@ void cache_cleanup(void)
 
 	pthread_mutex_unlock(&cache_state.lock);
 
-	pr_info("Page cache cleanup complete. Final stats: lookups=%lu, hits=%lu (%.1f%%), stores=%lu\n",
+	pr_info("Page cache cleanup complete. Final stats: lookups=%lu, hits=%lu (%.1f%%), stores=%lu, "
+		"evictions=%lu, backpressure=%lu, meminfo_checks=%lu\n",
 		cache_state.stats.lookups, cache_state.stats.hits,
 		cache_state.stats.lookups ? (100.0 * cache_state.stats.hits / cache_state.stats.lookups) : 0.0,
-		cache_state.stats.stores);
+		cache_state.stats.stores, cache_state.stats.evictions,
+		cache_state.stats.backpressure_waits, cache_state.stats.meminfo_checks);
+}
+
+/*
+ * Wait until cache + inflight bytes are below high watermark.
+ * Called by prefetch workers BEFORE allocating fetch buffer.
+ *
+ * Lock discipline: must NOT hold iov_meta_lock or queue_lock.
+ * This function acquires cache_state.lock internally.
+ */
+int cache_wait_for_room(size_t incoming_size)
+{
+	struct timespec ts;
+
+	if (!cache_state.initialized || cache_state.max_bytes == 0)
+		return 0;
+
+	pthread_mutex_lock(&cache_state.lock);
+	while (cache_state.total_bytes + cache_state.inflight_bytes + incoming_size
+	       >= cache_state.high_watermark) {
+		if (cache_state.shutdown) {
+			pthread_mutex_unlock(&cache_state.lock);
+			return -1;
+		}
+		cache_state.stats.backpressure_waits++;
+		/* Timed wait: 100ms to check shutdown flag */
+		clock_gettime(CLOCK_REALTIME, &ts);
+		ts.tv_nsec += 100 * 1000000;
+		if (ts.tv_nsec >= 1000000000) {
+			ts.tv_sec += 1;
+			ts.tv_nsec -= 1000000000;
+		}
+		pthread_cond_timedwait(&cache_state.drain_cond,
+				       &cache_state.lock, &ts);
+	}
+	pthread_mutex_unlock(&cache_state.lock);
+	return 0;
+}
+
+void cache_set_shutdown(void)
+{
+	pthread_mutex_lock(&cache_state.lock);
+	cache_state.shutdown = true;
+	pthread_cond_broadcast(&cache_state.drain_cond);
+	pthread_mutex_unlock(&cache_state.lock);
+}
+
+void cache_add_inflight(size_t bytes)
+{
+	pthread_mutex_lock(&cache_state.lock);
+	cache_state.inflight_bytes += bytes;
+	pthread_mutex_unlock(&cache_state.lock);
+}
+
+void cache_remove_inflight(size_t bytes)
+{
+	pthread_mutex_lock(&cache_state.lock);
+	if (cache_state.inflight_bytes >= bytes)
+		cache_state.inflight_bytes -= bytes;
+	else
+		cache_state.inflight_bytes = 0;
+	pthread_mutex_unlock(&cache_state.lock);
 }
 
 /* Internal lookup with statistics - for page fault handlers */
@@ -202,7 +412,11 @@ enum cache_result cache_lookup_iov_for_fault(unsigned long iov_start, unsigned l
 	entry = cache_lookup_internal(iov_start);
 
 	if (entry && entry->iov_start == iov_start && entry->iov_end == iov_end) {
-		/* Exact match - allocate and copy data to avoid use-after-free */
+		/*
+		 * Exact match - copy data and remove entry from cache.
+		 * Deep copy is needed because prefetch workers may still
+		 * reference the cache tree concurrently.
+		 */
 		void *data_copy = xmalloc(entry->data_size);
 		if (!data_copy) {
 			pr_err("Failed to allocate memory for cache data copy\n");
@@ -215,9 +429,22 @@ enum cache_result cache_lookup_iov_for_fault(unsigned long iov_start, unsigned l
 		cache_state.stats.hits++;
 		result = CACHE_HIT;
 
-		/* Log cache hit for simulation (using -1 as iov_idx since we only have iov_start) */
-		PREFETCH_CACHE_HIT_LOG(-1);
-		pr_debug("Cache HIT: IOV [0x%lx-0x%lx] (%zu bytes)\n", iov_start, iov_end, entry->data_size);
+		/* Remove entry from cache to free memory immediately */
+		{
+			size_t freed_size = entry->data_size;
+			rb_erase(&entry->node, &cache_state.tree);
+			cache_state.total_bytes -= freed_size;
+			xfree(entry->data);
+			xfree(entry);
+
+			/* Signal workers if below low watermark */
+			if (cache_state.total_bytes < cache_state.low_watermark)
+				pthread_cond_broadcast(&cache_state.drain_cond);
+
+			PREFETCH_CACHE_HIT_LOG(-1);
+			pr_debug("Cache HIT: IOV [0x%lx-0x%lx] (%zu bytes, removed)\n",
+				 iov_start, iov_end, freed_size);
+		}
 	} else {
 		cache_state.stats.misses++;
 		result = CACHE_MISS;
@@ -308,7 +535,7 @@ int cache_store_iov(unsigned long iov_start, unsigned long iov_end, unsigned lon
 	entry->is_prefetched = is_prefetched;
 	clock_gettime(CLOCK_MONOTONIC, &entry->enqueue_time);
 
-	/* Allocate and copy data */
+	/* Deep copy data into cache entry */
 	entry->data = xmalloc(size);
 	if (!entry->data) {
 		xfree(entry);

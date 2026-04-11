@@ -14,6 +14,7 @@
 #include <sys/un.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <sched.h>
 
 #include "linux/userfaultfd.h"
 
@@ -810,6 +811,11 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 			iov_array[i].iov_start = iov->start;
 			iov_array[i].iov_end = iov->end;
 
+			if (i < 5 || (i >= num_iovs - 3)) {
+				lp_debug(lpi, "prefetch_init IOV[%d]: start=0x%lx end=0x%lx img_start=0x%lx\n",
+					 i, iov->start, iov->end, iov->img_start);
+			}
+
 			/* Calculate actual file offset using seek_pagemap */
 			lpi->pr.reset(&lpi->pr);
 			if (lpi->pr.seek_pagemap(&lpi->pr, iov->img_start) > 0) {
@@ -820,6 +826,20 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 				iov_array[i].file_offset = 0;
 			}
 			i++;
+		}
+
+		/* Log first IOV addresses after seek_pagemap calls */
+		{
+			struct lazy_iov *check_iov;
+			int j = 0;
+			list_for_each_entry(check_iov, &lpi->iovs, l) {
+				if (j < 5) {
+					lp_debug(lpi, "AFTER seek: IOV[%d] start=0x%lx end=0x%lx\n",
+						 j, check_iov->start, check_iov->end);
+				}
+				j++;
+			}
+			lp_debug(lpi, "AFTER seek: total IOVs in list = %d (was %d)\n", j, num_iovs);
 		}
 
 		/* Initialize prefetch IOV metadata */
@@ -901,46 +921,189 @@ static int uffd_check_op_error(struct lazy_pages_info *lpi, const char *op, int 
 	return 0;
 }
 
-static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, int *nr_pages)
+#define UFFD_COPY_MAX_RETRIES 5
+
+/*
+ * Internal helper: perform UFFDIO_COPY with bounded EAGAIN retry.
+ *
+ * On EAGAIN (kernel VMA/page-table contention), retry up to
+ * UFFD_COPY_MAX_RETRIES times with sched_yield() between attempts.
+ * On partial copy (mcopy_rc > 0 but < requested), advance src/dst/len
+ * and retry the remainder.
+ *
+ * Sets *nr_pages to the number of pages actually installed.
+ * Returns 0 on full or partial success (nr_pages > 0),
+ *        -1 on total failure (nr_pages == 0) or fatal error.
+ *
+ * Callers hold no locks — retry+yield is safe.
+ */
+static int __uffd_copy_with_retry(struct lazy_pages_info *lpi, __u64 address,
+				  int *nr_pages, unsigned long src, const char *label)
 {
 	struct uffdio_copy uffdio_copy;
-	unsigned long len = *nr_pages * page_size();
+	unsigned long ps = page_size();
+	unsigned long total_requested = *nr_pages * ps;
+	unsigned long total_copied = 0;
+	unsigned long remaining = total_requested;
+	__u64 cur_dst = address;
+	unsigned long cur_src = src;
+	int ret;
+	int retry;
 
-	uffdio_copy.dst = address;
-	uffdio_copy.src = (unsigned long)lpi->buf;
-	uffdio_copy.len = len;
-	uffdio_copy.mode = 0;
-	uffdio_copy.copy = 0;
+	lp_debug(lpi, "%s: 0x%llx/%ld\n", label, address, total_requested);
 
-	lp_debug(lpi, "uffd_copy: 0x%llx/%ld\n", uffdio_copy.dst, len);
-	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) &&
-	    uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
+	while (remaining > 0) {
+		uffdio_copy.dst = cur_dst;
+		uffdio_copy.src = cur_src;
+		uffdio_copy.len = remaining;
+		uffdio_copy.mode = 0;
+		uffdio_copy.copy = 0;
+
+		ret = ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy);
+		if (ret == 0) {
+			/* Full success for this chunk */
+			total_copied += remaining;
+			break;
+		}
+
+		/* ioctl failed — check errno */
+
+		/* Process exit: not a real error, stop gracefully */
+		if (errno == ENOSPC || errno == ESRCH) {
+			handle_exit(lpi);
+			total_copied += (uffdio_copy.copy > 0) ? uffdio_copy.copy : 0;
+			break;
+		}
+
+		/* Partial copy: some pages were installed */
+		if (uffdio_copy.copy > 0) {
+			unsigned long copied = uffdio_copy.copy;
+
+			total_copied += copied;
+			remaining -= copied;
+			cur_dst += copied;
+			cur_src += copied;
+			lp_debug(lpi, "%s: partial copy %ld/%ld bytes, continuing\n",
+				 label, copied, remaining + copied);
+			continue;
+		}
+
+		/* EAGAIN with 0 bytes: bounded retry with exponential backoff.
+		 * EAGAIN typically means kernel VMA/page-table lock contention
+		 * (e.g., concurrent munmap in the restored process).  A VMA
+		 * operation can take 100-1000us, so sched_yield() alone is
+		 * insufficient.  Backoff: 100, 200, 400, 800, 1600 us.
+		 */
+		if (errno == EAGAIN) {
+			unsigned int backoff_us = 100;
+
+			for (retry = 1; retry <= UFFD_COPY_MAX_RETRIES; retry++) {
+				usleep(backoff_us);
+
+				uffdio_copy.dst = cur_dst;
+				uffdio_copy.src = cur_src;
+				uffdio_copy.len = remaining;
+				uffdio_copy.mode = 0;
+				uffdio_copy.copy = 0;
+
+				ret = ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy);
+				if (ret == 0) {
+					lp_info(lpi, "%s: EAGAIN resolved after %d retries at 0x%llx\n",
+						label, retry, cur_dst);
+					total_copied += remaining;
+					remaining = 0;
+					break;
+				}
+
+				if (uffdio_copy.copy > 0) {
+					unsigned long copied = uffdio_copy.copy;
+
+					lp_info(lpi, "%s: EAGAIN partial copy %ld bytes on retry %d\n",
+						label, copied, retry);
+					total_copied += copied;
+					remaining -= copied;
+					cur_dst += copied;
+					cur_src += copied;
+					break; /* exit retry loop, continue outer loop */
+				}
+
+				if (errno != EAGAIN)
+					break; /* different error, fall through */
+
+				lp_warn(lpi, "%s: EAGAIN retry %d/%d at 0x%llx (%ld bytes, backoff %uus)\n",
+					label, retry, UFFD_COPY_MAX_RETRIES, cur_dst, remaining, backoff_us);
+				backoff_us *= 2;
+			}
+
+			/* If retry resolved it (partial or full), continue outer loop */
+			if (remaining > 0 && uffdio_copy.copy > 0)
+				continue;
+			if (remaining == 0)
+				break;
+
+			/* Retries exhausted or different errno after retry */
+			if (errno == EAGAIN) {
+				lp_err(lpi, "%s: UFFDIO_COPY failed after %d retries at 0x%llx, "
+				       "%ld of %ld bytes copied\n", label,
+				       UFFD_COPY_MAX_RETRIES, cur_dst,
+				       total_copied, total_requested);
+				break;
+			}
+			/* Fall through to check other errors */
+		}
+
+		/* EEXIST: page already present — treat as success for that range */
+		if (errno == EEXIST || uffdio_copy.copy == -EEXIST) {
+			lp_debug(lpi, "%s: EEXIST at 0x%llx, pages already present\n",
+				 label, cur_dst);
+			total_copied += remaining;
+			break;
+		}
+
+		/* ENOENT: VMA gone — treat as success (process may have exited) */
+		if (errno == ENOENT || uffdio_copy.copy == -ENOENT) {
+			lp_debug(lpi, "%s: ENOENT at 0x%llx\n", label, cur_dst);
+			total_copied += remaining;
+			break;
+		}
+
+		/* Fatal error */
+		lp_perror(lpi, "%s: fatal error at 0x%llx, mcopy_rc:%ld",
+			  label, cur_dst, (long)uffdio_copy.copy);
+		*nr_pages = total_copied / ps;
+		lpi->copied_pages += *nr_pages;
 		return -1;
+	}
 
+	*nr_pages = total_copied / ps;
 	lpi->copied_pages += *nr_pages;
+
+	/*
+	 * If we copied nothing and this wasn't a process-exit situation,
+	 * warn but return success with *nr_pages=0.  Callers are responsible
+	 * for checking nr_pages and NOT dropping the IOV when it's 0.
+	 * Returning -1 here would kill the entire lazy-pages daemon, which
+	 * is too aggressive — other processes still need page service.
+	 */
+	if (*nr_pages == 0 && !lpi->exited) {
+		lp_warn(lpi, "%s: 0 pages installed out of %ld requested at 0x%llx "
+			"(EAGAIN retries exhausted), IOV should be retained\n",
+			label, total_requested / ps, address);
+	}
 
 	return 0;
 }
 
+static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, int *nr_pages)
+{
+	return __uffd_copy_with_retry(lpi, address, nr_pages,
+				     (unsigned long)lpi->buf, "uffd_copy");
+}
+
 static int uffd_copy_from_buf(struct lazy_pages_info *lpi, __u64 address, int *nr_pages, void *src_buf)
 {
-	struct uffdio_copy uffdio_copy;
-	unsigned long len = *nr_pages * page_size();
-
-	uffdio_copy.dst = address;
-	uffdio_copy.src = (unsigned long)src_buf;
-	uffdio_copy.len = len;
-	uffdio_copy.mode = 0;
-	uffdio_copy.copy = 0;
-
-	lp_debug(lpi, "uffd_copy_from_buf: 0x%llx/%ld from %p\n", uffdio_copy.dst, len, src_buf);
-	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) &&
-	    uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
-		return -1;
-
-	lpi->copied_pages += *nr_pages;
-
-	return 0;
+	return __uffd_copy_with_retry(lpi, address, nr_pages,
+				     (unsigned long)src_buf, "uffd_copy_from_buf");
 }
 
 static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, int nr)
@@ -982,8 +1145,17 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, int nr
 	nr = min(nr, req_pages);
 
 	ret = uffd_copy(lpi, addr, &nr);
-	if (ret < 0)
+	if (ret < 0) {
+		/*
+		 * Fatal UFFDIO_COPY error (not EAGAIN — those are retried
+		 * internally).  Move the request back to the IOV list so
+		 * the next fault on this range can retry.
+		 */
+		iov_list_insert(req, &lpi->iovs);
+		if (nr > 0)
+			drop_iovs(lpi, addr, nr * PAGE_SIZE);
 		return ret;
+	}
 
 	/* recheck if the process exited, it may be detected in uffd_copy */
 	if (lpi->exited)
@@ -1259,7 +1431,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	}
 
 	/* === IOV-based semi-synchronous logic === */
-	if (opts.enable_object_storage && opts.lazy_pages) {
+	if (opts.enable_object_storage && opts.lazy_pages && opts.semi_sync_iov) {
 		void *cached_data = NULL;
 		enum cache_result cache_result = CACHE_MISS;
 		int iov_index = -1;
@@ -1290,10 +1462,11 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 		/* Cache HIT - restore directly from cache */
 		if (cache_result == CACHE_HIT) {
-			size_t cache_size = fetch_end - fetch_start;
+			int original_nr_pages = nr_pages;
+			unsigned long actual_copied_bytes;
 
-			lp_info(lpi, "CACHE HIT: IOV [0x%lx-0x%lx] (%zu bytes)\n",
-				fetch_start, fetch_end, cache_size);
+			lp_info(lpi, "CACHE HIT: IOV [0x%lx-0x%lx] (%d pages)\n",
+				fetch_start, fetch_end, nr_pages);
 
 			/* Restore pages directly from cache buffer */
 			ret = uffd_copy_from_buf(lpi, fetch_start, &nr_pages, cached_data);
@@ -1301,19 +1474,41 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			/* Free the copied cache data */
 			xfree(cached_data);
 
-			if (ret < 0) {
-				lp_err(lpi, "uffd_copy_from_buf failed for cached IOV\n");
-				return -1;
+			if (ret < 0 || nr_pages == 0) {
+				/*
+				 * UFFDIO_COPY failed (EAGAIN retries exhausted or fatal).
+				 * Do NOT drop the IOV — leave it in lpi->iovs so the
+				 * next fault on this range will retry the fetch/copy.
+				 */
+				lp_err(lpi, "CACHE HIT copy failed: %d of %d pages installed "
+				       "at 0x%lx, IOV retained for retry\n",
+				       nr_pages, original_nr_pages, fetch_start);
+				return ret;
 			}
 
-			/* Mark IOV as restored in cache (will be removed) */
-			cache_mark_restored(fetch_start, fetch_end);
+			actual_copied_bytes = (unsigned long)nr_pages * ps;
 
-			/* Remove IOV from lpi->iovs after successful cache restore */
-			ret = drop_iovs(lpi, fetch_start, fetch_end - fetch_start);
+			/*
+			 * Only drop the range that was actually installed.
+			 * cache_mark_restored uses exact-match (iov_start, iov_end),
+			 * so it will only remove the cache entry if the full IOV
+			 * was copied. Partial copy safely leaves cache entry intact.
+			 */
+			if (nr_pages == original_nr_pages) {
+				/* Full copy — drop entire IOV and remove cache entry */
+				cache_mark_restored(fetch_start, fetch_end);
+				ret = drop_iovs(lpi, fetch_start, fetch_end - fetch_start);
+			} else {
+				/* Partial copy — only drop the installed range */
+				lp_warn(lpi, "CACHE HIT partial: %d of %d pages at 0x%lx, "
+					"dropping only installed range\n",
+					nr_pages, original_nr_pages, fetch_start);
+				ret = drop_iovs(lpi, fetch_start, actual_copied_bytes);
+			}
+
 			if (ret < 0) {
 				lp_err(lpi, "Failed to drop restored IOV [0x%lx-0x%lx] from list\n",
-				       fetch_start, fetch_end);
+				       fetch_start, fetch_start + actual_copied_bytes);
 				return -1;
 			}
 
@@ -1665,8 +1860,12 @@ int cr_lazy_pages(bool daemon)
 		int num_workers = opts.prefetch_workers > 0 ? opts.prefetch_workers : 8;  /* 8 workers for optimal throughput */
 		unsigned long cache_limit = opts.cache_limit_mb;
 
-		/* Initialize page cache */
-		ret = cache_init(cache_limit);
+		/* Initialize page cache.
+		 * total_lazy_bytes is not yet known (lpis not populated),
+		 * so pass 0. cache_init will use available_memory/4 as cap.
+		 * After all uffd connections are established, we could
+		 * refine the limit, but the conservative default is safe. */
+		ret = cache_init(cache_limit, 0);
 		if (ret < 0) {
 			pr_err("Failed to initialize page cache\n");
 			return -1;
@@ -1701,6 +1900,17 @@ int cr_lazy_pages(bool daemon)
 	if (prepare_uffds(lazy_sk, epollfd)) {
 		xfree(events);
 		return -1;
+	}
+
+	/* Now all lpis are populated — update cache limit with actual lazy bytes */
+	if (opts.async_prefetch) {
+		struct lazy_pages_info *lpi;
+		unsigned long total_lazy_bytes = 0;
+
+		list_for_each_entry(lpi, &lpis, l)
+			total_lazy_bytes += lpi->total_pages * page_size();
+
+		cache_update_limit(total_lazy_bytes);
 	}
 
 	if (opts.use_page_server) {

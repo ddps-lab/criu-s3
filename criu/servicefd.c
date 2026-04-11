@@ -96,6 +96,44 @@ int init_service_fd(void)
 	return 0;
 }
 
+int relocate_internal_fd(int fd)
+{
+	int min_fd;
+	int high_fd;
+
+	/*
+	 * Move an internal fd (pipe, memfd, curl socket, etc.) out of
+	 * the user fd range to prevent collisions during restore.
+	 *
+	 * Policy: place internal fds in the middle of the fd space,
+	 * above typical user fds but below service fds.
+	 *
+	 *   [0 .. user_max]  [internal_min .. service_min-1]  [service fds]
+	 *
+	 * We use rlim_cur/2 as a safe lower bound:
+	 * - Below service fds (which start near rlim_cur)
+	 * - Above typical user fds (usually < 256)
+	 * - Scales with the system's fd limit
+	 */
+	if (service_fd_rlim_cur <= 0)
+		min_fd = 512;  /* Fallback before init_service_fd() */
+	else
+		min_fd = service_fd_rlim_cur / 2;
+
+	if (fd >= min_fd)
+		return fd;  /* Already in safe range */
+
+	high_fd = fcntl(fd, F_DUPFD_CLOEXEC, min_fd);
+	if (high_fd >= 0) {
+		close(fd);
+		return high_fd;
+	}
+
+	/* F_DUPFD_CLOEXEC failed (fd exhaustion). Keep low fd as last resort. */
+	pr_warn("relocate_internal_fd: failed to move fd %d to >= %d\n", fd, min_fd);
+	return fd;
+}
+
 static int __get_service_fd(enum sfd_type type, int service_fd_id)
 {
 	return service_fd_base - type - SERVICE_FD_MAX * service_fd_id;

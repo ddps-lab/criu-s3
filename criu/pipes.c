@@ -305,6 +305,9 @@ int open_pipe(struct file_desc *d, int *new_fd)
 		return -1;
 	}
 
+	pfd[0] = relocate_internal_fd(pfd[0]);
+	pfd[1] = relocate_internal_fd(pfd[1]);
+
 	ret = restore_pipe_data(CR_FD_PIPES_DATA, pfd[1], pi->pe->pipe_id, pd_hash_pipes);
 	if (ret)
 		return -1;

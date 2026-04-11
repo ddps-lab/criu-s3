@@ -992,13 +992,16 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	}
 
 	pr->pi = open_pages_image_at(dfd, flags, pr->pmi, &pr->pages_img_id);
-	if (!pr->pi) {
+	if (!pr->pi || (pr->pi && empty_image(pr->pi))) {
 		/* If object storage is enabled, we don't need local pages.img */
 		if (opts.enable_object_storage) {
-			pr_warn("Could not open local pages-%u.img, but proceeding in object storage mode.\n",
+			pr_info("No local pages-%u.img, using object storage mode.\n",
 			        pr->pages_img_id);
-			pr->pi = NULL;
-		} else {
+			if (pr->pi) {
+				close_image(pr->pi);
+				pr->pi = NULL;
+			}
+		} else if (!pr->pi) {
 			pr_err("Failed to open pages image (id: %u)\n", pr->pages_img_id);
 			close_page_read(pr);
 			return -1;

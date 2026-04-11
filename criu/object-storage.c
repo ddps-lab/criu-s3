@@ -8,6 +8,8 @@
 #include <pthread.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <fcntl.h>
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -18,6 +20,7 @@
 #include "log.h"
 #include "cr_options.h"
 #include "object-storage.h"
+#include "servicefd.h"
 
 /*
  * =================================================================================
@@ -544,6 +547,27 @@ static size_t write_router_callback(void *contents, size_t size, size_t nmemb, v
  */
 
 /* Set fixed curl options that don't change between requests */
+/*
+ * Custom socket open callback for libcurl.
+ * Moves the socket fd out of the user fd range using the
+ * centralized relocate_internal_fd() policy.
+ */
+static curl_socket_t curl_opensocket_cb(void *clientp,
+					curlsocktype purpose,
+					struct curl_sockaddr *address)
+{
+	curl_socket_t s;
+
+	(void)clientp;
+	(void)purpose;
+
+	s = socket(address->family, address->socktype, address->protocol);
+	if (s == CURL_SOCKET_BAD)
+		return CURL_SOCKET_BAD;
+
+	return relocate_internal_fd(s);
+}
+
 static void set_fixed_curl_options(CURL *handle)
 {
 	curl_easy_setopt(handle, CURLOPT_HTTPGET, 1L);
@@ -564,6 +588,9 @@ static void set_fixed_curl_options(CURL *handle)
 
 	/* SSL verification */
 	curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, 2L);
+
+	/* Move curl sockets to high fd range to avoid conflicts with restore */
+	curl_easy_setopt(handle, CURLOPT_OPENSOCKETFUNCTION, curl_opensocket_cb);
 }
 
 /* Get curl handle for current process (create if not exists) */
