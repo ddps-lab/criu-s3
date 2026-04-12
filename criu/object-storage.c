@@ -909,12 +909,22 @@ static int _object_storage_create_express_session(void)
 	char x_amz_content_sha256_header[100];
 	int i;
 
+	const char *endpoint_host;
+
 	OBJSTOR_SESSION_CREATE_LOG();
 
 	if (!opts.aws_access_key || !opts.aws_secret_key || !opts.aws_region) {
 		pr_err("Missing AWS credentials or region for Express One Zone session\n");
 		return -1;
 	}
+
+	/* Strip optional protocol prefix so concatenation produces a well-formed URL.
+	 * Without this we end up with "https://bucket.https://endpoint/?session". */
+	endpoint_host = opts.object_storage_endpoint_url;
+	if (endpoint_host && strncmp(endpoint_host, "https://", 8) == 0)
+		endpoint_host += 8;
+	else if (endpoint_host && strncmp(endpoint_host, "http://", 7) == 0)
+		endpoint_host += 7;
 
 	payload_len = strlen(payload);
 	now = time(NULL);
@@ -923,7 +933,7 @@ static int _object_storage_create_express_session(void)
 	strftime(date_stamp, sizeof(date_stamp), "%Y%m%d", tm_gmt);
 
 	snprintf(session_url, sizeof(session_url), "https://%s.%s/?session", opts.object_storage_bucket,
-		 opts.object_storage_endpoint_url);
+		 endpoint_host);
 	pr_info("Session URL: %s\n", session_url);
 
 	_sha256_hex(payload, payload_len, payload_hash);
@@ -933,7 +943,7 @@ static int _object_storage_create_express_session(void)
 		 "x-amz-content-sha256:%s\n"
 		 "x-amz-create-session-mode:ReadWrite\n"
 		 "x-amz-date:%s\n",
-		 opts.object_storage_bucket, opts.object_storage_endpoint_url, payload_hash, amz_date);
+		 opts.object_storage_bucket, endpoint_host, payload_hash, amz_date);
 
 	snprintf(canonical_request, sizeof(canonical_request), "%s\n%s\n%s\n%s\n%s\n%s", method, canonical_uri,
 		 canonical_querystring, canonical_headers, signed_headers, payload_hash);
@@ -1173,7 +1183,7 @@ static int _construct_object_url(const char *object_key, struct object_url_info 
 	/* Construct URL */
 	if (opts.express_one_zone) {
 		snprintf(info->url, sizeof(info->url), "https://%s.%s/%s",
-			 opts.object_storage_bucket, opts.object_storage_endpoint_url, info->full_object_path);
+			 opts.object_storage_bucket, hostname, info->full_object_path);
 	} else if (opts.object_storage_bucket && opts.object_storage_bucket[0] != '\0') {
 		if (opts.object_storage_path_style) {
 			if (hostname != endpoint_url) {
@@ -1205,7 +1215,7 @@ static int _construct_object_url(const char *object_key, struct object_url_info 
 	/* Construct auth host */
 	if (opts.express_one_zone) {
 		snprintf(info->auth_host, sizeof(info->auth_host), "%s.%s",
-			 opts.object_storage_bucket, opts.object_storage_endpoint_url);
+			 opts.object_storage_bucket, hostname);
 	} else if (opts.object_storage_path_style ||
 		   !opts.object_storage_bucket || !opts.object_storage_bucket[0]) {
 		snprintf(info->auth_host, sizeof(info->auth_host), "%s", hostname);
@@ -1910,7 +1920,7 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	if (opts.express_one_zone) {
 		/* Express One Zone: always virtual-hosted style */
 		snprintf(url, sizeof(url), "https://%s.%s/%s", opts.object_storage_bucket,
-			 opts.object_storage_endpoint_url, full_object_path);
+			 hostname, full_object_path);
 	} else if (opts.object_storage_bucket && opts.object_storage_bucket[0] != '\0') {
 		if (opts.object_storage_path_style) {
 			/* Path-style: {scheme}{hostname}/{bucket}/{path} */
@@ -1999,7 +2009,7 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 		if (opts.express_one_zone) {
 			/* Express One Zone: always virtual-hosted */
 			snprintf(auth_host, sizeof(auth_host), "%s.%s",
-				 opts.object_storage_bucket, opts.object_storage_endpoint_url);
+				 opts.object_storage_bucket, hostname);
 		} else if (opts.object_storage_path_style ||
 			   !opts.object_storage_bucket || !opts.object_storage_bucket[0]) {
 			/* Path-style or no bucket: host = hostname only */
