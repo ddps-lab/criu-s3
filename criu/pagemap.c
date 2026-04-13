@@ -489,8 +489,9 @@ static int maybe_read_page_object_storage(struct page_read *pr, unsigned long va
 		}
 	}
 
-	/* Fetch data from object storage */
-	ret = object_storage_fetch_range(object_key, pr->pi_off, len, buf);
+	/* Fetch data from object storage (fault-driven path: lazy-pages
+	 * daemon is reactively pulling pages for an outstanding UFFD fault). */
+	ret = object_storage_fetch_range(object_key, pr->pi_off, len, buf, OBJSTOR_SRC_FAULT);
 
 	if (ret == 0) {
 		pr_debug("Object Storage: Fetch successful for offset %lu\n", pr->pi_off);

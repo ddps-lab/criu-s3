@@ -1888,7 +1888,8 @@ int object_storage_get_object(const char *object_key, void **out_data, unsigned 
  * =================================================================================
  */
 
-int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer)
+int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer,
+			       const char *source)
 {
 	CURL *curl_handle;
 	CURLcode res;
@@ -2124,7 +2125,7 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 
 	/* Log fetch start for simulation and record start time */
 	clock_gettime(CLOCK_MONOTONIC, &fetch_start);
-	OBJSTOR_FETCH_START_LOG(object_key, offset, length);
+	OBJSTOR_FETCH_START_LOG(object_key, offset, length, source);
 
 	/* Perform the request */
 	res = curl_easy_perform(curl_handle);
@@ -2133,7 +2134,7 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
 
 	if (res != CURLE_OK || http_code >= 400) {
-		OBJSTOR_FETCH_ERROR_LOG(object_key, offset, length, (int)http_code);
+		OBJSTOR_FETCH_ERROR_LOG(object_key, offset, length, (int)http_code, source);
 		pr_err("curl_easy_perform() failed: %s (URL: %s, Range: %s, HTTP Code: %ld)\n",
 		       curl_easy_strerror(res), url, range_header, http_code);
 
@@ -2270,7 +2271,7 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	fetch_duration_ms = (fetch_end.tv_sec - fetch_start.tv_sec) * 1000.0 +
 			    (fetch_end.tv_nsec - fetch_start.tv_nsec) / 1000000.0;
 	OBJSTOR_FETCH_DONE_LOG(object_key, offset, length, fetch_duration_ms,
-			       fetch_ctx.x_cache, fetch_ctx.x_amz_cf_pop);
+			       fetch_ctx.x_cache, fetch_ctx.x_amz_cf_pop, source);
 
 	pr_debug("Successfully fetched %zu bytes (range %s) from %s\n", chunk.size, range_header, url);
 

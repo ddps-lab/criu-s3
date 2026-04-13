@@ -538,7 +538,11 @@ static void *prefetch_worker(void *arg)
 			pr_debug("PREFETCH: Worker %d: Fetching from S3: %s at offset %lu, size %lu\n",
 				 worker_id, object_key, req->file_offset, size);
 
-			ret = object_storage_fetch_range(object_key, req->file_offset, size, data);
+			/* Prefetch worker: speculative pull-ahead, not driven by an
+			 * outstanding UFFD fault. Tag accordingly so per-source CDN
+			 * hit ratios can be computed from the FETCH_DONE log. */
+			ret = object_storage_fetch_range(object_key, req->file_offset, size, data,
+							 OBJSTOR_SRC_PREFETCH);
 
 			if (ret != 0) {
 				PREFETCH_WORKER_ERROR_LOG(worker_id, req->iov_index, ret);
