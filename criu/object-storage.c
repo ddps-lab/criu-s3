@@ -53,11 +53,18 @@ struct curl_thread_handle {
 	struct curl_thread_handle *next;
 };
 
-/* Structure to hold both data and error buffers */
+/* Structure to hold both data and error buffers + CDN observability fields. */
 struct FetchContext {
 	struct MemoryStruct *data_chunk;
 	struct MemoryStruct *error_chunk;
 	int got_error;
+	/*
+	 * Captured response headers for CDN visibility.  Populated by
+	 * header_callback, consumed by the caller after curl_easy_perform
+	 * completes.  Empty string means the header was absent.
+	 */
+	char x_cache[64];
+	char x_amz_cf_pop[32];
 };
 
 /*
@@ -509,10 +516,55 @@ static size_t write_error_callback(void *contents, size_t size, size_t nmemb, vo
 }
 
 /* Header callback to detect HTTP errors early */
+/*
+ * Case-insensitive prefix match for HTTP header names.  Returns pointer to
+ * the byte after the matched prefix on success, NULL on miss.  Used so we
+ * don't bring in strcasecmp for libcurl's case-bag headers.
+ */
+static const char *_hdr_match(const char *buf, size_t buflen, const char *needle)
+{
+	size_t nlen = strlen(needle);
+	size_t i;
+	if (buflen < nlen)
+		return NULL;
+	for (i = 0; i < nlen; i++) {
+		char a = buf[i];
+		char b = needle[i];
+		if (a >= 'A' && a <= 'Z')
+			a += 32;
+		if (b >= 'A' && b <= 'Z')
+			b += 32;
+		if (a != b)
+			return NULL;
+	}
+	return buf + nlen;
+}
+
+/*
+ * Copy a header value into dst, trimming leading whitespace and stripping
+ * trailing CRLF.  Always NUL-terminates dst.
+ */
+static void _copy_hdr_value(const char *src, size_t src_len, char *dst, size_t dst_size)
+{
+	size_t i = 0;
+	size_t j = 0;
+	while (i < src_len && (src[i] == ' ' || src[i] == '\t'))
+		i++;
+	while (i < src_len && j + 1 < dst_size) {
+		char c = src[i];
+		if (c == '\r' || c == '\n')
+			break;
+		dst[j++] = c;
+		i++;
+	}
+	dst[j] = '\0';
+}
+
 static size_t header_callback(char *buffer, size_t size, size_t nitems, void *userdata)
 {
 	struct FetchContext *ctx = (struct FetchContext *)userdata;
 	size_t total_size = size * nitems;
+	const char *value;
 
 	/* Check if this is the status line */
 	if (strncmp(buffer, "HTTP/", 5) == 0) {
@@ -523,6 +575,25 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
 				pr_debug("Detected error status code: %d\n", status_code);
 			}
 		}
+		return total_size;
+	}
+
+	/*
+	 * Capture CDN observability headers.  CloudFront uses "X-Cache" with
+	 * values like "Hit from cloudfront" / "Miss from cloudfront", and
+	 * "X-Amz-Cf-Pop" for the serving edge POP id (e.g. "CDG52-P1").
+	 */
+	value = _hdr_match(buffer, total_size, "X-Cache:");
+	if (value) {
+		_copy_hdr_value(value, total_size - (size_t)(value - buffer),
+				ctx->x_cache, sizeof(ctx->x_cache));
+		return total_size;
+	}
+	value = _hdr_match(buffer, total_size, "X-Amz-Cf-Pop:");
+	if (value) {
+		_copy_hdr_value(value, total_size - (size_t)(value - buffer),
+				ctx->x_amz_cf_pop, sizeof(ctx->x_amz_cf_pop));
+		return total_size;
 	}
 
 	return total_size;
@@ -1868,6 +1939,8 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	fetch_ctx.data_chunk = &chunk;
 	fetch_ctx.error_chunk = &error_response;
 	fetch_ctx.got_error = 0;
+	fetch_ctx.x_cache[0] = '\0';
+	fetch_ctx.x_amz_cf_pop[0] = '\0';
 
 	/* Normalize the object prefix */
 	if (opts.object_storage_object_prefix) {
@@ -2105,6 +2178,8 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 
 			/* Reset fetch context for retry */
 			fetch_ctx.got_error = 0;
+			fetch_ctx.x_cache[0] = '\0';
+			fetch_ctx.x_amz_cf_pop[0] = '\0';
 			error_response.size = 0;
 			curl_easy_setopt(retry_handle, CURLOPT_WRITEFUNCTION, write_router_callback);
 			curl_easy_setopt(retry_handle, CURLOPT_WRITEDATA, (void *)&fetch_ctx);
@@ -2194,7 +2269,8 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	clock_gettime(CLOCK_MONOTONIC, &fetch_end);
 	fetch_duration_ms = (fetch_end.tv_sec - fetch_start.tv_sec) * 1000.0 +
 			    (fetch_end.tv_nsec - fetch_start.tv_nsec) / 1000000.0;
-	OBJSTOR_FETCH_DONE_LOG(object_key, offset, length, fetch_duration_ms);
+	OBJSTOR_FETCH_DONE_LOG(object_key, offset, length, fetch_duration_ms,
+			       fetch_ctx.x_cache, fetch_ctx.x_amz_cf_pop);
 
 	pr_debug("Successfully fetched %zu bytes (range %s) from %s\n", chunk.size, range_header, url);
 

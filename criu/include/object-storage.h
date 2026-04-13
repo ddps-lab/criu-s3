@@ -22,9 +22,15 @@
 	pr_info("objstor: FETCH_START key=%s offset=%lu len=%lu\n", \
 		(key), (unsigned long)(offset), (unsigned long)(len))
 
-#define OBJSTOR_FETCH_DONE_LOG(key, offset, len, dur_ms) \
-	pr_info("objstor: FETCH_DONE key=%s offset=%lu len=%lu dur_ms=%.2f\n", \
-		(key), (unsigned long)(offset), (unsigned long)(len), (double)(dur_ms))
+/*
+ * NOTE: x_cache and x_amz_cf_pop may be empty strings when the response did
+ * not include the corresponding headers (e.g., direct S3 origin). Always
+ * NUL-terminated by header_callback so it's safe to %s them here.
+ */
+#define OBJSTOR_FETCH_DONE_LOG(key, offset, len, dur_ms, x_cache, x_pop) \
+	pr_info("objstor: FETCH_DONE key=%s offset=%lu len=%lu dur_ms=%.2f x_cache=\"%s\" x_pop=\"%s\"\n", \
+		(key), (unsigned long)(offset), (unsigned long)(len), (double)(dur_ms), \
+		(x_cache), (x_pop))
 
 #define OBJSTOR_FETCH_ERROR_LOG(key, offset, len, error_code) \
 	pr_err("objstor: FETCH_ERROR key=%s offset=%lu len=%lu error=%d\n", \
