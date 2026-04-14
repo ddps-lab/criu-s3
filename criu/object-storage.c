@@ -2576,21 +2576,24 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 		pr_warn("Expected HTTP 206 Partial Content, but received %ld\n", http_code);
 	}
 
-	/* Check if the received size matches the requested length */
+	/*
+	 * Check if the received size matches the requested length.
+	 *
+	 * A short read is NOT a transport error — it means the requested
+	 * range extended past the end of the object. S3 responds with
+	 * HTTP 206 Partial Content and returns only the available bytes.
+	 * Callers that issue speculative read-ahead windows (e.g. the
+	 * read-ahead buffer in maybe_read_page_object_storage) will often
+	 * trip this near the end of pages-*.img. Treating it as a hard
+	 * error and destroying the curl handle is what used to happen,
+	 * and it cost ~100–900ms per subsequent GET (cold TLS handshake
+	 * on a brand-new handle). Keep the handle alive so the next real
+	 * read reuses the warm TLS session; the caller is expected to
+	 * retry with a smaller length if it actually needed more data.
+	 */
 	if (chunk.size != length) {
-		pr_err("Object Storage fetch: Received size mismatch (Expected %lu, Got %zu)\n", length, chunk.size);
-
-		/* If using a reused handle, handle cleanup */
-		if (!is_main_thread()) {
-			pr_warn("Thread %d: Size mismatch, but keeping thread-local handle\n", get_thread_id());
-		} else {
-			if (curl_handle == get_curl_handle_for_current_process()) {
-				cleanup_curl_handle_for_process(getpid());
-			} else {
-				curl_easy_cleanup(curl_handle);
-			}
-		}
-
+		pr_warn("Object Storage fetch: short read (Expected %lu, Got %zu) — "
+			"likely past EOF, keeping handle warm\n", length, chunk.size);
 		free(error_response.memory);
 		ret = -1;
 		goto cleanup;
