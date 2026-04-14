@@ -108,6 +108,36 @@ struct page_read {
 	off_t ra_start; /* file offset of the first byte in ra_buf */
 	size_t ra_len;	/* number of valid bytes currently held in ra_buf */
 	size_t ra_cap;	/* allocated size of ra_buf, 0 = read-ahead disabled */
+
+	/*
+	 * Phase 6 M10: eager-prefetch buffer for object storage.
+	 *
+	 * Before cr-restore starts walking pagemap entries, we pre-scan
+	 * pmes[] to identify all entries that are PE_PRESENT but NOT
+	 * PE_LAZY (i.e. eager, non-lazy pages that cr-restore must read
+	 * from pages-N.img during the main walk — these can't be deferred
+	 * to the UFFD fault handler). Their byte ranges in pages-N.img are
+	 * merged into a small number of contiguous regions and parallel-
+	 * fetched into eager_buf by a short-lived pthread worker pool.
+	 *
+	 * maybe_read_page_object_storage checks eager_buf first — when
+	 * pi_off + len lies inside one of the prefetched ranges, the read
+	 * becomes a zero-RTT memcpy. Otherwise it falls through to the
+	 * existing ra_buf / direct S3 GET paths.
+	 *
+	 * eager_ranges is sorted by file_offset and the ranges don't
+	 * overlap. buf_offset is the position within eager_buf where each
+	 * range's data starts, so eager_buf is a packed concatenation of
+	 * all prefetched ranges.
+	 */
+	void *eager_buf;
+	size_t eager_buf_cap;
+	struct eager_range {
+		off_t file_offset;
+		size_t len;
+		size_t buf_offset;
+	} *eager_ranges;
+	int nr_eager_ranges;
 };
 
 /* flags for ->read_pages */
