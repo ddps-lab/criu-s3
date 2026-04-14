@@ -266,6 +266,7 @@ static void *_prefetch_worker(void *arg)
 		int rc;
 
 		rc = object_storage_get_object(item->stripped, &data, &len);
+
 		if (rc == 0 && data && len > 0) {
 			if (_cache_insert(item->full_key, data, len) != 0) {
 				pr_warn("cache insert failed for %s\n", item->full_key);
@@ -368,11 +369,25 @@ static int _prefetch_current_prefix(int num_workers, char *parent_prefix_out, si
 		return 0;
 	}
 
-	nw = num_workers > 0 ? num_workers : 16;
+	/*
+	 * Metadata prefetch is latency-bound, not bandwidth-bound: ~30 tiny
+	 * files × 25ms warm GET ≈ 750ms of serial work with perfect
+	 * connection reuse. Spawning 32 worker threads for this actively
+	 * hurts: 32 concurrent fresh TLS handshakes serialize inside
+	 * OpenSSL/libcurl (empirically 770–1005ms each on m5.8xlarge →
+	 * ~1050ms wave wall) while a small worker count can warm the TCP+TLS
+	 * connection cache and then amortize subsequent GETs at ~25ms each.
+	 *
+	 * Cap at 4 workers for the metadata wave regardless of the caller's
+	 * num_workers request. (obstor_xfer for pages-*.img fetches keeps
+	 * its full worker count — those are bandwidth-bound, not
+	 * latency-bound, and have their own scaling story.)
+	 */
+	nw = num_workers > 0 ? num_workers : 4;
+	if (nw > 4)
+		nw = 4;
 	if ((size_t)nw > wq.n)
 		nw = (int)wq.n;
-	if (nw > 64)
-		nw = 64;
 
 	tids = xmalloc(nw * sizeof(pthread_t));
 	if (!tids) {
@@ -454,6 +469,21 @@ int obstor_prefetch_init(int num_workers)
 
 	pr_info("initializing (workers=%d, prefix='%s')\n", num_workers,
 		opts.object_storage_object_prefix ? opts.object_storage_object_prefix : "");
+
+	/*
+	 * Force a single-threaded curl re-init BEFORE spawning workers.
+	 *
+	 * Without this, every worker thread's first curl_easy_init() +
+	 * first TLS connection post-fork races into libcurl / OpenSSL
+	 * global lazy-init state and serializes on a global lock. On mc-4gb
+	 * EC2 this reproduced as 26 threads each taking 835–1043 ms for a
+	 * 2 KB GET — the classic "all threads queue on one mutex" wall-time
+	 * shape. A single serial re-init here makes the subsequent parallel
+	 * fetch wave hit warm globals and actually overlap.
+	 */
+	if (object_storage_reinit_after_fork() != 0) {
+		pr_warn("reinit_after_fork failed; worker wave may serialize\n");
+	}
 
 	original_prefix = opts.object_storage_object_prefix;
 

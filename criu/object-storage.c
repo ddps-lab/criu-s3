@@ -1137,6 +1137,13 @@ static int ensure_valid_session(void)
  * =================================================================================
  */
 
+int object_storage_reinit_after_fork(void)
+{
+	/* Wraps the static reinitialize_curl_for_lazy_pages so external code
+	 * can force a single-threaded curl re-init before spawning workers. */
+	return reinitialize_curl_for_lazy_pages();
+}
+
 int object_storage_init(void)
 {
 	CURLcode res = curl_global_init(CURL_GLOBAL_DEFAULT);

@@ -186,6 +186,15 @@ int object_storage_get_object(const char *object_key, void **out_data, unsigned 
 int object_storage_list_objects(const char *key_prefix, char ***out_keys, size_t *out_n);
 
 /*
+ * Re-initialize the object-storage client after a fork (e.g. the lazy-pages
+ * daemon child inheriting its parent's curl state). Single-threaded; must
+ * be called before any worker thread starts issuing GETs. Fixes a
+ * serialization pathology where N worker threads racing into libcurl /
+ * OpenSSL lazy-init post-fork each take hundreds of ms for a small GET.
+ */
+int object_storage_reinit_after_fork(void);
+
+/*
  * Multipart upload API — for large files (pages-*.img, > 5MB)
  *
  * Usage:
