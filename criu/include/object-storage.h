@@ -175,6 +175,17 @@ int object_storage_put_object(const char *object_key, const void *data, unsigned
 int object_storage_get_object(const char *object_key, void **out_data, unsigned long *out_length);
 
 /*
+ * Enumerate object keys under a prefix using S3 ListObjectsV2.
+ * Handles pagination; returned keys are all under the given prefix.
+ *
+ * On success: *out_keys is an xmalloc'd array of xstrdup'd key strings,
+ * *out_n is the count. Caller must xfree each key and free() the array.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int object_storage_list_objects(const char *key_prefix, char ***out_keys, size_t *out_n);
+
+/*
  * Multipart upload API — for large files (pages-*.img, > 5MB)
  *
  * Usage:

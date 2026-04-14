@@ -84,6 +84,30 @@ struct page_read {
 
 	/* S3 object prefix override for this page_read (NULL = use global) */
 	char *object_storage_prefix;
+
+	/*
+	 * Phase 6: per-page_read read-ahead buffer for object storage.
+	 *
+	 * cr-restore's eager read path calls maybe_read_page_object_storage()
+	 * for each pagemap entry it walks, including many small (1–37 page)
+	 * entries during the initial restore phase. Each call to
+	 * object_storage_fetch_range() pays one same-region S3 RTT (~25 ms),
+	 * so an mc-4gb workload spends ~80 sequential GETs ≈ 2 s before the
+	 * lazy-pages worker pool ever sees its first IOV.
+	 *
+	 * Because pi_off advances monotonically inside a single page_read,
+	 * we can amortize this with a small in-memory window: on a miss,
+	 * fetch max(len, ra_cap) bytes starting at pi_off; subsequent
+	 * sequential reads inside that window are served from RAM with zero
+	 * extra GETs. This is purely a transport optimization — io_complete
+	 * semantics, pi_off advance, and image boundary handling stay
+	 * exactly the same. No file is created on the local filesystem;
+	 * the buffer lives only as long as the page_read instance.
+	 */
+	void *ra_buf;	/* xmalloc'd window, freed on close_page_read */
+	off_t ra_start; /* file offset of the first byte in ra_buf */
+	size_t ra_len;	/* number of valid bytes currently held in ra_buf */
+	size_t ra_cap;	/* allocated size of ra_buf, 0 = read-ahead disabled */
 };
 
 /* flags for ->read_pages */

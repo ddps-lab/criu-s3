@@ -489,6 +489,102 @@ static int maybe_read_page_object_storage(struct page_read *pr, unsigned long va
 		}
 	}
 
+	/*
+	 * Phase 6: per-page_read read-ahead fast path.
+	 *
+	 * cr-restore's eager pagemap walk issues many small sequential
+	 * reads against the same pages-N.img. pi_off advances monotonically
+	 * inside one page_read instance, so a contiguous in-memory window
+	 * over [ra_start, ra_start + ra_len) absorbs subsequent reads with
+	 * zero S3 GETs as long as they fit. On a miss we refill the window
+	 * with a single GET of size max(len, ra_cap) starting at the
+	 * current pi_off.
+	 *
+	 * io_complete and pi_off advance happen exactly as in the slow
+	 * path — the buffer is purely a transport optimization. No file
+	 * is created on the local filesystem; the buffer lives only as
+	 * long as this page_read.
+	 */
+	if (pr->ra_cap > 0) {
+		off_t hit_lo = pr->pi_off;
+		off_t hit_hi = pr->pi_off + (off_t)len;
+
+		/* Fast path: requested range is already inside the window. */
+		if (pr->ra_len > 0 && hit_lo >= pr->ra_start &&
+		    hit_hi <= pr->ra_start + (off_t)pr->ra_len) {
+			memcpy(buf, (char *)pr->ra_buf + (hit_lo - pr->ra_start), len);
+			pr_debug("Object Storage: read-ahead HIT pi_off=%lu len=%lu "
+				 "(window [%ld..%ld])\n",
+				 (unsigned long)pr->pi_off, len,
+				 (long)pr->ra_start, (long)(pr->ra_start + pr->ra_len));
+			ret = 0;
+			if (pr->io_complete) {
+				ret = pr->io_complete(pr, vaddr, nr);
+				if (ret < 0) {
+					pr_err("Object Storage: io_complete failed (ra hit) for vaddr %lx\n",
+					       vaddr);
+				}
+			}
+			pr->pi_off += len;
+			return ret;
+		}
+
+		/*
+		 * Miss: refill the window. Fetch max(len, ra_cap) bytes
+		 * starting at pi_off into ra_buf, then copy the prefix the
+		 * caller asked for. If the caller's request is larger than
+		 * the window we still satisfy it by issuing a single
+		 * GET-into-ra_buf of len bytes — an oversized request can
+		 * still be served, the only loss is no future read-ahead
+		 * benefit until the next refill.
+		 */
+		{
+			size_t window = pr->ra_cap;
+			if (window < len)
+				window = len;
+			if (window > pr->ra_cap) {
+				/*
+				 * Caller wants more than our buffer can hold.
+				 * Fall back to the original direct-fetch path
+				 * for THIS call only; leave the read-ahead
+				 * window untouched so it can still serve the
+				 * NEXT call.
+				 */
+				pr_debug("Object Storage: read-ahead bypass (len=%lu > ra_cap=%lu)\n",
+					 len, pr->ra_cap);
+				goto direct_fetch;
+			}
+			ret = object_storage_fetch_range(object_key, pr->pi_off, window,
+							 pr->ra_buf, OBJSTOR_SRC_FAULT);
+			if (ret == 0) {
+				pr->ra_start = pr->pi_off;
+				pr->ra_len = window;
+				memcpy(buf, pr->ra_buf, len);
+				pr_debug("Object Storage: read-ahead REFILL "
+					 "pi_off=%lu window=%lu (consumed %lu)\n",
+					 (unsigned long)pr->pi_off, (unsigned long)window, len);
+				if (pr->io_complete) {
+					ret = pr->io_complete(pr, vaddr, nr);
+					if (ret < 0) {
+						pr_err("Object Storage: io_complete failed (ra refill) "
+						       "for vaddr %lx\n", vaddr);
+					}
+				}
+				pr->pi_off += len;
+				return ret;
+			}
+			/*
+			 * Window fetch failed. Invalidate and fall through to
+			 * the direct fetch path below, which logs the error
+			 * the same way the pre-Phase-6 code did.
+			 */
+			pr->ra_len = 0;
+			pr_warn("Object Storage: read-ahead refill failed (ret=%d), "
+				"falling back to direct fetch\n", ret);
+		}
+	}
+
+direct_fetch:
 	/* Fetch data from object storage (fault-driven path: lazy-pages
 	 * daemon is reactively pulling pages for an outstanding UFFD fault). */
 	ret = object_storage_fetch_range(object_key, pr->pi_off, len, buf, OBJSTOR_SRC_FAULT);
@@ -673,6 +769,15 @@ static void close_page_read(struct page_read *pr)
 
 	if (pr->pmes)
 		free_pagemaps(pr);
+
+	/* Phase 6: object-storage read-ahead buffer (per-page_read) */
+	if (pr->ra_buf) {
+		xfree(pr->ra_buf);
+		pr->ra_buf = NULL;
+		pr->ra_start = 0;
+		pr->ra_len = 0;
+		pr->ra_cap = 0;
+	}
 }
 
 static void reset_pagemap(struct page_read *pr)
@@ -977,6 +1082,10 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->pmes = NULL;
 	pr->pieok = false;
 	pr->disable_dedup = false;
+	pr->ra_buf = NULL;
+	pr->ra_start = 0;
+	pr->ra_len = 0;
+	pr->ra_cap = 0;
 
 	pr->pmi = open_image_at(dfd, i_typ, O_RSTR, img_id);
 	if (!pr->pmi)
@@ -1036,6 +1145,34 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		        opts.lazy_pages, opts.enable_object_storage);
 		pr->maybe_read_page = maybe_read_page_object_storage;
 		pr->pieok = false;
+
+		/*
+		 * Phase 6: per-page_read read-ahead buffer.
+		 *
+		 * cr-restore's eager pagemap walk hits maybe_read_page_object_storage()
+		 * with many small (1–37 page) sequential requests against the same
+		 * pages-N.img. Without this buffer each call pays one S3 RTT
+		 * (~25 ms same-region). The buffer absorbs subsequent reads inside
+		 * the same window — pi_off advances monotonically inside one
+		 * page_read, so a 4 MB window is large enough to cover any
+		 * realistic burst of nearby small reads while still being too
+		 * small to hurt the lazy-pages worker pool's concurrent fetches
+		 * (workers go through object_storage_fetch_range directly and
+		 * never see this buffer).
+		 *
+		 * Allocation is best-effort. If xmalloc fails, ra_cap stays 0 and
+		 * the per-call fast path falls through to the existing
+		 * single-fetch code unchanged.
+		 */
+		pr->ra_cap = 4UL << 20; /* 4 MB; see comment for sizing rationale */
+		pr->ra_buf = xmalloc(pr->ra_cap);
+		if (!pr->ra_buf) {
+			pr_warn("page_read[%u]: read-ahead buffer alloc failed; "
+				"falling back to per-call S3 fetches\n", pr->id);
+			pr->ra_cap = 0;
+		}
+		pr->ra_start = 0;
+		pr->ra_len = 0;
 	} else {
 		/* Default to local file reading */
 		pr_info("Assigning maybe_read_page_local (lazy_pages: %d, enable_object_storage: %d)\n",

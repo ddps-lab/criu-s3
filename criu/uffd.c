@@ -44,6 +44,7 @@
 #include "namespaces.h"
 #include "page-cache.h"
 #include "obstor_xfer.h"
+#include "obstor_prefetch.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
@@ -1882,6 +1883,14 @@ int cr_lazy_pages(bool daemon)
 
 	if (status_ready())
 		return -1;
+
+	/*
+	 * Phase 6: bulk-prefetch metadata images post-fork (cr-restore's
+	 * cache is in a different address space). This happens before the
+	 * daemon opens its own pagemap images via open_page_read_at().
+	 */
+	if (opts.enable_object_storage)
+		obstor_prefetch_init(opts.prefetch_workers);
 
 	/* Initialize async prefetch system if enabled */
 	if (opts.object_storage_parallel_xfer) {

@@ -20,6 +20,7 @@
 #include "img-streamer.h"
 #include "namespaces.h"
 #include "object-storage.h"
+#include "obstor_prefetch.h"
 
 bool ns_per_id = false;
 bool img_common_magic = true;
@@ -681,8 +682,41 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 				unsigned long s3_len = 0;
 				int s3_ret;
 				int mfd;
+				const void *cache_data = NULL;
+				size_t cache_len = 0;
+				bool from_cache = false;
 
-				s3_ret = object_storage_get_object(path, &s3_data, &s3_len);
+				/*
+				 * Phase 6 bulk metadata prefetch: if this file
+				 * was pre-fetched at restore/lazy-pages init, serve
+				 * it from the in-memory cache and skip the S3 GET.
+				 * On miss: if the prefetch cache is authoritative
+				 * (LIST succeeded), treat the miss as "object does
+				 * not exist" so we skip a wasted 404 round-trip
+				 * (CRIU opens many optional files that don't exist
+				 * in any given checkpoint — each one costs ~25ms on
+				 * real S3). If prefetch init failed, fall through
+				 * to the existing sync path for safety.
+				 */
+				if (obstor_prefetch_lookup(path, &cache_data, &cache_len) == 0) {
+					s3_data = xmalloc(cache_len ? cache_len : 1);
+					if (s3_data) {
+						if (cache_len)
+							memcpy(s3_data, cache_data, cache_len);
+						s3_len = cache_len;
+						s3_ret = 0;
+						from_cache = true;
+					} else {
+						s3_ret = -1;
+					}
+				} else if (obstor_prefetch_is_authoritative()) {
+					s3_data = NULL;
+					s3_len = 0;
+					s3_ret = -ENOENT;
+				} else {
+					s3_ret = object_storage_get_object(path, &s3_data, &s3_len);
+				}
+				(void)from_cache;
 				if (s3_ret == 0 && s3_data && s3_len > 0) {
 					mfd = memfd_create(path, 0);
 					if (mfd >= 0) {
