@@ -1272,10 +1272,6 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 	unsigned long len;
 	int err;
 
-	iov = pick_next_range(lpi);
-	if (!iov)
-		return 0;
-
 	/*
 	 * Object-storage parallel xfer path.
 	 *
@@ -1285,26 +1281,56 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 	 * marking each IOV_RESTORED on success. This main-loop function's
 	 * only job for such IOVs is to reap (drop_iovs) the completed ones.
 	 *
-	 * For IOVs still QUEUED/FETCHING we return 0 and let the main loop
-	 * re-poll epoll — handle_requests arms a short timeout in that case.
+	 * Drain rate matters: handle_requests() polls epoll between
+	 * xfer_pages() calls (~10 ms after restore_finished). If we drop
+	 * exactly one IOV per call, the daemon spends ~10 s after the
+	 * workers finish just walking down the list at 100 IOVs/sec.
+	 * Reap up to OBSTOR_REAP_BATCH IOVs in a single call so the drain
+	 * tracks the worker install rate, not the epoll timeout.
 	 *
-	 * If a worker fails, it resets state to NOT_REQUESTED and we fall
-	 * through to the sequential xfer path below as a safety net.
+	 * For IOVs still IOV_FETCHING we return 0 and let the main loop
+	 * re-poll epoll. For unmanaged IOVs (small filtered, NOT_REQUESTED
+	 * after worker partial failure, etc.) we fall through to the
+	 * existing sequential extract_range + uffd_handle_pages body.
 	 */
 	if (opts.enable_object_storage && opts.object_storage_parallel_xfer) {
-		if (obstor_xfer_iov_is_restored(iov->start)) {
-			/* Worker finished — drain from list */
-			return drop_iovs(lpi, iov->start, iov->end - iov->start);
+		const int OBSTOR_REAP_BATCH = 256;
+		int drained = 0;
+
+		while (drained < OBSTOR_REAP_BATCH) {
+			iov = pick_next_range(lpi);
+			if (!iov)
+				return 0;
+
+			if (obstor_xfer_iov_is_restored(iov->start)) {
+				int rc = drop_iovs(lpi, iov->start, iov->end - iov->start);
+				if (rc < 0)
+					return rc;
+				drained++;
+				continue;
+			}
+			if (obstor_xfer_iov_is_pending(iov->start)) {
+				/* A worker is actively holding this IOV. Yield to
+				 * epoll so we can come back when something happens. */
+				return 0;
+			}
+			/* Meta missing, or state is IOV_QUEUED / IOV_NOT_REQUESTED /
+			 * IOV_FAULTED (small filtered, proximity-evicted, post-failure):
+			 * fall through to sequential sync fetch as a safety net. */
+			break;
 		}
-		if (obstor_xfer_iov_is_pending(iov->start)) {
-			/* Worker holds IOV_FETCHING; re-poll with short epoll timeout */
+
+		if (drained > 0 && drained == OBSTOR_REAP_BATCH) {
+			/* Hit the per-call cap — let the main loop tick and come
+			 * back so we don't starve UFFD event handling. */
 			return 0;
 		}
-		/* Meta missing, or state is IOV_QUEUED / IOV_NOT_REQUESTED /
-		 * IOV_FAULTED (e.g. proximity-evicted, small filtered iov, or
-		 * never enqueued): fall through to sequential sync fetch as a
-		 * safety net. UFFDIO_COPY's EEXIST handling tolerates any race
-		 * with a worker that later picks up the same range. */
+		/* iov is now the head we couldn't drain; fall through to
+		 * sequential body using it. */
+	} else {
+		iov = pick_next_range(lpi);
+		if (!iov)
+			return 0;
 	}
 
 	len = min(iov->end - iov->start, lpi->xfer_len);

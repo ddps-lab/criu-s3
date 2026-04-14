@@ -733,6 +733,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "aws-secret-key", required_argument, 0, 1107 },
 		{ "aws-region", required_argument, 0, 1108 },
 		{ "object-storage-parallel-xfer", no_argument, NULL, 1109 },
+		{ "async-prefetch", no_argument, NULL, 1109 }, /* deprecated alias for backward compat with workload scripts */
 		{ "prefetch-workers", required_argument, 0, 1110 },
 		{ "cache-limit", required_argument, 0, 1111 },
 		{ "exclude-range", required_argument, 0, 1112 },
