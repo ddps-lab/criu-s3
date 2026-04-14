@@ -1115,7 +1115,16 @@ void prefetch_on_fault(void *lpi, int iov_index)
 	}
 
 #if ENABLE_PROXIMITY_REMOVAL
-	/* 2. Proximity removal: remove next PROXIMITY_WINDOW forward IOVs */
+	/* 2. Proximity removal: remove next PROXIMITY_WINDOW forward IOVs.
+	 *
+	 * CRITICAL: these IOVs are being evicted from the worker queue, but
+	 * their iov_meta entries are still in state IOV_QUEUED. If we don't
+	 * reset the state, `obstor_xfer_iov_is_pending()` will forever report
+	 * them as pending to the main-loop xfer_pages path, and the main loop
+	 * will spin on them (no worker will ever pick them up — the request
+	 * object is gone). Reset to IOV_NOT_REQUESTED so the main-loop sync
+	 * fallback path in xfer_pages can handle them.
+	 */
 	for (i = 1; i <= PROXIMITY_WINDOW; i++) {
 		int prox_idx = iov_index + i;
 		struct prefetch_request *prox_req;
@@ -1123,11 +1132,20 @@ void prefetch_on_fault(void *lpi, int iov_index)
 			break;
 		prox_req = hash_table_lookup(&request_hash_table, prox_idx);
 		if (prox_req) {
+			struct iov_meta *prox_meta;
 			list_del(&prox_req->list);
 			hash_table_remove(&request_hash_table, prox_idx);
 			xfree(prox_req);
 			queue_size--;
 			controller_stats.proximity_removed++;
+
+			/* Restore state-machine invariant:
+			 * state == QUEUED ⇒ request is in a queue. */
+			pthread_mutex_lock(&iov_meta_lock);
+			prox_meta = iov_index_map[prox_idx];
+			if (prox_meta && prox_meta->state == IOV_QUEUED)
+				prox_meta->state = IOV_NOT_REQUESTED;
+			pthread_mutex_unlock(&iov_meta_lock);
 		}
 	}
 #endif
@@ -1193,6 +1211,15 @@ bool obstor_xfer_iov_is_restored(unsigned long iov_start)
 	return restored;
 }
 
+/*
+ * "Pending" means a worker is CURRENTLY holding this IOV and is about to
+ * complete the fetch-and-install. IOV_QUEUED is deliberately NOT treated
+ * as pending: the request object may have been evicted from the priority
+ * queue by prefetch_on_fault()'s proximity removal, which leaves the meta
+ * state stale. Main-loop xfer_pages() can safely sync-fetch a QUEUED IOV
+ * as a fallback — UFFDIO_COPY's EEXIST handling tolerates any race where
+ * a worker later tries to install the same range.
+ */
 bool obstor_xfer_iov_is_pending(unsigned long iov_start)
 {
 	struct iov_meta *m;
@@ -1200,7 +1227,7 @@ bool obstor_xfer_iov_is_pending(unsigned long iov_start)
 
 	pthread_mutex_lock(&iov_meta_lock);
 	m = iov_meta_search(iov_start);
-	if (m && (m->state == IOV_QUEUED || m->state == IOV_FETCHING))
+	if (m && m->state == IOV_FETCHING)
 		pending = true;
 	pthread_mutex_unlock(&iov_meta_lock);
 

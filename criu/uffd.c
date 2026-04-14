@@ -1293,14 +1293,18 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 	 */
 	if (opts.enable_object_storage && opts.object_storage_parallel_xfer) {
 		if (obstor_xfer_iov_is_restored(iov->start)) {
+			/* Worker finished — drain from list */
 			return drop_iovs(lpi, iov->start, iov->end - iov->start);
 		}
 		if (obstor_xfer_iov_is_pending(iov->start)) {
-			/* Worker in flight; main loop will re-poll */
+			/* Worker holds IOV_FETCHING; re-poll with short epoll timeout */
 			return 0;
 		}
-		/* NOT_REQUESTED (worker failed or not yet visible):
-		 * fall through to sequential sync fetch as safety net */
+		/* Meta missing, or state is IOV_QUEUED / IOV_NOT_REQUESTED /
+		 * IOV_FAULTED (e.g. proximity-evicted, small filtered iov, or
+		 * never enqueued): fall through to sequential sync fetch as a
+		 * safety net. UFFDIO_COPY's EEXIST handling tolerates any race
+		 * with a worker that later picks up the same range. */
 	}
 
 	len = min(iov->end - iov->start, lpi->xfer_len);
