@@ -17,7 +17,7 @@
 #include <unistd.h>
 #include <limits.h>
 
-#include "prefetch.h"
+#include "obstor_xfer.h"
 #include "page-cache.h"
 #include "log.h"
 #include "xmalloc.h"
@@ -503,18 +503,11 @@ static void *prefetch_worker(void *arg)
 		/* Fetch from object storage */
 		size = req->iov_end - req->iov_start;
 
-		/* Backpressure: wait if cache + inflight is near limit */
-		if (cache_wait_for_room(size) < 0)
-			break; /* shutdown */
-
 		data = xmalloc(size);
-
 		if (!data) {
 			pr_err("Worker %d: Failed to allocate buffer for IOV\n", worker_id);
 			goto next_request;
 		}
-
-		cache_add_inflight(size);
 
 		/* Fetch from object storage */
 		ret = -1;
@@ -534,24 +527,20 @@ static void *prefetch_worker(void *arg)
 				snprintf(object_key, sizeof(object_key), "%s", image_name);
 			}
 
-			/* Fetch data from S3 */
-			pr_debug("PREFETCH: Worker %d: Fetching from S3: %s at offset %lu, size %lu\n",
+			pr_debug("obstor_xfer: Worker %d: Fetching %s offset=%lu size=%lu\n",
 				 worker_id, object_key, req->file_offset, size);
 
-			/* Prefetch worker: speculative pull-ahead, not driven by an
-			 * outstanding UFFD fault. Tag accordingly so per-source CDN
-			 * hit ratios can be computed from the FETCH_DONE log. */
+			/* Source tag kept as PREFETCH for log compatibility — this is
+			 * still a speculative pull-ahead of a yet-un-faulted IOV. */
 			ret = object_storage_fetch_range(object_key, req->file_offset, size, data,
 							 OBJSTOR_SRC_PREFETCH);
 
 			if (ret != 0) {
 				PREFETCH_WORKER_ERROR_LOG(worker_id, req->iov_index, ret);
-				pr_err("PREFETCH: Worker %d: Failed to fetch from S3: %s (ret=%d)\n",
+				pr_err("obstor_xfer: Worker %d: Fetch failed %s ret=%d\n",
 				       worker_id, object_key, ret);
 			}
 		}
-
-		cache_remove_inflight(size);
 
 		if (ret == 0) {
 			/* Check if fault handler already processed this IOV */
@@ -561,11 +550,8 @@ static void *prefetch_worker(void *arg)
 				meta = iov_index_map[req->iov_index];
 			if (meta && (meta->state == IOV_FAULTED || meta->state == IOV_RESTORED)) {
 				pthread_mutex_unlock(&iov_meta_lock);
-				xfree(data);
-				data = NULL;
-				pr_debug("Worker %d: IOV[%d] already faulted/restored, skip cache\n",
+				pr_debug("obstor_xfer: Worker %d: IOV[%d] already faulted/restored, skip\n",
 					 worker_id, req->iov_index);
-
 				pthread_mutex_lock(&stats_lock);
 				stats.failed++;
 				pthread_mutex_unlock(&stats_lock);
@@ -573,55 +559,63 @@ static void *prefetch_worker(void *arg)
 			}
 			pthread_mutex_unlock(&iov_meta_lock);
 
-			/* Store in cache (cache makes a deep copy) */
-			ret = cache_store_iov(req->iov_start, req->iov_end, req->file_offset,
-					      data, size, true);
-			xfree(data); /* Always free our buffer after cache_store */
-			data = NULL;
-			if (ret == 0) {
-				/* Update metadata */
-				iov_meta_mark_cached(req->iov_start);
+			/* Direct install: UFFDIO_COPY the fetched data straight into
+			 * the restored process address space. No cache touched. */
+			{
+				int nr_pages = (int)(size / page_size());
+				int orig_nr = nr_pages;
+				int irc = obstor_xfer_install_pages(req->lpi, req->iov_start,
+								    &nr_pages, data);
+				if (irc == 0 && nr_pages == orig_nr) {
+					/* Full success — mark RESTORED */
+					pthread_mutex_lock(&iov_meta_lock);
+					if (req->iov_index >= 0 && req->iov_index < total_iovs &&
+					    iov_index_map[req->iov_index])
+						iov_index_map[req->iov_index]->state = IOV_RESTORED;
+					pthread_mutex_unlock(&iov_meta_lock);
 
-				pthread_mutex_lock(&stats_lock);
-				stats.cache_stored++;
-				stats.bytes_prefetched += size;
-				stats.completed++;
-				if (req->iov_index >= 0 && req->iov_index < total_iovs &&
-				    iov_index_map[req->iov_index] &&
-				    iov_index_map[req->iov_index]->is_hot)
-					controller_stats.hot_vma_prefetched++;
-				pthread_mutex_unlock(&stats_lock);
+					pthread_mutex_lock(&stats_lock);
+					stats.completed++;
+					stats.bytes_prefetched += size;
+					if (req->iov_index >= 0 && req->iov_index < total_iovs &&
+					    iov_index_map[req->iov_index] &&
+					    iov_index_map[req->iov_index]->is_hot)
+						controller_stats.hot_vma_prefetched++;
+					pthread_mutex_unlock(&stats_lock);
 
-				/* Calculate worker duration and log completion */
-				clock_gettime(CLOCK_MONOTONIC, &worker_end);
-				worker_duration_ms = (worker_end.tv_sec - worker_start.tv_sec) * 1000.0 +
-						     (worker_end.tv_nsec - worker_start.tv_nsec) / 1000000.0;
-				PREFETCH_WORKER_DONE_LOG(worker_id, req->iov_index, worker_duration_ms);
-
-				pr_debug("PREFETCH: Worker %d: Successfully cached IOV\n", worker_id);
-			} else {
-				pr_err("PREFETCH: Worker %d: Failed to cache IOV\n", worker_id);
-				xfree(data); /* cache_store failed, we still own the data */
-
-				pthread_mutex_lock(&stats_lock);
-				stats.failed++;
-				pthread_mutex_unlock(&stats_lock);
+					clock_gettime(CLOCK_MONOTONIC, &worker_end);
+					worker_duration_ms =
+						(worker_end.tv_sec - worker_start.tv_sec) * 1000.0 +
+						(worker_end.tv_nsec - worker_start.tv_nsec) / 1e6;
+					PREFETCH_WORKER_DONE_LOG(worker_id, req->iov_index, worker_duration_ms);
+					pr_debug("obstor_xfer: Worker %d: Installed IOV[%d] (%d pages)\n",
+						 worker_id, req->iov_index, orig_nr);
+				} else {
+					/* Partial / failed install — leave state as FETCHING
+					 * (will be reset to NOT_REQUESTED below) so main-loop
+					 * xfer_pages sequential fallback can retry. */
+					pr_warn("obstor_xfer: Worker %d: install partial %d/%d ret=%d, "
+						"falling back to sequential xfer\n",
+						worker_id, nr_pages, orig_nr, irc);
+					pthread_mutex_lock(&stats_lock);
+					stats.failed++;
+					pthread_mutex_unlock(&stats_lock);
+				}
 			}
 		} else {
-			pr_err("PREFETCH: Worker %d: Failed to fetch IOV from storage\n", worker_id);
-			xfree(data);
-			data = NULL;
-
+			pr_err("obstor_xfer: Worker %d: Failed to fetch IOV from storage\n", worker_id);
 			pthread_mutex_lock(&stats_lock);
 			stats.failed++;
 			pthread_mutex_unlock(&stats_lock);
 		}
 
 		xfree(data);
+		data = NULL;
 
 next_request:
-		/* Reset state only if still FETCHING (i.e., fetch failed).
-		 * On success, iov_meta_mark_cached() already set IOV_CACHED. */
+		/* Reset state only if still FETCHING (fetch failed or partial install).
+		 * On success we've set IOV_RESTORED above; on FAULTED/RESTORED skip
+		 * above the check here is a no-op. */
 		pthread_mutex_lock(&iov_meta_lock);
 		meta = iov_meta_search(req->iov_start);
 		if (meta && meta->state == IOV_FETCHING)
@@ -1181,6 +1175,36 @@ void prefetch_reset_stats(void)
 	pthread_mutex_unlock(&stats_lock);
 
 	pr_debug("Prefetch statistics reset\n");
+}
+
+/* ===== Main-loop query helpers (Phase 6 direct install) ===== */
+
+bool obstor_xfer_iov_is_restored(unsigned long iov_start)
+{
+	struct iov_meta *m;
+	bool restored = false;
+
+	pthread_mutex_lock(&iov_meta_lock);
+	m = iov_meta_search(iov_start);
+	if (m && m->state == IOV_RESTORED)
+		restored = true;
+	pthread_mutex_unlock(&iov_meta_lock);
+
+	return restored;
+}
+
+bool obstor_xfer_iov_is_pending(unsigned long iov_start)
+{
+	struct iov_meta *m;
+	bool pending = false;
+
+	pthread_mutex_lock(&iov_meta_lock);
+	m = iov_meta_search(iov_start);
+	if (m && (m->state == IOV_QUEUED || m->state == IOV_FETCHING))
+		pending = true;
+	pthread_mutex_unlock(&iov_meta_lock);
+
+	return pending;
 }
 
 /* Get idle worker count */

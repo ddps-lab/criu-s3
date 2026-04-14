@@ -444,7 +444,7 @@ void init_opts(void)
 	opts.aws_region = NULL;
 
 	/* Initialize Async Prefetch options */
-	opts.async_prefetch = false;
+	opts.object_storage_parallel_xfer = false;
 	opts.prefetch_workers = 4;		/* Default 4 workers */
 	opts.cache_limit_mb = 0;		/* Default unlimited */
 
@@ -731,7 +731,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "aws-access-key", required_argument, 0, 1106 },
 		{ "aws-secret-key", required_argument, 0, 1107 },
 		{ "aws-region", required_argument, 0, 1108 },
-		{ "async-prefetch", no_argument, NULL, 1109 },
+		{ "object-storage-parallel-xfer", no_argument, NULL, 1109 },
 		{ "prefetch-workers", required_argument, 0, 1110 },
 		{ "cache-limit", required_argument, 0, 1111 },
 		{ "exclude-range", required_argument, 0, 1112 },
@@ -1114,7 +1114,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			SET_CHAR_OPTS(aws_region, optarg);
 			break;
 		case 1109:
-			opts.async_prefetch = true;
+			opts.object_storage_parallel_xfer = true;
 			break;
 		case 1110:
 			opts.prefetch_workers = atoi(optarg);
@@ -1202,7 +1202,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 	 */
 	if (opts.enable_object_storage && !opts.no_semi_sync_iov)
 		opts.semi_sync_iov = true;
-	if (opts.async_prefetch && !opts.no_hot_vma_seed)
+	if (opts.object_storage_parallel_xfer && !opts.no_hot_vma_seed)
 		opts.hot_vma_seed = true;
 
 	if (opts.enable_object_storage) {
@@ -1220,7 +1220,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		pr_info("  AWS Secret Key: %s\n", opts.aws_secret_key ? "(set)" : "(not set)");
 	}
 
-	if (opts.async_prefetch) {
+	if (opts.object_storage_parallel_xfer) {
 		pr_info("Async Prefetch Enabled\n");
 		pr_info("  Prefetch Workers: %d\n", opts.prefetch_workers);
 		pr_info("  Cache Limit: %lu MB %s\n", opts.cache_limit_mb, opts.cache_limit_mb == 0 ? "(unlimited)" : "");
