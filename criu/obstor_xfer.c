@@ -114,6 +114,16 @@ static pthread_mutex_t iov_meta_lock = PTHREAD_MUTEX_INITIALIZER;
 static int total_iovs = 0;
 static struct iov_meta **iov_index_map = NULL;  /* Fast index lookup */
 
+/*
+ * Broadcast whenever a worker transitions any iov to IOV_RESTORED or
+ * reverts IOV_FETCHING → IOV_NOT_REQUESTED. Fault handlers that caught
+ * an IOV mid-fetch (state == IOV_FETCHING) wait on this cond with a
+ * bounded timeout and re-check the specific iov's state after every
+ * wake. A single global cond is sufficient — broadcast cost is a few
+ * µs and the fault rate is O(tens) per restore.
+ */
+static pthread_cond_t iov_restored_cond = PTHREAD_COND_INITIALIZER;
+
 /* Pattern detection */
 
 /* Adaptive configuration */
@@ -560,6 +570,32 @@ static int dequeue_batch(struct obstor_batch *b, unsigned long max_bytes)
 
 out:
 	pthread_mutex_unlock(&queue_lock);
+
+	/*
+	 * Mark every request in the batch as IOV_FETCHING *before* the S3
+	 * fetch starts. Previously this transition happened inside
+	 * worker_install_one(), i.e. after the fetch had already returned,
+	 * so meta->state stayed IOV_QUEUED for the entire ~70ms S3 window
+	 * and the fault path could not tell the difference between
+	 * "still sitting in queue" and "worker is actively fetching this".
+	 *
+	 * With the transition here, a fault handler that races a worker on
+	 * the same IOV can observe IOV_FETCHING and wait on a condvar for
+	 * the worker to finish (see obstor_xfer_iov_wait_restored). Waiting
+	 * on IOV_QUEUED is deliberately NOT supported — that risks
+	 * head-of-line blocking behind a stale queue entry.
+	 */
+	{
+		int i;
+		pthread_mutex_lock(&iov_meta_lock);
+		for (i = 0; i < b->n_iovs; i++) {
+			struct iov_meta *meta = iov_meta_get_exact_locked(b->reqs[i]->iov_start);
+			if (meta && meta->state == IOV_QUEUED)
+				meta->state = IOV_FETCHING;
+		}
+		pthread_mutex_unlock(&iov_meta_lock);
+	}
+
 	return b->n_iovs;
 }
 
@@ -634,7 +670,13 @@ static int worker_install_one(int worker_id,
 	int orig_nr = nr_pages;
 	int irc;
 
-	/* Re-verify meta state right before install */
+	/*
+	 * Re-verify meta state right before install. IOV_FETCHING is set
+	 * in dequeue_batch now, so we expect to see it here — but between
+	 * dequeue and arriving at this point the fault path may have
+	 * stamped IOV_FAULTED or (via the race check) an install may
+	 * already be done. Treat those as "someone else owns it".
+	 */
 	pthread_mutex_lock(&iov_meta_lock);
 	meta = iov_meta_get_exact_locked(req->iov_start);
 	if (meta) {
@@ -645,7 +687,6 @@ static int worker_install_one(int worker_id,
 			return 1;
 		}
 		if (meta->state == IOV_FAULTED) {
-			/* Sync fault path will (or did) install this. */
 			pthread_mutex_unlock(&iov_meta_lock);
 			pr_debug("obstor_xfer: Worker %d: IOV[%d] FAULTED, skip\n",
 				 worker_id, req->iov_index);
@@ -654,18 +695,18 @@ static int worker_install_one(int worker_id,
 			pthread_mutex_unlock(&stats_lock);
 			return 1;
 		}
-		meta->state = IOV_FETCHING;
 	}
 	pthread_mutex_unlock(&iov_meta_lock);
 
 	irc = obstor_xfer_install_pages(req->lpi, req->iov_start, &nr_pages, slice_buf);
 
 	if (irc == 0 && nr_pages == orig_nr) {
-		/* Full success — mark RESTORED */
+		/* Full success — mark RESTORED and wake any fault waiter */
 		pthread_mutex_lock(&iov_meta_lock);
 		meta = iov_meta_get_exact_locked(req->iov_start);
 		if (meta)
 			meta->state = IOV_RESTORED;
+		pthread_cond_broadcast(&iov_restored_cond);
 		pthread_mutex_unlock(&iov_meta_lock);
 
 		pthread_mutex_lock(&stats_lock);
@@ -691,6 +732,8 @@ static int worker_install_one(int worker_id,
 	meta = iov_meta_get_exact_locked(req->iov_start);
 	if (meta && meta->state == IOV_FETCHING)
 		meta->state = IOV_NOT_REQUESTED;
+	/* Wake any fault waiter — they must fall back now. */
+	pthread_cond_broadcast(&iov_restored_cond);
 	pthread_mutex_unlock(&iov_meta_lock);
 
 	pthread_mutex_lock(&stats_lock);
@@ -794,20 +837,21 @@ static void *prefetch_worker(void *arg)
 			}
 		} else {
 			/* Whole batch fetch failed: revert each iov's state so
-			 * the main-loop fallback handles them. */
+			 * the main-loop fallback handles them, and wake any
+			 * fault waiters so they fall back to sync fetch. */
+			pthread_mutex_lock(&iov_meta_lock);
 			for (i = 0; i < n; i++) {
 				struct prefetch_request *r = batch.reqs[i];
-				struct iov_meta *m;
-				pthread_mutex_lock(&iov_meta_lock);
-				m = iov_meta_get_exact_locked(r->iov_start);
+				struct iov_meta *m = iov_meta_get_exact_locked(r->iov_start);
 				if (m && m->state == IOV_FETCHING)
 					m->state = IOV_NOT_REQUESTED;
-				pthread_mutex_unlock(&iov_meta_lock);
-
-				pthread_mutex_lock(&stats_lock);
-				stats.failed++;
-				pthread_mutex_unlock(&stats_lock);
 			}
+			pthread_cond_broadcast(&iov_restored_cond);
+			pthread_mutex_unlock(&iov_meta_lock);
+
+			pthread_mutex_lock(&stats_lock);
+			stats.failed += n;
+			pthread_mutex_unlock(&stats_lock);
 		}
 
 release_batch:
@@ -946,6 +990,9 @@ void prefetch_cleanup(void)
 	pthread_mutex_lock(&stats_lock);
 	PREFETCH_STATS_LOG(stats.total_requests, stats.completed, stats.failed,
 			   stats.cache_stored, stats.bytes_prefetched);
+	pr_info("FAULT_WAIT attempted=%lu absorbed=%lu timed_out=%lu not_fetching=%lu\n",
+		stats.fault_wait_attempted, stats.fault_wait_absorbed,
+		stats.fault_wait_timed_out, stats.fault_wait_not_fetching);
 	pthread_mutex_unlock(&stats_lock);
 
 	pthread_mutex_lock(&controller_stats_lock);
@@ -1436,6 +1483,112 @@ bool obstor_xfer_iov_is_pending(unsigned long iov_start)
 	pthread_mutex_unlock(&iov_meta_lock);
 
 	return pending;
+}
+
+/*
+ * Bounded wait for a worker to finish installing the IOV at iov_start.
+ *
+ * Only waits if the IOV's current meta state is IOV_FETCHING (i.e. a
+ * worker popped it out of the queue and is either fetching from S3 or
+ * about to UFFDIO_COPY). Waiting on IOV_QUEUED is deliberately not
+ * supported — a queued request may have been evicted by
+ * prefetch_on_fault() proximity removal, leaving stale meta, and would
+ * risk head-of-line blocking the fault handler.
+ *
+ * Returns:
+ *   0         — IOV reached IOV_RESTORED within the timeout. Caller
+ *               should drop the IOV from the lazy list; the page is
+ *               already installed.
+ *   -EAGAIN   — meta is not IOV_FETCHING (caller should take its own
+ *               fast path — sync fetch, zero page, etc.)
+ *   -ENOENT   — no meta for this iov_start (split remnant etc.)
+ *   -ETIMEDOUT — timeout elapsed while state was still IOV_FETCHING.
+ *               Caller should fall back to the sync fetch path.
+ */
+void obstor_xfer_account_fault_wait(int wait_rc)
+{
+	pthread_mutex_lock(&stats_lock);
+	stats.fault_wait_attempted++;
+	switch (wait_rc) {
+	case 0:
+		stats.fault_wait_absorbed++;
+		break;
+	case -ETIMEDOUT:
+		stats.fault_wait_timed_out++;
+		break;
+	case -EAGAIN:
+	case -ENOENT:
+	default:
+		stats.fault_wait_not_fetching++;
+		break;
+	}
+	pthread_mutex_unlock(&stats_lock);
+}
+
+int obstor_xfer_iov_wait_restored(unsigned long iov_start, unsigned long timeout_ms)
+{
+	struct iov_meta *m;
+	struct timespec deadline;
+	int rc = -ETIMEDOUT;
+
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += (long)(timeout_ms / 1000);
+	deadline.tv_nsec += (long)((timeout_ms % 1000) * 1000000UL);
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec += 1;
+		deadline.tv_nsec -= 1000000000L;
+	}
+
+	pthread_mutex_lock(&iov_meta_lock);
+	m = iov_meta_get_exact_locked(iov_start);
+	if (!m) {
+		pthread_mutex_unlock(&iov_meta_lock);
+		return -ENOENT;
+	}
+	if (m->state == IOV_RESTORED) {
+		pthread_mutex_unlock(&iov_meta_lock);
+		return 0;
+	}
+	if (m->state != IOV_FETCHING) {
+		pthread_mutex_unlock(&iov_meta_lock);
+		return -EAGAIN;
+	}
+
+	/*
+	 * Loop: the cond broadcasts on ANY iov state change, so we may wake
+	 * for an unrelated iov. Re-check our specific meta on every wake.
+	 * Exit on RESTORED (success), on transition out of FETCHING (worker
+	 * reverted → caller falls back), or on timeout.
+	 */
+	while (m->state == IOV_FETCHING) {
+		int cwrc = pthread_cond_timedwait(&iov_restored_cond, &iov_meta_lock, &deadline);
+
+		/* Meta pointer may have been freed during the wait only if the
+		 * whole daemon is tearing down — at that point the fault loop
+		 * is already exiting. For the normal path we re-fetch by key
+		 * in case iov_meta_get_exact_locked semantics ever evolve. */
+		m = iov_meta_get_exact_locked(iov_start);
+		if (!m) {
+			rc = -ENOENT;
+			break;
+		}
+		if (m->state == IOV_RESTORED) {
+			rc = 0;
+			break;
+		}
+		if (m->state != IOV_FETCHING) {
+			rc = -EAGAIN;
+			break;
+		}
+		if (cwrc == ETIMEDOUT) {
+			rc = -ETIMEDOUT;
+			break;
+		}
+		/* Spurious wake or unrelated iov restored — keep waiting. */
+	}
+	pthread_mutex_unlock(&iov_meta_lock);
+
+	return rc;
 }
 
 /* Get idle worker count */

@@ -1529,8 +1529,19 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		 * via direct UFFDIO_COPY between the UFFD fault firing and us picking
 		 * it up here. If so, the page is already in place and we just need
 		 * to drop the IOV from the list.
+		 *
+		 * Phase 6.1a: if meta is IOV_FETCHING the worker is already mid-
+		 * fetch/install on this exact iov. A synchronous fault-path fetch
+		 * from here would duplicate S3 traffic (both worker and fault
+		 * fetching the same range) and still pay a full ~70ms S3 wall
+		 * time — while the worker is already several ms into its fetch.
+		 * Instead wait briefly on a cond broadcast from the worker and
+		 * drop the iov on success. Timeout falls through to sync fetch so
+		 * a stuck worker can never block the fault indefinitely.
 		 */
 		if (opts.object_storage_parallel_xfer) {
+			int wait_rc;
+
 			iov_index = iov_meta_get_index_by_addr(address);
 
 			if (obstor_xfer_iov_is_restored(fetch_start)) {
@@ -1538,7 +1549,15 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 					"— UFFD wakeup race, dropping\n", fetch_start, fetch_end);
 				return drop_iovs(lpi, fetch_start, fetch_end - fetch_start);
 			}
-			/* IOV_FETCHING or IOV_NOT_REQUESTED: fall through to sync fetch */
+
+			wait_rc = obstor_xfer_iov_wait_restored(fetch_start, OBSTOR_FAULT_WAIT_MS);
+			obstor_xfer_account_fault_wait(wait_rc);
+			if (wait_rc == 0) {
+				lp_info(lpi, "Fault absorbed by worker install [0x%lx-0x%lx], "
+					"dropping IOV\n", fetch_start, fetch_end);
+				return drop_iovs(lpi, fetch_start, fetch_end - fetch_start);
+			}
+			/* -EAGAIN / -ENOENT / -ETIMEDOUT → fall through to sync fetch */
 		}
 
 		/* Synchronous fetch via existing uffd_handle_pages path */

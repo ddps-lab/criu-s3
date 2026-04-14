@@ -38,6 +38,12 @@ struct prefetch_stats {
 	unsigned long batched_iovs;          /* IOVs covered by batched GETs */
 	unsigned long batched_bytes;         /* total bytes pulled by batched GETs */
 	unsigned long batch_partial_failures;/* IOVs in a batch that failed install */
+
+	/* Phase 6.1a fault-path bounded wait stats */
+	unsigned long fault_wait_attempted;   /* fault saw IOV_FETCHING, entered wait */
+	unsigned long fault_wait_absorbed;    /* worker completed inside wait (win) */
+	unsigned long fault_wait_timed_out;   /* fell through to sync fetch */
+	unsigned long fault_wait_not_fetching;/* meta wasn't IOV_FETCHING (EAGAIN) */
 };
 
 /* IOV info for metadata initialization */
@@ -96,6 +102,27 @@ int obstor_xfer_install_pages(void *lpi_ptr, unsigned long addr, int *nr, void *
  */
 bool obstor_xfer_iov_is_restored(unsigned long iov_start);
 bool obstor_xfer_iov_is_pending(unsigned long iov_start);  /* QUEUED or FETCHING */
+
+/*
+ * Bounded wait for a worker to finish installing the IOV.
+ * Only waits while meta state is IOV_FETCHING. Returns:
+ *   0          — installed; caller should drop the iov from the list
+ *   -EAGAIN    — meta not in IOV_FETCHING (caller takes its own path)
+ *   -ENOENT    — no meta for iov_start
+ *   -ETIMEDOUT — timeout elapsed while still IOV_FETCHING
+ */
+int obstor_xfer_iov_wait_restored(unsigned long iov_start, unsigned long timeout_ms);
+
+/* Record the outcome of a bounded wait into prefetch_stats. */
+void obstor_xfer_account_fault_wait(int wait_rc);
+
+/*
+ * Timeout for the fault-path bounded wait. Sized to roughly one typical
+ * S3 range GET (~70ms for a 4MB IOV on us-west-2 standard S3); a stuck
+ * worker can never block a fault longer than this. Can be promoted to
+ * a CLI flag if measurement ever shows per-workload tuning matters.
+ */
+#define OBSTOR_FAULT_WAIT_MS 100UL
 
 /* Get idle worker count */
 
