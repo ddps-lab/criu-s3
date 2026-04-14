@@ -11,11 +11,13 @@
 
 #include <pthread.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <limits.h>
+#include <dirent.h>
 
 #include "obstor_xfer.h"
 #include "page-cache.h"
@@ -187,6 +189,29 @@ static struct iov_meta *iov_meta_search(unsigned long addr)
 	}
 
 	return candidate; /* NULL if not found */
+}
+
+/*
+ * Exact-match lookup: returns the iov_meta whose iov_start equals `addr`,
+ * never the one that just *contains* addr. Use this from main-loop
+ * helpers (is_restored / is_pending) so that a remnant of a split IOV
+ * never accidentally latches onto a different (larger) IOV's state.
+ */
+static struct iov_meta *iov_meta_get_exact_locked(unsigned long iov_start)
+{
+	struct rb_node *node = iov_meta_tree.rb_node;
+
+	while (node) {
+		struct iov_meta *meta = rb_entry(node, struct iov_meta, node);
+
+		if (iov_start < meta->iov_start)
+			node = node->rb_left;
+		else if (iov_start > meta->iov_start)
+			node = node->rb_right;
+		else
+			return meta;
+	}
+	return NULL;
 }
 
 /* Insert IOV metadata into RB-tree */
@@ -402,227 +427,396 @@ int iov_meta_get_index_by_addr(unsigned long addr)
 
 /* ========== Worker Pool (Phase 5) ========== */
 
-/* Dequeue highest priority request */
-static struct prefetch_request *dequeue_request(void)
+/* Dequeue highest priority request — caller must hold queue_lock. */
+static struct prefetch_request *dequeue_request_locked(void)
 {
 	struct prefetch_request *req = NULL;
 
-	pthread_mutex_lock(&queue_lock);
-
-	/* Check high priority queue first */
 	if (!list_empty(&queue_high)) {
 		req = list_first_entry(&queue_high, struct prefetch_request, list);
-		list_del(&req->list);
-		queue_size--;
 	} else if (!list_empty(&queue_medium)) {
 		req = list_first_entry(&queue_medium, struct prefetch_request, list);
-		list_del(&req->list);
-		queue_size--;
 	} else if (!list_empty(&queue_low)) {
 		req = list_first_entry(&queue_low, struct prefetch_request, list);
+	}
+
+	if (req) {
 		list_del(&req->list);
 		queue_size--;
 	}
-
-	pthread_mutex_unlock(&queue_lock);
-
 	return req;
+}
+
+/* dequeue_request() (the unlocked wrapper) is unused now that workers go
+ * through dequeue_batch(); keep dequeue_request_locked() for the batch
+ * implementation and drop the wrapper to silence -Wunused-function. */
+
+/* ========== Phase 6: Batch coalescing ==========
+ *
+ * dequeue_batch() pops one head request from the highest-priority non-empty
+ * queue, then walks forward by iov_index using the hash table, batching
+ * together adjacent requests that satisfy ALL of:
+ *
+ *   - same pages_img_id (same dump file)
+ *   - same priority class as the head (high / medium / low)
+ *   - contiguous file_offset (no gap)
+ *   - contiguous virtual range (next->iov_start == prev->iov_end)
+ *   - cumulative bytes ≤ max_bytes (default 64 MB, configurable)
+ *
+ * The whole pop is performed under queue_lock so no other worker can claim
+ * the same range concurrently. Each popped request is removed from the hash
+ * table as well. Per-IOV state (IOV_FETCHING) is set under iov_meta_lock by
+ * the worker AFTER this function returns.
+ *
+ * Returns the number of requests in the batch (≥ 1 on success, 0 if no work).
+ */
+
+#define OBSTOR_BATCH_MAX_IOVS 256  /* Hard cap to keep arrays small */
+
+struct obstor_batch {
+	int n_iovs;
+	struct prefetch_request *reqs[OBSTOR_BATCH_MAX_IOVS];
+	unsigned long total_bytes;
+	unsigned long base_offset; /* file_offset of head IOV */
+	unsigned long base_vaddr;  /* iov_start of head IOV */
+	unsigned int pages_img_id;
+	int head_priority;
+};
+
+static int priority_class(int p)
+{
+	if (p >= 70) return 2;
+	if (p >= 40) return 1;
+	return 0;
+}
+
+static int dequeue_batch(struct obstor_batch *b, unsigned long max_bytes)
+{
+	struct prefetch_request *head;
+	int next_idx;
+
+	memset(b, 0, sizeof(*b));
+
+	pthread_mutex_lock(&queue_lock);
+
+	head = dequeue_request_locked();
+	if (!head) {
+		pthread_mutex_unlock(&queue_lock);
+		return 0;
+	}
+
+	hash_table_remove(&request_hash_table, head->iov_index);
+
+	b->reqs[0] = head;
+	b->n_iovs = 1;
+	b->total_bytes = head->iov_end - head->iov_start;
+	b->base_offset = head->file_offset;
+	b->base_vaddr = head->iov_start;
+	b->pages_img_id = head->pages_img_id;
+	b->head_priority = head->priority;
+
+	if (max_bytes == 0 || b->total_bytes >= max_bytes)
+		goto out;
+
+	/* Walk forward looking for adjacent requests in the hash table.
+	 * Uses iov_index ordering, which mirrors the original VMA walk
+	 * order from collect_iovs(); adjacent indices map to adjacent
+	 * file_offsets in the typical case. */
+	next_idx = head->iov_index + 1;
+	while (b->n_iovs < OBSTOR_BATCH_MAX_IOVS) {
+		struct prefetch_request *next;
+		unsigned long next_size;
+		unsigned long expected_offset;
+		unsigned long expected_vaddr;
+
+		next = hash_table_lookup(&request_hash_table, next_idx);
+		if (!next)
+			break;
+		if (next->pages_img_id != b->pages_img_id)
+			break;
+		if (priority_class(next->priority) != priority_class(b->head_priority))
+			break;
+
+		expected_offset = b->base_offset + b->total_bytes;
+		expected_vaddr = b->base_vaddr + b->total_bytes;
+		if (next->file_offset != expected_offset)
+			break;
+		if (next->iov_start != expected_vaddr)
+			break;
+
+		next_size = next->iov_end - next->iov_start;
+		if (b->total_bytes + next_size > max_bytes)
+			break;
+
+		/* Eligible — pop it */
+		list_del(&next->list);
+		hash_table_remove(&request_hash_table, next_idx);
+		queue_size--;
+
+		b->reqs[b->n_iovs++] = next;
+		b->total_bytes += next_size;
+		next_idx++;
+	}
+
+out:
+	pthread_mutex_unlock(&queue_lock);
+	return b->n_iovs;
+}
+
+/*
+ * NIC speed -based default for prefetch_workers when --prefetch-workers is
+ * not given (or set to 0). Walks /sys/class/net to find the highest-speed
+ * non-loopback interface; assumes ~100 MB/s = 800 Mbps per worker stream;
+ * caps at 32. Falls back to 8 if detection fails (virtual NIC reports -1,
+ * etc).
+ */
+#define OBSTOR_DEFAULT_WORKERS_FALLBACK 8
+#define OBSTOR_DEFAULT_WORKERS_CAP 32
+
+static int detect_default_workers(void)
+{
+	DIR *d;
+	struct dirent *e;
+	int best = 0;
+
+	d = opendir("/sys/class/net");
+	if (!d)
+		return OBSTOR_DEFAULT_WORKERS_FALLBACK;
+
+	while ((e = readdir(d))) {
+		char path[PATH_MAX];
+		FILE *f;
+		int speed_mbps;
+
+		if (e->d_name[0] == '.')
+			continue;
+		if (!strcmp(e->d_name, "lo"))
+			continue;
+
+		snprintf(path, sizeof(path), "/sys/class/net/%s/speed", e->d_name);
+		f = fopen(path, "r");
+		if (!f)
+			continue;
+		if (fscanf(f, "%d", &speed_mbps) == 1 && speed_mbps > 0) {
+			/* per-worker ~800 Mbps */
+			int w = speed_mbps / 800;
+			if (w > best)
+				best = w;
+		}
+		fclose(f);
+	}
+	closedir(d);
+
+	if (best <= 0)
+		return OBSTOR_DEFAULT_WORKERS_FALLBACK;
+	if (best > OBSTOR_DEFAULT_WORKERS_CAP)
+		return OBSTOR_DEFAULT_WORKERS_CAP;
+	return best;
+}
+
+/*
+ * Per-IOV install for one batch element. Looks up the meta by exact
+ * iov_start (so a remnant or unrelated containing iov never hijacks our
+ * decision), refuses to install if the meta is already in a terminal
+ * state set by another path, then UFFDIO_COPYs the slice and updates
+ * meta + stats. Returns 1 if the iov was installed (or already done by
+ * someone else), 0 if it failed and the main loop should retry it.
+ *
+ * Caller must NOT hold iov_meta_lock; this function takes it internally.
+ */
+static int worker_install_one(int worker_id,
+			      struct prefetch_request *req,
+			      void *slice_buf,
+			      unsigned long slice_size)
+{
+	struct iov_meta *meta;
+	int nr_pages = (int)(slice_size / page_size());
+	int orig_nr = nr_pages;
+	int irc;
+
+	/* Re-verify meta state right before install */
+	pthread_mutex_lock(&iov_meta_lock);
+	meta = iov_meta_get_exact_locked(req->iov_start);
+	if (meta) {
+		if (meta->state == IOV_RESTORED) {
+			pthread_mutex_unlock(&iov_meta_lock);
+			pr_debug("obstor_xfer: Worker %d: IOV[%d] already restored, skip\n",
+				 worker_id, req->iov_index);
+			return 1;
+		}
+		if (meta->state == IOV_FAULTED) {
+			/* Sync fault path will (or did) install this. */
+			pthread_mutex_unlock(&iov_meta_lock);
+			pr_debug("obstor_xfer: Worker %d: IOV[%d] FAULTED, skip\n",
+				 worker_id, req->iov_index);
+			pthread_mutex_lock(&stats_lock);
+			stats.failed++;
+			pthread_mutex_unlock(&stats_lock);
+			return 1;
+		}
+		meta->state = IOV_FETCHING;
+	}
+	pthread_mutex_unlock(&iov_meta_lock);
+
+	irc = obstor_xfer_install_pages(req->lpi, req->iov_start, &nr_pages, slice_buf);
+
+	if (irc == 0 && nr_pages == orig_nr) {
+		/* Full success — mark RESTORED */
+		pthread_mutex_lock(&iov_meta_lock);
+		meta = iov_meta_get_exact_locked(req->iov_start);
+		if (meta)
+			meta->state = IOV_RESTORED;
+		pthread_mutex_unlock(&iov_meta_lock);
+
+		pthread_mutex_lock(&stats_lock);
+		stats.completed++;
+		stats.bytes_prefetched += slice_size;
+		if (meta && meta->is_hot)
+			controller_stats.hot_vma_prefetched++;
+		pthread_mutex_unlock(&stats_lock);
+
+		PREFETCH_WORKER_DONE_LOG(worker_id, req->iov_index, 0);
+		pr_debug("obstor_xfer: Worker %d: Installed IOV[%d] (%d pages)\n",
+			 worker_id, req->iov_index, orig_nr);
+		return 1;
+	}
+
+	/* Partial or failed install: revert state, count as partial failure,
+	 * let the main-loop sequential fallback handle this iov later. */
+	pr_warn("obstor_xfer: Worker %d: install partial %d/%d ret=%d for IOV[%d], "
+		"reverting to NOT_REQUESTED\n",
+		worker_id, nr_pages, orig_nr, irc, req->iov_index);
+
+	pthread_mutex_lock(&iov_meta_lock);
+	meta = iov_meta_get_exact_locked(req->iov_start);
+	if (meta && meta->state == IOV_FETCHING)
+		meta->state = IOV_NOT_REQUESTED;
+	pthread_mutex_unlock(&iov_meta_lock);
+
+	pthread_mutex_lock(&stats_lock);
+	stats.failed++;
+	stats.batch_partial_failures++;
+	pthread_mutex_unlock(&stats_lock);
+	return 0;
 }
 
 /* Worker thread function */
 static void *prefetch_worker(void *arg)
 {
 	int worker_id = (int)(long)arg;
+	struct obstor_batch batch;
 
 	pr_debug("Worker %d started\n", worker_id);
 
 	while (workers_running) {
-		struct prefetch_request *req;
-		struct iov_meta *meta;
-		unsigned long size;
-		void *data;
-		int ret;
+		struct prefetch_request *head;
+		void *data = NULL;
+		int ret = -1;
+		int n;
+		int i;
 		struct timespec ts;
-		struct timespec worker_start, worker_end;
-		double worker_duration_ms;
+		char object_key[PATH_MAX];
+		char image_name[64];
+		unsigned long offset_in_buf;
 
 		/* Wait for work or timeout */
 		pthread_mutex_lock(&queue_lock);
-
 		while (workers_running &&
 		       list_empty(&queue_high) &&
 		       list_empty(&queue_medium) &&
 		       list_empty(&queue_low)) {
 			clock_gettime(CLOCK_REALTIME, &ts);
 			ts.tv_sec += 1;  /* 1 second timeout */
-
 			pthread_cond_timedwait(&queue_cond, &queue_lock, &ts);
 		}
-
 		pthread_mutex_unlock(&queue_lock);
 
 		if (!workers_running)
 			break;
 
-		/* Dequeue request */
-		req = dequeue_request();
-		if (!req)
+		/* Atomic batch dequeue: head + adjacent contiguous IOVs */
+		n = dequeue_batch(&batch, opts.prefetch_batch_bytes);
+		if (n == 0)
 			continue;
 
-		/* Remove from hash table (controller uses hash for O(1) lookup) */
-		pthread_mutex_lock(&queue_lock);
-		hash_table_remove(&request_hash_table, req->iov_index);
-		pthread_mutex_unlock(&queue_lock);
+		head = batch.reqs[0];
 
-		/* Check metadata */
-		pthread_mutex_lock(&iov_meta_lock);
-		meta = iov_meta_search(req->iov_start);
+		PREFETCH_WORKER_START_LOG(worker_id, head->iov_index);
+		pr_debug("obstor_xfer: Worker %d: batch of %d IOVs (%lu bytes), "
+			 "head IOV[%d] [0x%lx-...]\n",
+			 worker_id, n, batch.total_bytes,
+			 head->iov_index, head->iov_start);
 
-		if (meta) {
-			/* Skip if already in cache */
-			if (meta->state >= IOV_CACHED) {
-				pthread_mutex_unlock(&iov_meta_lock);
-				pr_debug("PREFETCH: Worker %d: IOV[%d] already in cache, skipping\n",
-					 worker_id, req->iov_index);
-				xfree(req);
-				continue;
-			}
-
-			/* Set prefetching flag */
-			meta->state = IOV_FETCHING;
-		}
-		pthread_mutex_unlock(&iov_meta_lock);
-
-		/* Log worker start for simulation and record start time */
-		clock_gettime(CLOCK_MONOTONIC, &worker_start);
-		PREFETCH_WORKER_START_LOG(worker_id, req->iov_index);
-
-		pr_debug("PREFETCH: Worker %d processing IOV [0x%lx-0x%lx] priority=%d\n",
-			 worker_id, req->iov_start, req->iov_end, req->priority);
-
-		/* Fetch from object storage */
-		size = req->iov_end - req->iov_start;
-
-		data = xmalloc(size);
+		data = xmalloc(batch.total_bytes);
 		if (!data) {
-			pr_err("Worker %d: Failed to allocate buffer for IOV\n", worker_id);
-			goto next_request;
+			pr_err("Worker %d: Failed to allocate %lu byte batch buffer\n",
+			       worker_id, batch.total_bytes);
+			goto release_batch;
 		}
-
-		/* Fetch from object storage */
-		ret = -1;
 
 		if (opts.enable_object_storage) {
-			char object_key[PATH_MAX];
-			char image_name[64];
-
-			/* Construct image name using pages_img_id */
-			snprintf(image_name, sizeof(image_name), "pages-%u.img", req->pages_img_id);
-
-			/* Construct object key with prefix if available */
-			if (opts.object_storage_object_prefix && strlen(opts.object_storage_object_prefix) > 0) {
+			snprintf(image_name, sizeof(image_name), "pages-%u.img", batch.pages_img_id);
+			if (opts.object_storage_object_prefix && strlen(opts.object_storage_object_prefix) > 0)
 				snprintf(object_key, sizeof(object_key), "%s%s",
 					 opts.object_storage_object_prefix, image_name);
-			} else {
+			else
 				snprintf(object_key, sizeof(object_key), "%s", image_name);
-			}
 
-			pr_debug("obstor_xfer: Worker %d: Fetching %s offset=%lu size=%lu\n",
-				 worker_id, object_key, req->file_offset, size);
+			pr_debug("obstor_xfer: Worker %d: Fetching %s offset=%lu size=%lu (n=%d)\n",
+				 worker_id, object_key, batch.base_offset, batch.total_bytes, n);
 
-			/* Source tag kept as PREFETCH for log compatibility — this is
-			 * still a speculative pull-ahead of a yet-un-faulted IOV. */
-			ret = object_storage_fetch_range(object_key, req->file_offset, size, data,
+			ret = object_storage_fetch_range(object_key, batch.base_offset,
+							 batch.total_bytes, data,
 							 OBJSTOR_SRC_PREFETCH);
-
 			if (ret != 0) {
-				PREFETCH_WORKER_ERROR_LOG(worker_id, req->iov_index, ret);
-				pr_err("obstor_xfer: Worker %d: Fetch failed %s ret=%d\n",
+				PREFETCH_WORKER_ERROR_LOG(worker_id, head->iov_index, ret);
+				pr_err("obstor_xfer: Worker %d: batch fetch failed %s ret=%d\n",
 				       worker_id, object_key, ret);
 			}
 		}
 
+		/* Stats: count this as one batch (always, even on failure) */
+		pthread_mutex_lock(&stats_lock);
+		if (n > 1) {
+			stats.batches_issued++;
+			stats.batched_iovs += n;
+			stats.batched_bytes += batch.total_bytes;
+		}
+		pthread_mutex_unlock(&stats_lock);
+
 		if (ret == 0) {
-			/* Check if fault handler already processed this IOV */
-			pthread_mutex_lock(&iov_meta_lock);
-			meta = NULL;
-			if (req->iov_index >= 0 && req->iov_index < total_iovs)
-				meta = iov_index_map[req->iov_index];
-			if (meta && (meta->state == IOV_FAULTED || meta->state == IOV_RESTORED)) {
+			offset_in_buf = 0;
+			for (i = 0; i < n; i++) {
+				struct prefetch_request *r = batch.reqs[i];
+				unsigned long slice_size = r->iov_end - r->iov_start;
+				worker_install_one(worker_id, r, (char *)data + offset_in_buf, slice_size);
+				offset_in_buf += slice_size;
+			}
+		} else {
+			/* Whole batch fetch failed: revert each iov's state so
+			 * the main-loop fallback handles them. */
+			for (i = 0; i < n; i++) {
+				struct prefetch_request *r = batch.reqs[i];
+				struct iov_meta *m;
+				pthread_mutex_lock(&iov_meta_lock);
+				m = iov_meta_get_exact_locked(r->iov_start);
+				if (m && m->state == IOV_FETCHING)
+					m->state = IOV_NOT_REQUESTED;
 				pthread_mutex_unlock(&iov_meta_lock);
-				pr_debug("obstor_xfer: Worker %d: IOV[%d] already faulted/restored, skip\n",
-					 worker_id, req->iov_index);
+
 				pthread_mutex_lock(&stats_lock);
 				stats.failed++;
 				pthread_mutex_unlock(&stats_lock);
-				goto next_request;
 			}
-			pthread_mutex_unlock(&iov_meta_lock);
-
-			/* Direct install: UFFDIO_COPY the fetched data straight into
-			 * the restored process address space. No cache touched. */
-			{
-				int nr_pages = (int)(size / page_size());
-				int orig_nr = nr_pages;
-				int irc = obstor_xfer_install_pages(req->lpi, req->iov_start,
-								    &nr_pages, data);
-				if (irc == 0 && nr_pages == orig_nr) {
-					/* Full success — mark RESTORED */
-					pthread_mutex_lock(&iov_meta_lock);
-					if (req->iov_index >= 0 && req->iov_index < total_iovs &&
-					    iov_index_map[req->iov_index])
-						iov_index_map[req->iov_index]->state = IOV_RESTORED;
-					pthread_mutex_unlock(&iov_meta_lock);
-
-					pthread_mutex_lock(&stats_lock);
-					stats.completed++;
-					stats.bytes_prefetched += size;
-					if (req->iov_index >= 0 && req->iov_index < total_iovs &&
-					    iov_index_map[req->iov_index] &&
-					    iov_index_map[req->iov_index]->is_hot)
-						controller_stats.hot_vma_prefetched++;
-					pthread_mutex_unlock(&stats_lock);
-
-					clock_gettime(CLOCK_MONOTONIC, &worker_end);
-					worker_duration_ms =
-						(worker_end.tv_sec - worker_start.tv_sec) * 1000.0 +
-						(worker_end.tv_nsec - worker_start.tv_nsec) / 1e6;
-					PREFETCH_WORKER_DONE_LOG(worker_id, req->iov_index, worker_duration_ms);
-					pr_debug("obstor_xfer: Worker %d: Installed IOV[%d] (%d pages)\n",
-						 worker_id, req->iov_index, orig_nr);
-				} else {
-					/* Partial / failed install — leave state as FETCHING
-					 * (will be reset to NOT_REQUESTED below) so main-loop
-					 * xfer_pages sequential fallback can retry. */
-					pr_warn("obstor_xfer: Worker %d: install partial %d/%d ret=%d, "
-						"falling back to sequential xfer\n",
-						worker_id, nr_pages, orig_nr, irc);
-					pthread_mutex_lock(&stats_lock);
-					stats.failed++;
-					pthread_mutex_unlock(&stats_lock);
-				}
-			}
-		} else {
-			pr_err("obstor_xfer: Worker %d: Failed to fetch IOV from storage\n", worker_id);
-			pthread_mutex_lock(&stats_lock);
-			stats.failed++;
-			pthread_mutex_unlock(&stats_lock);
 		}
 
-		xfree(data);
-		data = NULL;
-
-next_request:
-		/* Reset state only if still FETCHING (fetch failed or partial install).
-		 * On success we've set IOV_RESTORED above; on FAULTED/RESTORED skip
-		 * above the check here is a no-op. */
-		pthread_mutex_lock(&iov_meta_lock);
-		meta = iov_meta_search(req->iov_start);
-		if (meta && meta->state == IOV_FETCHING)
-			meta->state = IOV_NOT_REQUESTED;
-		pthread_mutex_unlock(&iov_meta_lock);
-
-		xfree(req);
+release_batch:
+		if (data) {
+			xfree(data);
+			data = NULL;
+		}
+		for (i = 0; i < n; i++)
+			xfree(batch.reqs[i]);
 	}
 
 	pr_debug("Worker %d exiting\n", worker_id);
@@ -638,11 +832,13 @@ int prefetch_init(int num_worker_threads)
 	int i;
 
 	if (num_worker_threads <= 0) {
-		pr_err("Invalid number of workers: %d\n", num_worker_threads);
-		return -EINVAL;
+		num_worker_threads = detect_default_workers();
+		pr_info("obstor_xfer: auto-detected %d worker threads (NIC speed)\n",
+			num_worker_threads);
 	}
 
-	pr_info("Initializing prefetch system with %d workers\n", num_worker_threads);
+	pr_info("Initializing prefetch system with %d workers (batch_bytes=%lu)\n",
+		num_worker_threads, opts.prefetch_batch_bytes);
 
 	/* Reset statistics */
 	memset(&stats, 0, sizeof(stats));
@@ -1197,13 +1393,19 @@ void prefetch_reset_stats(void)
 
 /* ===== Main-loop query helpers (Phase 6 direct install) ===== */
 
+/*
+ * Exact-start match only: a remnant of a split IOV (whose iov_start no
+ * longer equals any meta's iov_start) is treated as "no meta", so the
+ * main loop falls through to the sequential fallback rather than
+ * latching onto an unrelated containing meta.
+ */
 bool obstor_xfer_iov_is_restored(unsigned long iov_start)
 {
 	struct iov_meta *m;
 	bool restored = false;
 
 	pthread_mutex_lock(&iov_meta_lock);
-	m = iov_meta_search(iov_start);
+	m = iov_meta_get_exact_locked(iov_start);
 	if (m && m->state == IOV_RESTORED)
 		restored = true;
 	pthread_mutex_unlock(&iov_meta_lock);
@@ -1219,6 +1421,8 @@ bool obstor_xfer_iov_is_restored(unsigned long iov_start)
  * state stale. Main-loop xfer_pages() can safely sync-fetch a QUEUED IOV
  * as a fallback — UFFDIO_COPY's EEXIST handling tolerates any race where
  * a worker later tries to install the same range.
+ *
+ * Uses exact-start match for the same reason as is_restored.
  */
 bool obstor_xfer_iov_is_pending(unsigned long iov_start)
 {
@@ -1226,7 +1430,7 @@ bool obstor_xfer_iov_is_pending(unsigned long iov_start)
 	bool pending = false;
 
 	pthread_mutex_lock(&iov_meta_lock);
-	m = iov_meta_search(iov_start);
+	m = iov_meta_get_exact_locked(iov_start);
 	if (m && m->state == IOV_FETCHING)
 		pending = true;
 	pthread_mutex_unlock(&iov_meta_lock);

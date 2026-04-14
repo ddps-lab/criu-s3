@@ -1859,7 +1859,8 @@ int cr_lazy_pages(bool daemon)
 
 	/* Initialize async prefetch system if enabled */
 	if (opts.object_storage_parallel_xfer) {
-		int num_workers = opts.prefetch_workers > 0 ? opts.prefetch_workers : 8;  /* 8 workers for optimal throughput */
+		/* prefetch_init() will NIC-auto-detect when num_workers <= 0 */
+		int num_workers = opts.prefetch_workers;
 		unsigned long cache_limit = opts.cache_limit_mb;
 
 		/* Initialize page cache.

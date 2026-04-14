@@ -32,6 +32,12 @@ struct prefetch_stats {
 	unsigned long cache_stored;
 	unsigned long ahead_count;
 	unsigned long bytes_prefetched;
+
+	/* Phase 6 batch coalescing stats */
+	unsigned long batches_issued;        /* number of multi-IOV S3 GETs */
+	unsigned long batched_iovs;          /* IOVs covered by batched GETs */
+	unsigned long batched_bytes;         /* total bytes pulled by batched GETs */
+	unsigned long batch_partial_failures;/* IOVs in a batch that failed install */
 };
 
 /* IOV info for metadata initialization */

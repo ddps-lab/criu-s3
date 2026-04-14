@@ -445,8 +445,9 @@ void init_opts(void)
 
 	/* Initialize Async Prefetch options */
 	opts.object_storage_parallel_xfer = false;
-	opts.prefetch_workers = 4;		/* Default 4 workers */
+	opts.prefetch_workers = 0;		/* 0 = auto-detect from NIC speed */
 	opts.cache_limit_mb = 0;		/* Default unlimited */
+	opts.prefetch_batch_bytes = 64UL * 1024 * 1024;  /* 64 MB default; 0 disables batching */
 
 	/* Initialize exclude ranges */
 	INIT_LIST_HEAD(&opts.exclude_ranges);
@@ -741,6 +742,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "object-storage-upload", no_argument, NULL, 1116 },
 		{ "no-semi-sync-iov", no_argument, NULL, 1117 },
 		{ "no-hot-vma-seed", no_argument, NULL, 1118 },
+		{ "prefetch-batch-bytes", required_argument, 0, 1119 },
 		{},
 	};
 
@@ -1118,8 +1120,8 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			break;
 		case 1110:
 			opts.prefetch_workers = atoi(optarg);
-			if (opts.prefetch_workers <= 0) {
-				pr_err("Invalid prefetch workers: %s (must be > 0)\n", optarg);
+			if (opts.prefetch_workers < 0) {
+				pr_err("Invalid prefetch workers: %s (use 0 for auto-detect)\n", optarg);
 				return 1;
 			}
 			break;
@@ -1182,6 +1184,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			break;
 		case 1118:
 			opts.no_hot_vma_seed = true;
+			break;
+		case 1119:
+			opts.prefetch_batch_bytes = strtoul(optarg, NULL, 10);
 			break;
 		default:
 			return 2;
