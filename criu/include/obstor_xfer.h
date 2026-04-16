@@ -29,7 +29,6 @@ struct prefetch_stats {
 	unsigned long total_requests;
 	unsigned long completed;
 	unsigned long failed;
-	unsigned long cache_stored;
 	unsigned long ahead_count;
 	unsigned long bytes_prefetched;
 

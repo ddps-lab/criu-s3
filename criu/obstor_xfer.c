@@ -20,7 +20,6 @@
 #include <dirent.h>
 
 #include "obstor_xfer.h"
-#include "page-cache.h"
 #include "log.h"
 #include "xmalloc.h"
 #include "object-storage.h"
@@ -65,7 +64,7 @@
  *       └──[eviction]── NOT_REQUESTED
  *
  * FAULTED: fault handler started sync fetch (UFFDIO_COPY pending).
- *          Worker skips cache_store if state is FAULTED or RESTORED.
+ *          Worker skips install if state is FAULTED or RESTORED.
  * RESTORED: UFFDIO_COPY completed. Terminal. No further transitions.
  */
 enum iov_state {
@@ -928,7 +927,6 @@ void prefetch_cleanup(void)
 
 	/* Stop workers */
 	workers_running = false;
-	cache_set_shutdown(); /* Unblock workers waiting in cache_wait_for_room */
 
 	/* Wake up all workers */
 	pthread_mutex_lock(&queue_lock);
@@ -988,8 +986,8 @@ void prefetch_cleanup(void)
 
 	/* Print summary stats */
 	pthread_mutex_lock(&stats_lock);
-	PREFETCH_STATS_LOG(stats.total_requests, stats.completed, stats.failed,
-			   stats.cache_stored, stats.bytes_prefetched);
+	pr_info("PREFETCH requests=%lu completed=%lu failed=%lu bytes=%lu\n",
+		stats.total_requests, stats.completed, stats.failed, stats.bytes_prefetched);
 	pr_info("FAULT_WAIT attempted=%lu absorbed=%lu timed_out=%lu not_fetching=%lu\n",
 		stats.fault_wait_attempted, stats.fault_wait_absorbed,
 		stats.fault_wait_timed_out, stats.fault_wait_not_fetching);

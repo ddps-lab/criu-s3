@@ -103,7 +103,6 @@ obj-y			+= pidfd-store.o
 obj-y			+= hugetlb.o
 obj-y			+= pidfd.o
 obj-y			+= object-storage.o
-obj-y			+= page-cache.o
 obj-y			+= hash-table.o
 obj-y			+= obstor_xfer.o
 obj-y			+= obstor_prefetch.o
