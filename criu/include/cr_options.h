@@ -273,7 +273,6 @@ struct cr_options {
 	bool hot_vma_seed;		/* hot VMA priority seeding (default: true when object_storage_parallel_xfer) */
 	bool no_hot_vma_seed;		/* explicit --no-hot-vma-seed was given */
 	int prefetch_workers;
-	unsigned long cache_limit_mb;
 	unsigned long prefetch_batch_bytes; /* obstor_xfer worker batch coalescing limit (0 = disabled) */
 
 	/* Hot VMA exclude ranges for pre-dump */

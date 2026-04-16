@@ -604,7 +604,6 @@ usage:
 	       "  --prefetch-workers N          number of prefetch worker threads (0 = auto-detect from NIC)\n"
 	       "  --prefetch-batch-bytes N      coalesce adjacent IOVs into a single S3 GET up to N bytes\n"
 	       "                                (default 67108864 = 64 MB; set 0 to disable batching)\n"
-	       "  --cache-limit N               page cache size limit in MB (default: 0=unlimited)\n"
 	       "\n"
 	       "Hot VMA options (for dump/pre-dump):\n"
 	       "  --exclude-range START:END     exclude address range from pre-dump (hex)\n"

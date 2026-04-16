@@ -446,7 +446,6 @@ void init_opts(void)
 	/* Initialize Async Prefetch options */
 	opts.object_storage_parallel_xfer = false;
 	opts.prefetch_workers = 0;		/* 0 = auto-detect from NIC speed */
-	opts.cache_limit_mb = 0;		/* Default unlimited */
 	opts.prefetch_batch_bytes = 64UL * 1024 * 1024;  /* 64 MB default; 0 disables batching */
 
 	/* Initialize exclude ranges */
@@ -735,7 +734,6 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "object-storage-parallel-xfer", no_argument, NULL, 1109 },
 		{ "async-prefetch", no_argument, NULL, 1109 }, /* deprecated alias for backward compat with workload scripts */
 		{ "prefetch-workers", required_argument, 0, 1110 },
-		{ "cache-limit", required_argument, 0, 1111 },
 		{ "exclude-range", required_argument, 0, 1112 },
 		{ "exclude-file", required_argument, 0, 1113 },
 		{ "no-parent-range", required_argument, 0, 1114 },
@@ -1126,9 +1124,6 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 				return 1;
 			}
 			break;
-		case 1111:
-			opts.cache_limit_mb = strtoul(optarg, NULL, 10);
-			break;
 		case 1112: {
 			struct exclude_range *er = xzalloc(sizeof(*er));
 			if (!er)
@@ -1229,7 +1224,6 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 	if (opts.object_storage_parallel_xfer) {
 		pr_info("Async Prefetch Enabled\n");
 		pr_info("  Prefetch Workers: %d\n", opts.prefetch_workers);
-		pr_info("  Cache Limit: %lu MB %s\n", opts.cache_limit_mb, opts.cache_limit_mb == 0 ? "(unlimited)" : "");
 		pr_info("  Hot VMA Seed: %s\n", opts.hot_vma_seed ? "enabled" : "disabled");
 	}
 
