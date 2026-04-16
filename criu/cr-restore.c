@@ -82,6 +82,7 @@
 #include "apparmor.h"
 #include "pidfd.h"
 #include "object-storage.h"
+#include "obstor_prefetch.h"
 
 #include "parasite-syscall.h"
 #include "files-reg.h"
@@ -2377,6 +2378,16 @@ int cr_restore_tasks(void)
 
 	if (init_service_fd())
 		return 1;
+
+	/*
+	 * Phase 6: bulk-prefetch all metadata image files from object storage
+	 * BEFORE any open_image_at() call. Without this, cr-restore serially
+	 * pays ~125ms per metadata file (inventory/pstree/ids/core/mm/...),
+	 * ~4.3s on mc-4gb. The prefetch runs one S3 LIST then drains the key
+	 * set through a bounded pthread worker pool.
+	 */
+	if (opts.enable_object_storage)
+		obstor_prefetch_init(opts.prefetch_workers);
 
 	if (check_img_inventory(/* restore = */ true) < 0)
 		goto err;

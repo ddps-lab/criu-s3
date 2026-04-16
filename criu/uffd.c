@@ -43,7 +43,8 @@
 #include "util.h"
 #include "namespaces.h"
 #include "page-cache.h"
-#include "prefetch.h"
+#include "obstor_xfer.h"
+#include "obstor_prefetch.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
@@ -789,7 +790,7 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 	lp_debug(lpi, "Found %ld pages to be handled by UFFD\n", lpi->total_pages);
 
 	/* Initialize IOV metadata for async prefetch */
-	if (opts.async_prefetch) {
+	if (opts.object_storage_parallel_xfer) {
 		struct lazy_iov *iov;
 		struct iov_info *iov_array;
 		int num_iovs = 0;
@@ -1071,12 +1072,14 @@ static int __uffd_copy_with_retry(struct lazy_pages_info *lpi, __u64 address,
 		lp_perror(lpi, "%s: fatal error at 0x%llx, mcopy_rc:%ld",
 			  label, cur_dst, (long)uffdio_copy.copy);
 		*nr_pages = total_copied / ps;
-		lpi->copied_pages += *nr_pages;
+		/* Atomic: multiple obstor_xfer workers may race here. */
+		__atomic_fetch_add(&lpi->copied_pages, *nr_pages, __ATOMIC_RELAXED);
 		return -1;
 	}
 
 	*nr_pages = total_copied / ps;
-	lpi->copied_pages += *nr_pages;
+	/* Atomic: multiple obstor_xfer workers may race here. */
+	__atomic_fetch_add(&lpi->copied_pages, *nr_pages, __ATOMIC_RELAXED);
 
 	/*
 	 * If we copied nothing and this wasn't a process-exit situation,
@@ -1104,6 +1107,19 @@ static int uffd_copy_from_buf(struct lazy_pages_info *lpi, __u64 address, int *n
 {
 	return __uffd_copy_with_retry(lpi, address, nr_pages,
 				     (unsigned long)src_buf, "uffd_copy_from_buf");
+}
+
+/*
+ * Public entry point for obstor_xfer workers to install pages directly
+ * via UFFDIO_COPY. Hides struct lazy_pages_info from obstor_xfer.c.
+ * See obstor_xfer.h for contract.
+ */
+int obstor_xfer_install_pages(void *lpi_ptr, unsigned long addr, int *nr, void *buf)
+{
+	struct lazy_pages_info *lpi = (struct lazy_pages_info *)lpi_ptr;
+	if (!lpi || !nr || !buf)
+		return -1;
+	return uffd_copy_from_buf(lpi, (__u64)addr, nr, buf);
 }
 
 static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, int nr)
@@ -1257,9 +1273,66 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 	unsigned long len;
 	int err;
 
-	iov = pick_next_range(lpi);
-	if (!iov)
-		return 0;
+	/*
+	 * Object-storage parallel xfer path.
+	 *
+	 * When S3-style object storage is the backend and the worker pool
+	 * is enabled, obstor_xfer.c workers are the real install path. They
+	 * fetch IOVs in parallel and install them via UFFDIO_COPY directly,
+	 * marking each IOV_RESTORED on success. This main-loop function's
+	 * only job for such IOVs is to reap (drop_iovs) the completed ones.
+	 *
+	 * Drain rate matters: handle_requests() polls epoll between
+	 * xfer_pages() calls (~10 ms after restore_finished). If we drop
+	 * exactly one IOV per call, the daemon spends ~10 s after the
+	 * workers finish just walking down the list at 100 IOVs/sec.
+	 * Reap up to OBSTOR_REAP_BATCH IOVs in a single call so the drain
+	 * tracks the worker install rate, not the epoll timeout.
+	 *
+	 * For IOVs still IOV_FETCHING we return 0 and let the main loop
+	 * re-poll epoll. For unmanaged IOVs (small filtered, NOT_REQUESTED
+	 * after worker partial failure, etc.) we fall through to the
+	 * existing sequential extract_range + uffd_handle_pages body.
+	 */
+	if (opts.enable_object_storage && opts.object_storage_parallel_xfer) {
+		const int OBSTOR_REAP_BATCH = 256;
+		int drained = 0;
+
+		while (drained < OBSTOR_REAP_BATCH) {
+			iov = pick_next_range(lpi);
+			if (!iov)
+				return 0;
+
+			if (obstor_xfer_iov_is_restored(iov->start)) {
+				int rc = drop_iovs(lpi, iov->start, iov->end - iov->start);
+				if (rc < 0)
+					return rc;
+				drained++;
+				continue;
+			}
+			if (obstor_xfer_iov_is_pending(iov->start)) {
+				/* A worker is actively holding this IOV. Yield to
+				 * epoll so we can come back when something happens. */
+				return 0;
+			}
+			/* Meta missing, or state is IOV_QUEUED / IOV_NOT_REQUESTED /
+			 * IOV_FAULTED (small filtered, proximity-evicted, post-failure):
+			 * fall through to sequential sync fetch as a safety net. */
+			break;
+		}
+
+		if (drained > 0 && drained == OBSTOR_REAP_BATCH) {
+			/* Hit the per-call cap — let the main loop tick and come
+			 * back so we don't starve UFFD event handling. */
+			return 0;
+		}
+		/* iov is now the head we couldn't drain; fall through to
+		 * sequential body using it. */
+	} else {
+		iov = pick_next_range(lpi);
+		if (!iov)
+			return 0;
+	}
 
 	len = min(iov->end - iov->start, lpi->xfer_len);
 
@@ -1432,8 +1505,6 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 	/* === IOV-based semi-synchronous logic === */
 	if (opts.enable_object_storage && opts.lazy_pages && opts.semi_sync_iov) {
-		void *cached_data = NULL;
-		enum cache_result cache_result = CACHE_MISS;
 		int iov_index = -1;
 
 		/* Fetch entire IOV instead of just single page */
@@ -1453,78 +1524,44 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			fetch_end = fetch_start + nr_pages * ps;
 		}
 
-		/* Try cache lookup if async prefetch is enabled */
-		if (opts.async_prefetch) {
-			cache_result = cache_lookup_iov_for_fault(fetch_start, fetch_end, &cached_data);
-			/* Use RB-tree based lookup for correct IOV index */
+		/*
+		 * Race check: obstor_xfer worker may have already installed this IOV
+		 * via direct UFFDIO_COPY between the UFFD fault firing and us picking
+		 * it up here. If so, the page is already in place and we just need
+		 * to drop the IOV from the list.
+		 *
+		 * Phase 6.1a: if meta is IOV_FETCHING the worker is already mid-
+		 * fetch/install on this exact iov. A synchronous fault-path fetch
+		 * from here would duplicate S3 traffic (both worker and fault
+		 * fetching the same range) and still pay a full ~70ms S3 wall
+		 * time — while the worker is already several ms into its fetch.
+		 * Instead wait briefly on a cond broadcast from the worker and
+		 * drop the iov on success. Timeout falls through to sync fetch so
+		 * a stuck worker can never block the fault indefinitely.
+		 */
+		if (opts.object_storage_parallel_xfer) {
+			int wait_rc;
+
 			iov_index = iov_meta_get_index_by_addr(address);
+
+			if (obstor_xfer_iov_is_restored(fetch_start)) {
+				lp_warn(lpi, "Fault on already-installed IOV [0x%lx-0x%lx] "
+					"— UFFD wakeup race, dropping\n", fetch_start, fetch_end);
+				return drop_iovs(lpi, fetch_start, fetch_end - fetch_start);
+			}
+
+			wait_rc = obstor_xfer_iov_wait_restored(fetch_start, OBSTOR_FAULT_WAIT_MS);
+			obstor_xfer_account_fault_wait(wait_rc);
+			if (wait_rc == 0) {
+				lp_info(lpi, "Fault absorbed by worker install [0x%lx-0x%lx], "
+					"dropping IOV\n", fetch_start, fetch_end);
+				return drop_iovs(lpi, fetch_start, fetch_end - fetch_start);
+			}
+			/* -EAGAIN / -ENOENT / -ETIMEDOUT → fall through to sync fetch */
 		}
 
-		/* Cache HIT - restore directly from cache */
-		if (cache_result == CACHE_HIT) {
-			int original_nr_pages = nr_pages;
-			unsigned long actual_copied_bytes;
-
-			lp_info(lpi, "CACHE HIT: IOV [0x%lx-0x%lx] (%d pages)\n",
-				fetch_start, fetch_end, nr_pages);
-
-			/* Restore pages directly from cache buffer */
-			ret = uffd_copy_from_buf(lpi, fetch_start, &nr_pages, cached_data);
-
-			/* Free the copied cache data */
-			xfree(cached_data);
-
-			if (ret < 0 || nr_pages == 0) {
-				/*
-				 * UFFDIO_COPY failed (EAGAIN retries exhausted or fatal).
-				 * Do NOT drop the IOV — leave it in lpi->iovs so the
-				 * next fault on this range will retry the fetch/copy.
-				 */
-				lp_err(lpi, "CACHE HIT copy failed: %d of %d pages installed "
-				       "at 0x%lx, IOV retained for retry\n",
-				       nr_pages, original_nr_pages, fetch_start);
-				return ret;
-			}
-
-			actual_copied_bytes = (unsigned long)nr_pages * ps;
-
-			/*
-			 * Only drop the range that was actually installed.
-			 * cache_mark_restored uses exact-match (iov_start, iov_end),
-			 * so it will only remove the cache entry if the full IOV
-			 * was copied. Partial copy safely leaves cache entry intact.
-			 */
-			if (nr_pages == original_nr_pages) {
-				/* Full copy — drop entire IOV and remove cache entry */
-				cache_mark_restored(fetch_start, fetch_end);
-				ret = drop_iovs(lpi, fetch_start, fetch_end - fetch_start);
-			} else {
-				/* Partial copy — only drop the installed range */
-				lp_warn(lpi, "CACHE HIT partial: %d of %d pages at 0x%lx, "
-					"dropping only installed range\n",
-					nr_pages, original_nr_pages, fetch_start);
-				ret = drop_iovs(lpi, fetch_start, actual_copied_bytes);
-			}
-
-			if (ret < 0) {
-				lp_err(lpi, "Failed to drop restored IOV [0x%lx-0x%lx] from list\n",
-				       fetch_start, fetch_start + actual_copied_bytes);
-				return -1;
-			}
-
-			/* Trigger prefetch strategies */
-			if (opts.async_prefetch && iov_index >= 0) {
-				lp_debug(lpi, "Triggering prefetch for IOV index %d\n", iov_index);
-				prefetch_on_fault(lpi, iov_index);
-			}
-
-			lp_info(lpi, "=== PAGE FAULT SERVED from CACHE (prefetched) ===\n");
-			return 0;
-		}
-
-		/* Cache MISS - fetch from S3 */
-		lp_info(lpi, "Semi-sync: %s - Fetching %d pages [0x%lx - 0x%lx]\n",
-			cache_result == CACHE_MISS ? "CACHE MISS" : "No cache",
+		/* Synchronous fetch via existing uffd_handle_pages path */
+		lp_info(lpi, "Semi-sync: Fetching %d pages [0x%lx - 0x%lx]\n",
 			nr_pages, fetch_start, fetch_end);
 
 		/* Extract IOV range */
@@ -1562,7 +1599,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		}
 
 		/* Trigger prefetch strategies */
-		if (opts.async_prefetch && iov_index >= 0) {
+		if (opts.object_storage_parallel_xfer && iov_index >= 0) {
 			lp_debug(lpi, "Triggering prefetch for IOV index %d\n", iov_index);
 			prefetch_on_fault(lpi, iov_index);
 		}
@@ -1665,8 +1702,19 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 			ret = complete_forks(epollfd, events, &nr_fds);
 			if (ret < 0)
 				goto out;
-			if (restore_finished)
-				poll_timeout = 0;
+			if (restore_finished) {
+				/*
+				 * Object-storage parallel xfer: workers are
+				 * installing pages in the background. If we
+				 * return to epoll with timeout=0 we burn 100%
+				 * CPU busy-looping. 10ms gives workers time
+				 * to make progress between reap attempts.
+				 */
+				if (opts.enable_object_storage && opts.object_storage_parallel_xfer)
+					poll_timeout = 10;
+				else
+					poll_timeout = 0;
+			}
 			if (!restore_finished || !ret)
 				continue;
 		}
@@ -1855,9 +1903,18 @@ int cr_lazy_pages(bool daemon)
 	if (status_ready())
 		return -1;
 
+	/*
+	 * Phase 6: bulk-prefetch metadata images post-fork (cr-restore's
+	 * cache is in a different address space). This happens before the
+	 * daemon opens its own pagemap images via open_page_read_at().
+	 */
+	if (opts.enable_object_storage)
+		obstor_prefetch_init(opts.prefetch_workers);
+
 	/* Initialize async prefetch system if enabled */
-	if (opts.async_prefetch) {
-		int num_workers = opts.prefetch_workers > 0 ? opts.prefetch_workers : 8;  /* 8 workers for optimal throughput */
+	if (opts.object_storage_parallel_xfer) {
+		/* prefetch_init() will NIC-auto-detect when num_workers <= 0 */
+		int num_workers = opts.prefetch_workers;
 		unsigned long cache_limit = opts.cache_limit_mb;
 
 		/* Initialize page cache.
@@ -1890,7 +1947,7 @@ int cr_lazy_pages(bool daemon)
 	nr_fds = task_entries->nr_tasks + (opts.use_page_server ? 2 : 1);
 	epollfd = epoll_prepare(nr_fds, &events);
 	if (epollfd < 0) {
-		if (opts.async_prefetch) {
+		if (opts.object_storage_parallel_xfer) {
 			prefetch_cleanup();
 			cache_cleanup();
 		}
@@ -1903,7 +1960,7 @@ int cr_lazy_pages(bool daemon)
 	}
 
 	/* Now all lpis are populated — update cache limit with actual lazy bytes */
-	if (opts.async_prefetch) {
+	if (opts.object_storage_parallel_xfer) {
 		struct lazy_pages_info *lpi;
 		unsigned long total_lazy_bytes = 0;
 
@@ -1925,7 +1982,7 @@ int cr_lazy_pages(bool daemon)
 	disconnect_from_page_server();
 
 	/* Cleanup async prefetch system if enabled */
-	if (opts.async_prefetch) {
+	if (opts.object_storage_parallel_xfer) {
 		struct cache_stats cache_stats;
 		struct prefetch_stats prefetch_stats;
 

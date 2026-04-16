@@ -21,6 +21,7 @@
 #include "cr_options.h"
 #include "object-storage.h"
 #include "servicefd.h"
+#include "xmalloc.h"
 
 /*
  * =================================================================================
@@ -53,11 +54,18 @@ struct curl_thread_handle {
 	struct curl_thread_handle *next;
 };
 
-/* Structure to hold both data and error buffers */
+/* Structure to hold both data and error buffers + CDN observability fields. */
 struct FetchContext {
 	struct MemoryStruct *data_chunk;
 	struct MemoryStruct *error_chunk;
 	int got_error;
+	/*
+	 * Captured response headers for CDN visibility.  Populated by
+	 * header_callback, consumed by the caller after curl_easy_perform
+	 * completes.  Empty string means the header was absent.
+	 */
+	char x_cache[64];
+	char x_amz_cf_pop[32];
 };
 
 /*
@@ -509,10 +517,55 @@ static size_t write_error_callback(void *contents, size_t size, size_t nmemb, vo
 }
 
 /* Header callback to detect HTTP errors early */
+/*
+ * Case-insensitive prefix match for HTTP header names.  Returns pointer to
+ * the byte after the matched prefix on success, NULL on miss.  Used so we
+ * don't bring in strcasecmp for libcurl's case-bag headers.
+ */
+static const char *_hdr_match(const char *buf, size_t buflen, const char *needle)
+{
+	size_t nlen = strlen(needle);
+	size_t i;
+	if (buflen < nlen)
+		return NULL;
+	for (i = 0; i < nlen; i++) {
+		char a = buf[i];
+		char b = needle[i];
+		if (a >= 'A' && a <= 'Z')
+			a += 32;
+		if (b >= 'A' && b <= 'Z')
+			b += 32;
+		if (a != b)
+			return NULL;
+	}
+	return buf + nlen;
+}
+
+/*
+ * Copy a header value into dst, trimming leading whitespace and stripping
+ * trailing CRLF.  Always NUL-terminates dst.
+ */
+static void _copy_hdr_value(const char *src, size_t src_len, char *dst, size_t dst_size)
+{
+	size_t i = 0;
+	size_t j = 0;
+	while (i < src_len && (src[i] == ' ' || src[i] == '\t'))
+		i++;
+	while (i < src_len && j + 1 < dst_size) {
+		char c = src[i];
+		if (c == '\r' || c == '\n')
+			break;
+		dst[j++] = c;
+		i++;
+	}
+	dst[j] = '\0';
+}
+
 static size_t header_callback(char *buffer, size_t size, size_t nitems, void *userdata)
 {
 	struct FetchContext *ctx = (struct FetchContext *)userdata;
 	size_t total_size = size * nitems;
+	const char *value;
 
 	/* Check if this is the status line */
 	if (strncmp(buffer, "HTTP/", 5) == 0) {
@@ -523,6 +576,25 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
 				pr_debug("Detected error status code: %d\n", status_code);
 			}
 		}
+		return total_size;
+	}
+
+	/*
+	 * Capture CDN observability headers.  CloudFront uses "X-Cache" with
+	 * values like "Hit from cloudfront" / "Miss from cloudfront", and
+	 * "X-Amz-Cf-Pop" for the serving edge POP id (e.g. "CDG52-P1").
+	 */
+	value = _hdr_match(buffer, total_size, "X-Cache:");
+	if (value) {
+		_copy_hdr_value(value, total_size - (size_t)(value - buffer),
+				ctx->x_cache, sizeof(ctx->x_cache));
+		return total_size;
+	}
+	value = _hdr_match(buffer, total_size, "X-Amz-Cf-Pop:");
+	if (value) {
+		_copy_hdr_value(value, total_size - (size_t)(value - buffer),
+				ctx->x_amz_cf_pop, sizeof(ctx->x_amz_cf_pop));
+		return total_size;
 	}
 
 	return total_size;
@@ -1065,6 +1137,13 @@ static int ensure_valid_session(void)
  * =================================================================================
  */
 
+int object_storage_reinit_after_fork(void)
+{
+	/* Wraps the static reinitialize_curl_for_lazy_pages so external code
+	 * can force a single-threaded curl re-init before spawning workers. */
+	return reinitialize_curl_for_lazy_pages();
+}
+
 int object_storage_init(void)
 {
 	CURLcode res = curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -1173,8 +1252,25 @@ static int _construct_object_url(const char *object_key, struct object_url_info 
 	endpoint_url = opts.object_storage_endpoint_url;
 	hostname = _strip_scheme(endpoint_url);
 
-	/* Build full object path */
-	if (normalized_prefix[0] != '\0' && strncmp(object_key, normalized_prefix, strlen(normalized_prefix)) == 0) {
+	/*
+	 * Build full object path. Callers pass `object_key` in one of two
+	 * forms:
+	 *   1. bare filename (e.g., "inventory.img") — needs normalized_prefix
+	 *      prepended to become a full S3 key.
+	 *   2. already-prefixed path (e.g., "memcached-4gb/pages-1.img" in
+	 *      the normal case, or "pdtest/pd1/pages-1.img" when
+	 *      maybe_read_page_object_storage serves a parent page_read with
+	 *      its own per-page_read prefix).
+	 *
+	 * The previous strncmp() check only detected case (2) when the key
+	 * started with THE CURRENT opts prefix — so parent-chain keys (which
+	 * use the PARENT's prefix, not the current) were incorrectly
+	 * re-prefixed, producing "pdtest/pd_dump/pdtest/pd1/pages-1.img".
+	 *
+	 * Simpler rule: any key containing '/' is already absolute and must
+	 * not be re-prefixed. Bare filenames never contain '/'.
+	 */
+	if (strchr(object_key, '/') != NULL) {
 		snprintf(info->full_object_path, sizeof(info->full_object_path), "%s", object_key);
 	} else {
 		snprintf(info->full_object_path, sizeof(info->full_object_path), "%s%s", normalized_prefix, object_key);
@@ -1813,11 +1909,311 @@ int object_storage_get_object(const char *object_key, void **out_data, unsigned 
 
 /*
  * =================================================================================
+ * List Objects V2 — enumerates keys under a prefix for bulk metadata prefetch.
+ * Used by obstor_prefetch to discover all metadata files before opening any
+ * image so that per-image opens become in-memory cache hits instead of one
+ * serial S3 GET per file.
+ * =================================================================================
+ */
+
+/*
+ * Percent-encode a string for SigV4 canonical query string.
+ * RFC 3986 unreserved: A-Z a-z 0-9 - _ . ~
+ * Everything else must be %XX (uppercase hex).
+ */
+static int _sigv4_uri_encode(const char *src, char *dst, size_t dst_cap)
+{
+	size_t si, di = 0;
+	const char *hex = "0123456789ABCDEF";
+
+	for (si = 0; src[si]; si++) {
+		unsigned char c = (unsigned char)src[si];
+		int unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+				 (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+				 c == '.' || c == '~';
+		if (unreserved) {
+			if (di + 1 >= dst_cap)
+				return -1;
+			dst[di++] = (char)c;
+		} else {
+			if (di + 3 >= dst_cap)
+				return -1;
+			dst[di++] = '%';
+			dst[di++] = hex[(c >> 4) & 0xF];
+			dst[di++] = hex[c & 0xF];
+		}
+	}
+	if (di >= dst_cap)
+		return -1;
+	dst[di] = '\0';
+	return 0;
+}
+
+/*
+ * Minimal XML tag extractor. Finds the content of <tag>...</tag> starting
+ * from *cursor; on success advances *cursor past the closing tag and returns
+ * the content in a caller-provided buffer. Returns 0 on found, -1 on absent.
+ * Not a general-purpose parser — only used for the tiny subset of fields
+ * ListObjectsV2 returns (<Key>, <IsTruncated>, <NextContinuationToken>).
+ */
+static int _xml_extract_next(const char **cursor, const char *end, const char *tag, char *out, size_t out_cap)
+{
+	char open_tag[64], close_tag[64];
+	const char *p, *q;
+	size_t n;
+
+	snprintf(open_tag, sizeof(open_tag), "<%s>", tag);
+	snprintf(close_tag, sizeof(close_tag), "</%s>", tag);
+
+	p = strstr(*cursor, open_tag);
+	if (!p || p >= end)
+		return -1;
+	p += strlen(open_tag);
+	q = strstr(p, close_tag);
+	if (!q || q >= end)
+		return -1;
+
+	n = (size_t)(q - p);
+	if (n >= out_cap)
+		n = out_cap - 1;
+	memcpy(out, p, n);
+	out[n] = '\0';
+	*cursor = q + strlen(close_tag);
+	return 0;
+}
+
+/*
+ * Issue one ListObjectsV2 HTTP call. Appends extracted keys to *out_keys
+ * (which may be NULL initially and is grown via realloc). Sets *continuation
+ * to the NextContinuationToken on truncation (caller must free), NULL otherwise.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+static int _list_objects_v2_once(const char *key_prefix, const char *continuation_in,
+				 char ***io_keys, size_t *io_n, size_t *io_cap,
+				 char **continuation_out)
+{
+	struct object_url_info url_info_unused;
+	char encoded_prefix[1024];
+	char encoded_token[1024];
+	char query_canonical[4096];
+	char query_url[4096];
+	char url[8192];
+	char host[512];
+	CURL *curl_handle;
+	struct MemoryStruct chunk;
+	struct curl_slist *headers = NULL;
+	CURLcode res;
+	long http_code = 0;
+	const char *endpoint_url, *hostname;
+	const char *cursor, *end_p;
+	char truncated_buf[16];
+	char key_buf[2048];
+	int ret = -1;
+
+	(void)url_info_unused;
+
+	*continuation_out = NULL;
+
+	if (_sigv4_uri_encode(key_prefix ? key_prefix : "", encoded_prefix, sizeof(encoded_prefix)) != 0) {
+		pr_err("list_objects: prefix encode overflow\n");
+		return -1;
+	}
+
+	if (continuation_in) {
+		if (_sigv4_uri_encode(continuation_in, encoded_token, sizeof(encoded_token)) != 0) {
+			pr_err("list_objects: continuation-token encode overflow\n");
+			return -1;
+		}
+	} else {
+		encoded_token[0] = '\0';
+	}
+
+	/*
+	 * SigV4 canonical query string: keys sorted alphabetically.
+	 * Keys used: continuation-token, list-type, max-keys, prefix
+	 */
+	if (continuation_in)
+		snprintf(query_canonical, sizeof(query_canonical),
+			 "continuation-token=%s&list-type=2&max-keys=1000&prefix=%s",
+			 encoded_token, encoded_prefix);
+	else
+		snprintf(query_canonical, sizeof(query_canonical),
+			 "list-type=2&max-keys=1000&prefix=%s",
+			 encoded_prefix);
+
+	/* URL query string is identical to canonical here (no duplicate keys). */
+	snprintf(query_url, sizeof(query_url), "%s", query_canonical);
+
+	endpoint_url = opts.object_storage_endpoint_url;
+	hostname = _strip_scheme(endpoint_url);
+
+	/* LIST target is the bucket itself, so auth host = bucket-virtual-host. */
+	if (opts.object_storage_path_style || !opts.object_storage_bucket || !opts.object_storage_bucket[0]) {
+		snprintf(host, sizeof(host), "%s", hostname);
+		if (hostname != endpoint_url)
+			snprintf(url, sizeof(url), "%.*s%s/%s?%s",
+				 (int)(hostname - endpoint_url), endpoint_url, hostname,
+				 opts.object_storage_bucket ? opts.object_storage_bucket : "", query_url);
+		else
+			snprintf(url, sizeof(url), "https://%s/%s?%s",
+				 hostname, opts.object_storage_bucket ? opts.object_storage_bucket : "", query_url);
+	} else {
+		snprintf(host, sizeof(host), "%s.%s", opts.object_storage_bucket, hostname);
+		if (hostname != endpoint_url)
+			snprintf(url, sizeof(url), "%.*s%s.%s/?%s",
+				 (int)(hostname - endpoint_url), endpoint_url,
+				 opts.object_storage_bucket, hostname, query_url);
+		else
+			snprintf(url, sizeof(url), "https://%s.%s/?%s",
+				 opts.object_storage_bucket, hostname, query_url);
+	}
+	/* Strip trailing slash in host if any */
+	{
+		size_t hlen = strlen(host);
+		if (hlen > 0 && host[hlen - 1] == '/')
+			host[hlen - 1] = '\0';
+	}
+
+	curl_handle = _get_curl_handle();
+	if (!curl_handle)
+		return -1;
+
+	chunk.memory = malloc(1);
+	chunk.size = 0;
+	chunk.capacity = 0;
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, url);
+	curl_easy_setopt(curl_handle, CURLOPT_HTTPGET, 1L);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &chunk);
+
+	/* SigV4 canonical URI for LIST: path-style = "/<bucket>", vhost = "/" */
+	{
+		char canonical_uri[1024];
+		if (opts.object_storage_path_style && opts.object_storage_bucket && opts.object_storage_bucket[0])
+			snprintf(canonical_uri, sizeof(canonical_uri), "/%s", opts.object_storage_bucket);
+		else
+			snprintf(canonical_uri, sizeof(canonical_uri), "/");
+
+		if (_build_auth_headers("GET", host, canonical_uri, query_canonical,
+					EMPTY_PAYLOAD_HASH, NULL, -1, &headers) != 0) {
+			free(chunk.memory);
+			return -1;
+		}
+	}
+
+	if (headers)
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	pr_debug("LIST %s\n", url);
+
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (headers)
+		curl_slist_free_all(headers);
+
+	if (res != CURLE_OK) {
+		pr_err("LIST failed: %s\n", curl_easy_strerror(res));
+		goto out;
+	}
+	if (http_code < 200 || http_code >= 300) {
+		pr_err("LIST HTTP %ld: %.*s\n", http_code, (int)chunk.size, chunk.memory ? (char *)chunk.memory : "");
+		goto out;
+	}
+
+	/* Parse XML: extract all <Key> and optional <NextContinuationToken>. */
+	cursor = (const char *)chunk.memory;
+	end_p = cursor + chunk.size;
+	while (_xml_extract_next(&cursor, end_p, "Key", key_buf, sizeof(key_buf)) == 0) {
+		if (*io_n == *io_cap) {
+			size_t new_cap = *io_cap ? (*io_cap) * 2 : 128;
+			char **nk = realloc(*io_keys, new_cap * sizeof(char *));
+			if (!nk) {
+				pr_err("list_objects: realloc failed\n");
+				goto out;
+			}
+			*io_keys = nk;
+			*io_cap = new_cap;
+		}
+		(*io_keys)[(*io_n)++] = xstrdup(key_buf);
+	}
+
+	{
+		const char *p = (const char *)chunk.memory;
+		char token_buf[1024];
+		if (_xml_extract_next(&p, end_p, "IsTruncated", truncated_buf, sizeof(truncated_buf)) == 0 &&
+		    strcmp(truncated_buf, "true") == 0) {
+			p = (const char *)chunk.memory;
+			if (_xml_extract_next(&p, end_p, "NextContinuationToken", token_buf, sizeof(token_buf)) == 0)
+				*continuation_out = xstrdup(token_buf);
+		}
+	}
+
+	ret = 0;
+out:
+	free(chunk.memory);
+	return ret;
+}
+
+/*
+ * Enumerate all object keys under the given prefix.
+ * On success: *out_keys points to an xmalloc'd array of xstrdup'd key strings,
+ * *out_n is the count. Caller must xfree each key and the array.
+ */
+int object_storage_list_objects(const char *key_prefix, char ***out_keys, size_t *out_n)
+{
+	char **keys = NULL;
+	size_t n = 0, cap = 0;
+	char *continuation = NULL;
+	int rounds = 0;
+
+	if (!out_keys || !out_n)
+		return -1;
+	*out_keys = NULL;
+	*out_n = 0;
+
+	do {
+		char *next = NULL;
+		if (_list_objects_v2_once(key_prefix, continuation, &keys, &n, &cap, &next) != 0) {
+			if (continuation)
+				xfree(continuation);
+			goto err;
+		}
+		if (continuation)
+			xfree(continuation);
+		continuation = next;
+		rounds++;
+		if (rounds > 64) {
+			pr_err("list_objects: too many pagination rounds (>64), aborting\n");
+			goto err;
+		}
+	} while (continuation);
+
+	*out_keys = keys;
+	*out_n = n;
+	pr_info("LIST prefix='%s': %zu keys (%d page(s))\n", key_prefix ? key_prefix : "", n, rounds);
+	return 0;
+
+err:
+	if (keys) {
+		size_t i;
+		for (i = 0; i < n; i++)
+			xfree(keys[i]);
+		free(keys);
+	}
+	return -1;
+}
+
+/*
+ * =================================================================================
  * Fetch Range (existing)
  * =================================================================================
  */
 
-int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer)
+int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer,
+			       const char *source)
 {
 	CURL *curl_handle;
 	CURLcode res;
@@ -1868,6 +2264,8 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	fetch_ctx.data_chunk = &chunk;
 	fetch_ctx.error_chunk = &error_response;
 	fetch_ctx.got_error = 0;
+	fetch_ctx.x_cache[0] = '\0';
+	fetch_ctx.x_amz_cf_pop[0] = '\0';
 
 	/* Normalize the object prefix */
 	if (opts.object_storage_object_prefix) {
@@ -1907,10 +2305,16 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	endpoint_url = opts.object_storage_endpoint_url;
 	hostname = _strip_scheme(endpoint_url);
 
-	/* Check if object_key already contains the prefix to avoid duplication */
-	if (normalized_prefix[0] != '\0' && strncmp(object_key, normalized_prefix, strlen(normalized_prefix)) == 0) {
+	/*
+	 * Build full object path. See _construct_object_url for the full
+	 * rationale. Any key containing '/' is already absolute (either the
+	 * current opts prefix or a parent-chain prefix attached by
+	 * maybe_read_page_object_storage via pr->object_storage_prefix).
+	 * Only bare filenames need normalized_prefix prepended.
+	 */
+	if (strchr(object_key, '/') != NULL) {
 		snprintf(full_object_path, sizeof(full_object_path), "%s", object_key);
-		pr_debug("Object key already contains prefix, using as is: %s\n", full_object_path);
+		pr_debug("Object key is absolute, using as is: %s\n", full_object_path);
 	} else {
 		snprintf(full_object_path, sizeof(full_object_path), "%s%s", normalized_prefix, object_key);
 		pr_debug("Prepended prefix to object key: %s\n", full_object_path);
@@ -2051,7 +2455,7 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 
 	/* Log fetch start for simulation and record start time */
 	clock_gettime(CLOCK_MONOTONIC, &fetch_start);
-	OBJSTOR_FETCH_START_LOG(object_key, offset, length);
+	OBJSTOR_FETCH_START_LOG(object_key, offset, length, source);
 
 	/* Perform the request */
 	res = curl_easy_perform(curl_handle);
@@ -2060,7 +2464,7 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
 
 	if (res != CURLE_OK || http_code >= 400) {
-		OBJSTOR_FETCH_ERROR_LOG(object_key, offset, length, (int)http_code);
+		OBJSTOR_FETCH_ERROR_LOG(object_key, offset, length, (int)http_code, source);
 		pr_err("curl_easy_perform() failed: %s (URL: %s, Range: %s, HTTP Code: %ld)\n",
 		       curl_easy_strerror(res), url, range_header, http_code);
 
@@ -2105,6 +2509,8 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 
 			/* Reset fetch context for retry */
 			fetch_ctx.got_error = 0;
+			fetch_ctx.x_cache[0] = '\0';
+			fetch_ctx.x_amz_cf_pop[0] = '\0';
 			error_response.size = 0;
 			curl_easy_setopt(retry_handle, CURLOPT_WRITEFUNCTION, write_router_callback);
 			curl_easy_setopt(retry_handle, CURLOPT_WRITEDATA, (void *)&fetch_ctx);
@@ -2170,21 +2576,24 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 		pr_warn("Expected HTTP 206 Partial Content, but received %ld\n", http_code);
 	}
 
-	/* Check if the received size matches the requested length */
+	/*
+	 * Check if the received size matches the requested length.
+	 *
+	 * A short read is NOT a transport error — it means the requested
+	 * range extended past the end of the object. S3 responds with
+	 * HTTP 206 Partial Content and returns only the available bytes.
+	 * Callers that issue speculative read-ahead windows (e.g. the
+	 * read-ahead buffer in maybe_read_page_object_storage) will often
+	 * trip this near the end of pages-*.img. Treating it as a hard
+	 * error and destroying the curl handle is what used to happen,
+	 * and it cost ~100–900ms per subsequent GET (cold TLS handshake
+	 * on a brand-new handle). Keep the handle alive so the next real
+	 * read reuses the warm TLS session; the caller is expected to
+	 * retry with a smaller length if it actually needed more data.
+	 */
 	if (chunk.size != length) {
-		pr_err("Object Storage fetch: Received size mismatch (Expected %lu, Got %zu)\n", length, chunk.size);
-
-		/* If using a reused handle, handle cleanup */
-		if (!is_main_thread()) {
-			pr_warn("Thread %d: Size mismatch, but keeping thread-local handle\n", get_thread_id());
-		} else {
-			if (curl_handle == get_curl_handle_for_current_process()) {
-				cleanup_curl_handle_for_process(getpid());
-			} else {
-				curl_easy_cleanup(curl_handle);
-			}
-		}
-
+		pr_warn("Object Storage fetch: short read (Expected %lu, Got %zu) — "
+			"likely past EOF, keeping handle warm\n", length, chunk.size);
 		free(error_response.memory);
 		ret = -1;
 		goto cleanup;
@@ -2194,7 +2603,8 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	clock_gettime(CLOCK_MONOTONIC, &fetch_end);
 	fetch_duration_ms = (fetch_end.tv_sec - fetch_start.tv_sec) * 1000.0 +
 			    (fetch_end.tv_nsec - fetch_start.tv_nsec) / 1000000.0;
-	OBJSTOR_FETCH_DONE_LOG(object_key, offset, length, fetch_duration_ms);
+	OBJSTOR_FETCH_DONE_LOG(object_key, offset, length, fetch_duration_ms,
+			       fetch_ctx.x_cache, fetch_ctx.x_amz_cf_pop, source);
 
 	pr_debug("Successfully fetched %zu bytes (range %s) from %s\n", chunk.size, range_header, url);
 

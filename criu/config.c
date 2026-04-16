@@ -444,9 +444,10 @@ void init_opts(void)
 	opts.aws_region = NULL;
 
 	/* Initialize Async Prefetch options */
-	opts.async_prefetch = false;
-	opts.prefetch_workers = 4;		/* Default 4 workers */
+	opts.object_storage_parallel_xfer = false;
+	opts.prefetch_workers = 0;		/* 0 = auto-detect from NIC speed */
 	opts.cache_limit_mb = 0;		/* Default unlimited */
+	opts.prefetch_batch_bytes = 64UL * 1024 * 1024;  /* 64 MB default; 0 disables batching */
 
 	/* Initialize exclude ranges */
 	INIT_LIST_HEAD(&opts.exclude_ranges);
@@ -731,7 +732,8 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "aws-access-key", required_argument, 0, 1106 },
 		{ "aws-secret-key", required_argument, 0, 1107 },
 		{ "aws-region", required_argument, 0, 1108 },
-		{ "async-prefetch", no_argument, NULL, 1109 },
+		{ "object-storage-parallel-xfer", no_argument, NULL, 1109 },
+		{ "async-prefetch", no_argument, NULL, 1109 }, /* deprecated alias for backward compat with workload scripts */
 		{ "prefetch-workers", required_argument, 0, 1110 },
 		{ "cache-limit", required_argument, 0, 1111 },
 		{ "exclude-range", required_argument, 0, 1112 },
@@ -741,6 +743,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "object-storage-upload", no_argument, NULL, 1116 },
 		{ "no-semi-sync-iov", no_argument, NULL, 1117 },
 		{ "no-hot-vma-seed", no_argument, NULL, 1118 },
+		{ "prefetch-batch-bytes", required_argument, 0, 1119 },
 		{},
 	};
 
@@ -1114,12 +1117,12 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			SET_CHAR_OPTS(aws_region, optarg);
 			break;
 		case 1109:
-			opts.async_prefetch = true;
+			opts.object_storage_parallel_xfer = true;
 			break;
 		case 1110:
 			opts.prefetch_workers = atoi(optarg);
-			if (opts.prefetch_workers <= 0) {
-				pr_err("Invalid prefetch workers: %s (must be > 0)\n", optarg);
+			if (opts.prefetch_workers < 0) {
+				pr_err("Invalid prefetch workers: %s (use 0 for auto-detect)\n", optarg);
 				return 1;
 			}
 			break;
@@ -1183,6 +1186,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		case 1118:
 			opts.no_hot_vma_seed = true;
 			break;
+		case 1119:
+			opts.prefetch_batch_bytes = strtoul(optarg, NULL, 10);
+			break;
 		default:
 			return 2;
 		}
@@ -1202,7 +1208,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 	 */
 	if (opts.enable_object_storage && !opts.no_semi_sync_iov)
 		opts.semi_sync_iov = true;
-	if (opts.async_prefetch && !opts.no_hot_vma_seed)
+	if (opts.object_storage_parallel_xfer && !opts.no_hot_vma_seed)
 		opts.hot_vma_seed = true;
 
 	if (opts.enable_object_storage) {
@@ -1220,7 +1226,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		pr_info("  AWS Secret Key: %s\n", opts.aws_secret_key ? "(set)" : "(not set)");
 	}
 
-	if (opts.async_prefetch) {
+	if (opts.object_storage_parallel_xfer) {
 		pr_info("Async Prefetch Enabled\n");
 		pr_info("  Prefetch Workers: %d\n", opts.prefetch_workers);
 		pr_info("  Cache Limit: %lu MB %s\n", opts.cache_limit_mb, opts.cache_limit_mb == 0 ? "(unlimited)" : "");

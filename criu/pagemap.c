@@ -5,6 +5,8 @@
 #include <sys/uio.h>
 #include <limits.h>
 #include <string.h>
+#include <pthread.h>
+#include <time.h>
 
 #include "types.h"
 #include "image.h"
@@ -465,6 +467,336 @@ static int read_page_complete(unsigned long img_id, unsigned long vaddr, int nr_
 	return ret;
 }
 
+/* Forward decl — prefetch_eager_ranges below tests pr->maybe_read_page against this. */
+static int maybe_read_page_object_storage(struct page_read *pr, unsigned long vaddr, int nr, void *buf, unsigned flags);
+
+/*
+ * =================================================================================
+ * Phase 6 M10: Eager-prefetch phase for object-storage-backed page_reads.
+ *
+ * Motivation: cr-restore's pagemap walk issues synchronous S3 range GETs on
+ * the main thread for every PE_PRESENT && !PE_LAZY entry. Measurement on
+ * mc-4gb showed this adds up to ~3.6 s of pure serial RTT (49 reads, ~25 ms
+ * warm / ~80 ms cold each). We can't change the walk itself (it's part of
+ * upstream CRIU's restore structure), but we CAN precompute which byte
+ * ranges in pages-N.img will be read and pull them in parallel before the
+ * walk starts. The main walk then becomes zero-RTT memcpy-from-buffer.
+ * =================================================================================
+ */
+
+struct eager_worker_arg {
+	const char *object_key;
+	off_t file_offset;
+	size_t len;
+	void *dst;
+	int rc;
+};
+
+struct eager_ss {
+	struct eager_worker_arg *args;
+	int total;
+	int next;
+	pthread_mutex_t lock;
+};
+
+static void *eager_drain_worker(void *arg)
+{
+	struct eager_ss *ss = (struct eager_ss *)arg;
+	int idx;
+
+	while (1) {
+		pthread_mutex_lock(&ss->lock);
+		if (ss->next >= ss->total) {
+			pthread_mutex_unlock(&ss->lock);
+			break;
+		}
+		idx = ss->next++;
+		pthread_mutex_unlock(&ss->lock);
+
+		ss->args[idx].rc = object_storage_fetch_range(
+			ss->args[idx].object_key,
+			ss->args[idx].file_offset,
+			ss->args[idx].len,
+			ss->args[idx].dst,
+			OBJSTOR_SRC_PREFETCH);
+	}
+	return NULL;
+}
+
+/*
+ * Scan pmes[] once, collect (file_offset, len) for every entry that is
+ * PE_PRESENT but NOT PE_LAZY and NOT PE_PARENT. File offset is cumulative
+ * over all PE_PRESENT entries in order, mirroring how pi_off advances
+ * inside the real walk. Adjacent or small-gap eager ranges are merged
+ * into a single GET to minimize per-request overhead. Returns 0 on
+ * success with *out_ranges / *out_n / *out_total_bytes populated (caller
+ * owns the array).
+ */
+static int collect_eager_ranges(struct page_read *pr,
+				struct eager_range **out_ranges,
+				int *out_n, size_t *out_total_bytes)
+{
+	struct eager_range *arr;
+	int cap = 64, n = 0, i;
+	off_t cur_off = 0;
+	size_t total = 0;
+	/* Merge ranges closer than this many bytes into one GET. The
+	 * per-request S3 overhead is ~25 ms; any gap smaller than a
+	 * few hundred KB is cheaper to pay in extra bytes than in a
+	 * second round-trip. */
+	const size_t merge_slack = 256 * 1024;
+
+	*out_ranges = NULL;
+	*out_n = 0;
+	*out_total_bytes = 0;
+
+	arr = xmalloc(cap * sizeof(*arr));
+	if (!arr)
+		return -1;
+
+	for (i = 0; i < pr->nr_pmes; i++) {
+		PagemapEntry *pe = pr->pmes[i];
+		size_t len;
+		bool eager;
+
+		if (!pagemap_present(pe))
+			continue; /* no bytes in current pages-N.img */
+
+		len = pagemap_len(pe);
+		eager = !pagemap_lazy(pe) && !pagemap_in_parent(pe);
+
+		if (eager) {
+			if (n > 0) {
+				struct eager_range *last = &arr[n - 1];
+				off_t gap = cur_off - (last->file_offset + last->len);
+				if (gap <= (off_t)merge_slack) {
+					/* Absorb the gap into the merged range. */
+					last->len = (cur_off - last->file_offset) + len;
+					cur_off += len;
+					continue;
+				}
+			}
+			if (n == cap) {
+				struct eager_range *nw;
+				cap *= 2;
+				nw = xrealloc(arr, cap * sizeof(*arr));
+				if (!nw) {
+					xfree(arr);
+					return -1;
+				}
+				arr = nw;
+			}
+			arr[n].file_offset = cur_off;
+			arr[n].len = len;
+			arr[n].buf_offset = 0; /* assigned after final merge */
+			n++;
+		}
+
+		cur_off += len;
+	}
+
+	/* Assign packed buf_offsets and compute total buffer size. */
+	for (i = 0; i < n; i++) {
+		arr[i].buf_offset = total;
+		total += arr[i].len;
+	}
+
+	*out_ranges = arr;
+	*out_n = n;
+	*out_total_bytes = total;
+	return 0;
+}
+
+/*
+ * Call once at open_page_read_at time, right after init_pagemaps. Collects
+ * eager ranges, allocates a packed buffer, parallel-fetches every range
+ * with a small worker pool, and stores the result in pr->eager_buf. On
+ * any failure the buffer is freed and eager_buf stays NULL — the page_read
+ * then falls through to the existing read-ahead / direct fetch paths with
+ * no correctness regression.
+ */
+static int prefetch_eager_ranges(struct page_read *pr)
+{
+	struct eager_range *ranges = NULL;
+	int nr_ranges = 0;
+	size_t total_bytes = 0;
+	char object_key[PATH_MAX];
+	char image_name[64];
+	const char *prefix;
+	int nw, i, created;
+	pthread_t *tids = NULL;
+	struct eager_worker_arg *args = NULL;
+	struct timespec t0, t1;
+	double wall_ms;
+
+	/* Only applies to object-storage page_reads */
+	if (!opts.enable_object_storage || pr->maybe_read_page != maybe_read_page_object_storage)
+		return 0;
+
+	if (collect_eager_ranges(pr, &ranges, &nr_ranges, &total_bytes) != 0)
+		return -1;
+
+	if (nr_ranges == 0 || total_bytes == 0) {
+		if (ranges)
+			xfree(ranges);
+		return 0;
+	}
+
+	/* Skip prefetch if the total is too small to be worth the worker
+	 * pool overhead. The per-page_read ra_buf window already handles
+	 * tiny workloads well. */
+	if (total_bytes < (256UL * 1024)) {
+		xfree(ranges);
+		return 0;
+	}
+
+	pr_info("eager prefetch: %d ranges, %lu bytes total\n",
+		nr_ranges, (unsigned long)total_bytes);
+
+	pr->eager_buf = xmalloc(total_bytes);
+	if (!pr->eager_buf) {
+		pr_warn("eager prefetch: xmalloc(%lu) failed, skipping\n",
+			(unsigned long)total_bytes);
+		xfree(ranges);
+		return 0;
+	}
+	pr->eager_buf_cap = total_bytes;
+	pr->eager_ranges = ranges;
+	pr->nr_eager_ranges = nr_ranges;
+
+	/* Build the full object key (matching maybe_read_page_object_storage) */
+	snprintf(image_name, sizeof(image_name), "pages-%u.img", pr->pages_img_id);
+	prefix = pr->object_storage_prefix ? pr->object_storage_prefix : opts.object_storage_object_prefix;
+	if (prefix && strlen(prefix) > 0)
+		snprintf(object_key, sizeof(object_key), "%s%s", prefix, image_name);
+	else
+		snprintf(object_key, sizeof(object_key), "%s", image_name);
+
+	/* Worker count: same reasoning as obstor_prefetch — tiny number of
+	 * threads to avoid the libcurl/OpenSSL TLS-handshake serialization
+	 * pathology we hit before. 4 is the sweet spot on m5.8xlarge. */
+	nw = nr_ranges;
+	if (nw > 4)
+		nw = 4;
+
+	tids = xmalloc(nw * sizeof(pthread_t));
+	args = xmalloc(nr_ranges * sizeof(*args));
+	if (!tids || !args) {
+		if (tids)
+			xfree(tids);
+		if (args)
+			xfree(args);
+		xfree(pr->eager_buf);
+		pr->eager_buf = NULL;
+		pr->eager_buf_cap = 0;
+		xfree(pr->eager_ranges);
+		pr->eager_ranges = NULL;
+		pr->nr_eager_ranges = 0;
+		return 0;
+	}
+
+	/* Prepare all work items (fixed object_key pointer — it outlives
+	 * the join). */
+	for (i = 0; i < nr_ranges; i++) {
+		args[i].object_key = object_key;
+		args[i].file_offset = ranges[i].file_offset;
+		args[i].len = ranges[i].len;
+		args[i].dst = (char *)pr->eager_buf + ranges[i].buf_offset;
+		args[i].rc = -1;
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+
+	{
+		struct eager_ss ss;
+		ss.args = args;
+		ss.total = nr_ranges;
+		ss.next = 0;
+		pthread_mutex_init(&ss.lock, NULL);
+
+		created = 0;
+		for (i = 0; i < nw; i++) {
+			if (pthread_create(&tids[i], NULL, eager_drain_worker, &ss) != 0) {
+				pr_warn("eager prefetch: pthread_create %d failed\n", i);
+				break;
+			}
+			created++;
+		}
+
+		if (created == 0) {
+			/* Drain on main thread as last-resort fallback */
+			int idx;
+			for (idx = 0; idx < nr_ranges; idx++) {
+				args[idx].rc = object_storage_fetch_range(
+					args[idx].object_key,
+					args[idx].file_offset,
+					args[idx].len,
+					args[idx].dst,
+					OBJSTOR_SRC_PREFETCH);
+			}
+		} else {
+			for (i = 0; i < created; i++)
+				pthread_join(tids[i], NULL);
+		}
+
+		pthread_mutex_destroy(&ss.lock);
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	wall_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+	/* Check all worker return codes; on any failure, disable eager_buf. */
+	for (i = 0; i < nr_ranges; i++) {
+		if (args[i].rc != 0) {
+			pr_warn("eager prefetch: range %d (off=%ld len=%lu) failed (rc=%d), "
+				"disabling eager_buf\n",
+				i, (long)args[i].file_offset, (unsigned long)args[i].len,
+				args[i].rc);
+			xfree(pr->eager_buf);
+			pr->eager_buf = NULL;
+			pr->eager_buf_cap = 0;
+			xfree(pr->eager_ranges);
+			pr->eager_ranges = NULL;
+			pr->nr_eager_ranges = 0;
+			break;
+		}
+	}
+
+	if (pr->eager_buf)
+		pr_info("eager prefetch: %d ranges, %lu bytes in %.1f ms (%.1f MB/s)\n",
+			nr_ranges, (unsigned long)total_bytes, wall_ms,
+			(total_bytes / 1024.0 / 1024.0) / (wall_ms / 1000.0));
+
+	xfree(tids);
+	xfree(args);
+
+	return 0;
+}
+
+/*
+ * Look up a (pi_off, len) read in the eager buffer. Returns 0 and serves
+ * the data via memcpy if the range is fully contained in any eager_range.
+ * Returns -1 on miss (caller falls through to other paths).
+ */
+static int eager_buf_lookup(struct page_read *pr, void *buf, size_t len)
+{
+	int i;
+
+	if (!pr->eager_buf || pr->nr_eager_ranges == 0)
+		return -1;
+
+	for (i = 0; i < pr->nr_eager_ranges; i++) {
+		struct eager_range *r = &pr->eager_ranges[i];
+		if (pr->pi_off >= r->file_offset &&
+		    pr->pi_off + (off_t)len <= r->file_offset + (off_t)r->len) {
+			size_t rel = (size_t)(pr->pi_off - r->file_offset);
+			memcpy(buf, (char *)pr->eager_buf + r->buf_offset + rel, len);
+			return 0;
+		}
+	}
+	return -1;
+}
+
 /* Function to read page data from Object Storage */
 static int maybe_read_page_object_storage(struct page_read *pr, unsigned long vaddr, int nr, void *buf, unsigned flags)
 {
@@ -489,8 +821,132 @@ static int maybe_read_page_object_storage(struct page_read *pr, unsigned long va
 		}
 	}
 
-	/* Fetch data from object storage */
-	ret = object_storage_fetch_range(object_key, pr->pi_off, len, buf);
+	/*
+	 * Phase 6 M10: eager-prefetch buffer fast path.
+	 *
+	 * If prefetch_eager_ranges() already pulled this byte range in a
+	 * parallel wave at open_page_read_at time, serve directly from
+	 * memory — zero S3 RTT. Miss falls through to the ra_buf window
+	 * and then to the direct-fetch path.
+	 */
+	if (eager_buf_lookup(pr, buf, len) == 0) {
+		pr_debug("Object Storage: eager_buf HIT pi_off=%lu len=%lu\n",
+			 (unsigned long)pr->pi_off, len);
+		ret = 0;
+		if (pr->io_complete) {
+			ret = pr->io_complete(pr, vaddr, nr);
+			if (ret < 0)
+				pr_err("Object Storage: io_complete failed (eager hit) for vaddr %lx\n",
+				       vaddr);
+		}
+		pr->pi_off += len;
+		return ret;
+	}
+
+	/*
+	 * Phase 6: per-page_read read-ahead fast path.
+	 *
+	 * cr-restore's eager pagemap walk issues many small sequential
+	 * reads against the same pages-N.img. pi_off advances monotonically
+	 * inside one page_read instance, so a contiguous in-memory window
+	 * over [ra_start, ra_start + ra_len) absorbs subsequent reads with
+	 * zero S3 GETs as long as they fit. On a miss we refill the window
+	 * with a single GET of size max(len, ra_cap) starting at the
+	 * current pi_off.
+	 *
+	 * io_complete and pi_off advance happen exactly as in the slow
+	 * path — the buffer is purely a transport optimization. No file
+	 * is created on the local filesystem; the buffer lives only as
+	 * long as this page_read.
+	 */
+	if (pr->ra_cap > 0) {
+		off_t hit_lo = pr->pi_off;
+		off_t hit_hi = pr->pi_off + (off_t)len;
+
+		/* Fast path: requested range is already inside the window. */
+		if (pr->ra_len > 0 && hit_lo >= pr->ra_start &&
+		    hit_hi <= pr->ra_start + (off_t)pr->ra_len) {
+			memcpy(buf, (char *)pr->ra_buf + (hit_lo - pr->ra_start), len);
+			pr_debug("Object Storage: read-ahead HIT pi_off=%lu len=%lu "
+				 "(window [%ld..%ld])\n",
+				 (unsigned long)pr->pi_off, len,
+				 (long)pr->ra_start, (long)(pr->ra_start + pr->ra_len));
+			ret = 0;
+			if (pr->io_complete) {
+				ret = pr->io_complete(pr, vaddr, nr);
+				if (ret < 0) {
+					pr_err("Object Storage: io_complete failed (ra hit) for vaddr %lx\n",
+					       vaddr);
+				}
+			}
+			pr->pi_off += len;
+			return ret;
+		}
+
+		/*
+		 * Miss: refill the window. Fetch max(len, ra_cap) bytes
+		 * starting at pi_off into ra_buf, then copy the prefix the
+		 * caller asked for. If the caller's request is larger than
+		 * the window we still satisfy it by issuing a single
+		 * GET-into-ra_buf of len bytes — an oversized request can
+		 * still be served, the only loss is no future read-ahead
+		 * benefit until the next refill.
+		 */
+		{
+			size_t window = pr->ra_cap;
+			if (window < len)
+				window = len;
+			if (window > pr->ra_cap) {
+				/*
+				 * Caller wants more than our buffer can hold.
+				 * Fall back to the original direct-fetch path
+				 * for THIS call only; leave the read-ahead
+				 * window untouched so it can still serve the
+				 * NEXT call.
+				 */
+				pr_debug("Object Storage: read-ahead bypass (len=%lu > ra_cap=%lu)\n",
+					 len, pr->ra_cap);
+				goto direct_fetch;
+			}
+			ret = object_storage_fetch_range(object_key, pr->pi_off, window,
+							 pr->ra_buf, OBJSTOR_SRC_FAULT);
+			if (ret == 0) {
+				pr->ra_start = pr->pi_off;
+				pr->ra_len = window;
+				memcpy(buf, pr->ra_buf, len);
+				pr_debug("Object Storage: read-ahead REFILL "
+					 "pi_off=%lu window=%lu (consumed %lu)\n",
+					 (unsigned long)pr->pi_off, (unsigned long)window, len);
+				if (pr->io_complete) {
+					ret = pr->io_complete(pr, vaddr, nr);
+					if (ret < 0) {
+						pr_err("Object Storage: io_complete failed (ra refill) "
+						       "for vaddr %lx\n", vaddr);
+					}
+				}
+				pr->pi_off += len;
+				return ret;
+			}
+			/*
+			 * Window fetch failed. The most common cause is a
+			 * short read near the end of pages-*.img (S3 returns
+			 * fewer bytes than we asked for because we overshot
+			 * EOF). Disable further read-ahead on this page_read
+			 * so we don't re-pay the same futile refill cost for
+			 * every subsequent read — fall through to direct
+			 * fetch which asks for the caller's exact `len`.
+			 */
+			pr->ra_len = 0;
+			pr->ra_cap = 0;
+			pr_warn("Object Storage: read-ahead refill failed (ret=%d), "
+				"disabling read-ahead for this page_read\n", ret);
+		}
+	}
+
+direct_fetch:
+	/* Fetch data from object storage (fault-driven path: lazy-pages
+	 * daemon is reactively pulling pages for an outstanding UFFD fault). */
+	ret = object_storage_fetch_range(object_key, pr->pi_off, len, buf, OBJSTOR_SRC_FAULT);
 
 	if (ret == 0) {
 		pr_debug("Object Storage: Fetch successful for offset %lu\n", pr->pi_off);
@@ -672,6 +1128,27 @@ static void close_page_read(struct page_read *pr)
 
 	if (pr->pmes)
 		free_pagemaps(pr);
+
+	/* Phase 6: object-storage read-ahead buffer (per-page_read) */
+	if (pr->ra_buf) {
+		xfree(pr->ra_buf);
+		pr->ra_buf = NULL;
+		pr->ra_start = 0;
+		pr->ra_len = 0;
+		pr->ra_cap = 0;
+	}
+
+	/* Phase 6 M10: eager-prefetch buffer (per-page_read) */
+	if (pr->eager_buf) {
+		xfree(pr->eager_buf);
+		pr->eager_buf = NULL;
+		pr->eager_buf_cap = 0;
+	}
+	if (pr->eager_ranges) {
+		xfree(pr->eager_ranges);
+		pr->eager_ranges = NULL;
+		pr->nr_eager_ranges = 0;
+	}
 }
 
 static void reset_pagemap(struct page_read *pr)
@@ -976,6 +1453,14 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->pmes = NULL;
 	pr->pieok = false;
 	pr->disable_dedup = false;
+	pr->ra_buf = NULL;
+	pr->ra_start = 0;
+	pr->ra_len = 0;
+	pr->ra_cap = 0;
+	pr->eager_buf = NULL;
+	pr->eager_buf_cap = 0;
+	pr->eager_ranges = NULL;
+	pr->nr_eager_ranges = 0;
 
 	pr->pmi = open_image_at(dfd, i_typ, O_RSTR, img_id);
 	if (!pr->pmi)
@@ -1035,6 +1520,43 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		        opts.lazy_pages, opts.enable_object_storage);
 		pr->maybe_read_page = maybe_read_page_object_storage;
 		pr->pieok = false;
+
+		/*
+		 * Phase 6: per-page_read read-ahead buffer.
+		 *
+		 * cr-restore's eager pagemap walk hits maybe_read_page_object_storage()
+		 * with many small (1–37 page) sequential requests against the same
+		 * pages-N.img. Without this buffer each call pays one S3 RTT
+		 * (~25 ms same-region, ~80 ms cold). The buffer absorbs subsequent
+		 * reads inside the same window — pi_off advances monotonically
+		 * inside one page_read, so a large window covers a long burst of
+		 * nearby small reads with a single refill. We use 16 MB here —
+		 * a 4 MB window showed only 35% HIT rate because real pagemap
+		 * walks hop across regions larger than 4 MB before coming back.
+		 * At 16 MB the expected HIT rate is 70%+ and the extra memory
+		 * cost is negligible (16 MB × per-task page_reads ≪ a typical
+		 * workload's actual memory).
+		 *
+		 * Allocation is best-effort. If xmalloc fails, ra_cap stays 0 and
+		 * the per-call fast path falls through to the existing
+		 * single-fetch code unchanged.
+		 */
+		pr->ra_cap = 16UL << 20; /* 16 MB */
+		pr->ra_buf = xmalloc(pr->ra_cap);
+		if (!pr->ra_buf) {
+			pr_warn("page_read[%u]: read-ahead buffer alloc failed; "
+				"falling back to per-call S3 fetches\n", pr->id);
+			pr->ra_cap = 0;
+		}
+		pr->ra_start = 0;
+		pr->ra_len = 0;
+
+		/*
+		 * Phase 6 M10: eager prefetch. Kick off a short parallel
+		 * fetch wave for all non-lazy PE_PRESENT entries so the
+		 * main pagemap walk serves them from memory.
+		 */
+		prefetch_eager_ranges(pr);
 	} else {
 		/* Default to local file reading */
 		pr_info("Assigning maybe_read_page_local (lazy_pages: %d, enable_object_storage: %d)\n",

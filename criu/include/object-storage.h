@@ -18,17 +18,25 @@
  */
 
 /* Object Storage fetch events */
-#define OBJSTOR_FETCH_START_LOG(key, offset, len) \
-	pr_info("objstor: FETCH_START key=%s offset=%lu len=%lu\n", \
-		(key), (unsigned long)(offset), (unsigned long)(len))
+#define OBJSTOR_FETCH_START_LOG(key, offset, len, source) \
+	pr_info("objstor: FETCH_START key=%s offset=%lu len=%lu src=%s\n", \
+		(key), (unsigned long)(offset), (unsigned long)(len), (source))
 
-#define OBJSTOR_FETCH_DONE_LOG(key, offset, len, dur_ms) \
-	pr_info("objstor: FETCH_DONE key=%s offset=%lu len=%lu dur_ms=%.2f\n", \
-		(key), (unsigned long)(offset), (unsigned long)(len), (double)(dur_ms))
+/*
+ * NOTE: x_cache and x_amz_cf_pop may be empty strings when the response did
+ * not include the corresponding headers (e.g., direct S3 origin). Always
+ * NUL-terminated by header_callback so it's safe to %s them here. `source`
+ * is one of OBJSTOR_SRC_FAULT / OBJSTOR_SRC_PREFETCH so analysis tooling
+ * can attribute hits to fault-path vs prefetch-path call sites.
+ */
+#define OBJSTOR_FETCH_DONE_LOG(key, offset, len, dur_ms, x_cache, x_pop, source) \
+	pr_info("objstor: FETCH_DONE key=%s offset=%lu len=%lu dur_ms=%.2f x_cache=\"%s\" x_pop=\"%s\" src=%s\n", \
+		(key), (unsigned long)(offset), (unsigned long)(len), (double)(dur_ms), \
+		(x_cache), (x_pop), (source))
 
-#define OBJSTOR_FETCH_ERROR_LOG(key, offset, len, error_code) \
-	pr_err("objstor: FETCH_ERROR key=%s offset=%lu len=%lu error=%d\n", \
-	       (key), (unsigned long)(offset), (unsigned long)(len), (int)(error_code))
+#define OBJSTOR_FETCH_ERROR_LOG(key, offset, len, error_code, source) \
+	pr_err("objstor: FETCH_ERROR key=%s offset=%lu len=%lu error=%d src=%s\n", \
+	       (key), (unsigned long)(offset), (unsigned long)(len), (int)(error_code), (source))
 
 /* Object Storage session events (for Express One Zone) */
 #define OBJSTOR_SESSION_CREATE_LOG() \
@@ -122,16 +130,27 @@
 int object_storage_init(void);
 
 /*
+ * Source of a fetch_range call.  Used to tag the FETCH_START / FETCH_DONE
+ * log lines so post-restore analysis can separate fault-driven fetches from
+ * prefetch worker fetches when computing per-source CDN cache hit ratios.
+ */
+#define OBJSTOR_SRC_FAULT    "fault"
+#define OBJSTOR_SRC_PREFETCH "prefetch"
+
+/*
  * Fetch a range of bytes from an object in object storage
  *
  * @param object_key: The key/path of the object in the bucket
  * @param offset: The starting byte offset to fetch
  * @param length: The number of bytes to fetch
  * @param buffer: Buffer to store the fetched data (must be at least 'length' bytes)
+ * @param source: One of OBJSTOR_SRC_FAULT or OBJSTOR_SRC_PREFETCH (only
+ *                used by the FETCH_* log macros, not stored anywhere)
  *
  * Returns 0 on success, -1 on failure
  */
-int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer);
+int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer,
+			       const char *source);
 
 /*
  * Upload an object to object storage (simple PUT, for files < 5GB)
@@ -154,6 +173,26 @@ int object_storage_put_object(const char *object_key, const void *data, unsigned
  * Returns 0 on success, -ENOENT if not found, -1 on other failure
  */
 int object_storage_get_object(const char *object_key, void **out_data, unsigned long *out_length);
+
+/*
+ * Enumerate object keys under a prefix using S3 ListObjectsV2.
+ * Handles pagination; returned keys are all under the given prefix.
+ *
+ * On success: *out_keys is an xmalloc'd array of xstrdup'd key strings,
+ * *out_n is the count. Caller must xfree each key and free() the array.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int object_storage_list_objects(const char *key_prefix, char ***out_keys, size_t *out_n);
+
+/*
+ * Re-initialize the object-storage client after a fork (e.g. the lazy-pages
+ * daemon child inheriting its parent's curl state). Single-threaded; must
+ * be called before any worker thread starts issuing GETs. Fixes a
+ * serialization pathology where N worker threads racing into libcurl /
+ * OpenSSL lazy-init post-fork each take hundreds of ms for a small GET.
+ */
+int object_storage_reinit_after_fork(void);
 
 /*
  * Multipart upload API — for large files (pages-*.img, > 5MB)
