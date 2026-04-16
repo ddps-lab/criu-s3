@@ -93,11 +93,6 @@
 	pr_info(" REMOVE iov_idx=%d reason=%s\n", \
 		(int)(iov_idx), (reason))
 
-/* Statistics events (emitted at cleanup) */
-#define PREFETCH_STATS_LOG(total_requests, completed, failed, cache_hits, cache_misses) \
-	pr_info(" STATS requests=%lu completed=%lu failed=%lu hits=%lu misses=%lu\n", \
-		(unsigned long)(total_requests), (unsigned long)(completed), \
-		(unsigned long)(failed), (unsigned long)(cache_hits), (unsigned long)(cache_misses))
 
 /* Lazy restore page fault events (uffd.c) */
 #define LAZY_FAULT_LOG(pid, addr, iov_start, iov_end, nr_pages) \

@@ -42,7 +42,6 @@
 #include "fdstore.h"
 #include "util.h"
 #include "namespaces.h"
-#include "page-cache.h"
 #include "obstor_xfer.h"
 #include "obstor_prefetch.h"
 
@@ -1913,30 +1912,15 @@ int cr_lazy_pages(bool daemon)
 
 	/* Initialize async prefetch system if enabled */
 	if (opts.object_storage_parallel_xfer) {
-		/* prefetch_init() will NIC-auto-detect when num_workers <= 0 */
 		int num_workers = opts.prefetch_workers;
-		unsigned long cache_limit = opts.cache_limit_mb;
 
-		/* Initialize page cache.
-		 * total_lazy_bytes is not yet known (lpis not populated),
-		 * so pass 0. cache_init will use available_memory/4 as cap.
-		 * After all uffd connections are established, we could
-		 * refine the limit, but the conservative default is safe. */
-		ret = cache_init(cache_limit, 0);
-		if (ret < 0) {
-			pr_err("Failed to initialize page cache\n");
-			return -1;
-		}
-
-		/* Initialize prefetch system */
 		ret = prefetch_init(num_workers);
 		if (ret < 0) {
 			pr_err("Failed to initialize prefetch system\n");
-			cache_cleanup();
 			return -1;
 		}
 
-		pr_info("Async prefetch initialized: %d workers, cache limit %lu MB\n", num_workers, cache_limit);
+		pr_info("Async prefetch initialized: %d workers\n", num_workers);
 	}
 
 	/*
@@ -1947,27 +1931,14 @@ int cr_lazy_pages(bool daemon)
 	nr_fds = task_entries->nr_tasks + (opts.use_page_server ? 2 : 1);
 	epollfd = epoll_prepare(nr_fds, &events);
 	if (epollfd < 0) {
-		if (opts.object_storage_parallel_xfer) {
+		if (opts.object_storage_parallel_xfer)
 			prefetch_cleanup();
-			cache_cleanup();
-		}
 		return -1;
 	}
 
 	if (prepare_uffds(lazy_sk, epollfd)) {
 		xfree(events);
 		return -1;
-	}
-
-	/* Now all lpis are populated — update cache limit with actual lazy bytes */
-	if (opts.object_storage_parallel_xfer) {
-		struct lazy_pages_info *lpi;
-		unsigned long total_lazy_bytes = 0;
-
-		list_for_each_entry(lpi, &lpis, l)
-			total_lazy_bytes += lpi->total_pages * page_size();
-
-		cache_update_limit(total_lazy_bytes);
 	}
 
 	if (opts.use_page_server) {
@@ -1983,22 +1954,13 @@ int cr_lazy_pages(bool daemon)
 
 	/* Cleanup async prefetch system if enabled */
 	if (opts.object_storage_parallel_xfer) {
-		struct cache_stats cache_stats;
 		struct prefetch_stats prefetch_stats;
 
-		/* Get and print statistics */
-		cache_get_stats(&cache_stats);
 		prefetch_get_stats(&prefetch_stats);
-
-		pr_info("Cache stats: lookups=%lu hits=%lu misses=%lu hit_rate=%.1f%%\n", cache_stats.lookups,
-			cache_stats.hits, cache_stats.misses,
-			cache_stats.lookups > 0 ? (100.0 * cache_stats.hits / cache_stats.lookups) : 0.0);
-
 		pr_info("Prefetch stats: total=%lu completed=%lu failed=%lu bytes=%lu\n", prefetch_stats.total_requests,
 			prefetch_stats.completed, prefetch_stats.failed, prefetch_stats.bytes_prefetched);
 
 		prefetch_cleanup();
-		cache_cleanup();
 	}
 
 	xfree(events);
