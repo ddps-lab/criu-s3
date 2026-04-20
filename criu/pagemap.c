@@ -1750,6 +1750,25 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->bunch.iov_base = NULL;
 	pr->pmes = NULL;
 	pr->pieok = false;
+	/*
+	 * Compression / read-ahead / eager-prefetch state. struct page_read
+	 * lives on the caller's stack (e.g. restore_priv_vma_content's local
+	 * pr) and is not zero-initialized. init_s3_compression() only writes
+	 * these fields on a positive probe, so we must zero them here to
+	 * prevent close_page_read() from calling free()/munmap() on stale
+	 * stack bytes when the probe misses (the raw-image path).
+	 */
+	pr->compressed_mode = false;
+	pr->decompress = NULL;
+	pr->decompress_cookie = NULL;
+	pr->ra_buf = NULL;
+	pr->ra_start = 0;
+	pr->ra_len = 0;
+	pr->ra_cap = 0;
+	pr->eager_buf = NULL;
+	pr->eager_buf_cap = 0;
+	pr->eager_ranges = NULL;
+	pr->nr_eager_ranges = 0;
 	pr->disable_dedup = false;
 	pr->ra_buf = NULL;
 	pr->ra_start = 0;
