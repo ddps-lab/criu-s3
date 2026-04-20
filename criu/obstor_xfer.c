@@ -196,13 +196,18 @@ static int worker_dctx_nheads;
 /* Cookie identical in shape to s3_decomp_cookie in pagemap.c but scoped
  * to this module to keep compilation units independent.
  *
- * tail_buf caches the last tail_len bytes of the compressed pages-*.img —
- * large enough to cover any realistic seek table. ZSTD_seekable's init
- * walks the seek table and serves every read from tail_buf (zero network).
- * Decompress of a frame body issues one Range GET per frame; no state is
- * shared across workers beyond this read-only tail.
+ * tail_buf caches only the zstd-seekable seek-table region at EOF
+ * (exact size, not a fixed window). ZSTD_seekable's init walks the
+ * table and serves every read from tail_buf (zero network). Decompress
+ * of a frame body issues one Range GET per frame; no state is shared
+ * across workers beyond this read-only tail.
  */
-#define XFER_COMP_TAIL_CAP (16UL << 20)
+#define XFER_ZSTD_FOOTER_LEN 9
+#define XFER_ZSTD_SKIP_HDR_LEN 8
+#define XFER_ZSTD_ENTRY_LEN_BASE 8
+#define XFER_ZSTD_ENTRY_LEN_CS 12
+#define XFER_COMP_TAIL_MAX (16UL << 20)
+
 struct xfer_decomp_cookie {
 	char object_key[PATH_MAX];
 	unsigned long total_size;
@@ -210,6 +215,43 @@ struct xfer_decomp_cookie {
 	unsigned long tail_start;
 	size_t tail_len;
 };
+
+static inline uint32_t xfer_read_le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Parse the 9-byte footer of a seekable-format object to derive the
+ * exact byte count the seek table occupies. Returns 0 on parse error. */
+static size_t xfer_seek_table_size(const char *object_key, unsigned long total_size)
+{
+	uint8_t footer[XFER_ZSTD_FOOTER_LEN];
+	unsigned long got = 0;
+	uint32_t num_frames;
+	uint8_t descriptor, entry_size;
+	size_t needed;
+
+	if (total_size < XFER_ZSTD_FOOTER_LEN + XFER_ZSTD_SKIP_HDR_LEN)
+		return 0;
+	if (object_storage_fetch_range_short(object_key,
+					     total_size - XFER_ZSTD_FOOTER_LEN,
+					     XFER_ZSTD_FOOTER_LEN,
+					     footer, &got,
+					     OBJSTOR_SRC_PREFETCH) != 0 ||
+	    got != XFER_ZSTD_FOOTER_LEN)
+		return 0;
+
+	num_frames = xfer_read_le32(footer);
+	descriptor = footer[4];
+	entry_size = (descriptor & 0x80) ? XFER_ZSTD_ENTRY_LEN_CS
+					 : XFER_ZSTD_ENTRY_LEN_BASE;
+
+	needed = XFER_ZSTD_SKIP_HDR_LEN + (size_t)num_frames * entry_size + XFER_ZSTD_FOOTER_LEN;
+	if (needed > XFER_COMP_TAIL_MAX || needed > total_size)
+		return 0;
+	return needed;
+}
 
 static int xfer_decomp_read_cb(void *cookie, off_t offset, size_t length,
 			       void *out)
@@ -324,11 +366,17 @@ xfer_obtain_compress_entry(unsigned int pages_img_id, const char *object_key)
 			c->total_size = size;
 
 			/*
-			 * Fetch only the tail (or full file if smaller). Every
+			 * Fetch the exact seek-table bytes at EOF. Every
 			 * ZSTD_seekable init served from memory; frame bodies
 			 * are fetched on demand during decompress_range().
 			 */
-			c->tail_len = size < XFER_COMP_TAIL_CAP ? (size_t)size : XFER_COMP_TAIL_CAP;
+			c->tail_len = xfer_seek_table_size(object_key, size);
+			if (c->tail_len == 0) {
+				pr_err("obstor_xfer: seek-table footer parse failed\n");
+				xfree(c);
+				e->probed = true;
+				goto done;
+			}
 			c->tail_start = size - c->tail_len;
 			c->tail_buf = xmalloc(c->tail_len);
 			if (!c->tail_buf) {

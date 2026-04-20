@@ -263,10 +263,62 @@ struct s3_decomp_cookie {
 	size_t tail_len;
 };
 
-/* Cap on how much of the file we cache for seek-table parsing. 16 MiB
- * covers ~1.3 M frames (at 12 bytes/entry with checksum) — far more than
- * any realistic CRIU dump. Small files are cached in full. */
-#define S3_COMP_TAIL_CAP (16UL << 20)
+/*
+ * ZSTD seekable format footer (last 9 bytes of the file):
+ *   [num_frames:4B LE] [descriptor:1B] [seekable_magic:4B 0x8F92EAB1]
+ * Seek table layout (end of file, preceded by frame bodies):
+ *   [skippable_frame_header:8B] [seek_table_entries:N*sz] [footer:9B]
+ * where sz = 12 if descriptor bit7 (checksum) is set, else 8.
+ */
+#define ZSTD_SEEK_FOOTER_LEN		9
+#define ZSTD_SKIPPABLE_HDR_LEN		8
+#define ZSTD_SEEK_ENTRY_LEN_BASE	8
+#define ZSTD_SEEK_ENTRY_LEN_CS		12
+
+/* Safety ceiling in case the footer reports a corrupt num_frames. */
+#define S3_COMP_TAIL_MAX (16UL << 20)
+
+static inline uint32_t read_le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/*
+ * Determine the exact byte range the seek table occupies at the end of
+ * a seekable-format pages-*.img. Returns the number of bytes to cache
+ * (measured from the end of the file) on success, 0 on any parse error.
+ * Reads only the 9-byte footer from S3.
+ */
+static size_t s3_seek_table_size(const char *object_key, unsigned long total_size)
+{
+	uint8_t footer[ZSTD_SEEK_FOOTER_LEN];
+	unsigned long got = 0;
+	uint32_t num_frames;
+	uint8_t descriptor, entry_size;
+	size_t needed;
+
+	if (total_size < ZSTD_SEEK_FOOTER_LEN + ZSTD_SKIPPABLE_HDR_LEN)
+		return 0;
+
+	if (object_storage_fetch_range_short(object_key,
+					     total_size - ZSTD_SEEK_FOOTER_LEN,
+					     ZSTD_SEEK_FOOTER_LEN,
+					     footer, &got,
+					     OBJSTOR_SRC_FAULT) != 0 ||
+	    got != ZSTD_SEEK_FOOTER_LEN)
+		return 0;
+
+	num_frames = read_le32(footer);
+	descriptor = footer[4];
+	entry_size = (descriptor & 0x80) ? ZSTD_SEEK_ENTRY_LEN_CS
+					 : ZSTD_SEEK_ENTRY_LEN_BASE;
+
+	needed = ZSTD_SKIPPABLE_HDR_LEN + (size_t)num_frames * entry_size + ZSTD_SEEK_FOOTER_LEN;
+	if (needed > S3_COMP_TAIL_MAX || needed > total_size)
+		return 0;
+	return needed;
+}
 
 static int s3_decomp_read_cb(void *cookie, off_t offset, size_t length, void *out)
 {
@@ -343,14 +395,18 @@ static int init_s3_compression(struct page_read *pr, const char *object_key)
 	cookie->total_size = size;
 
 	/*
-	 * Fetch just the tail of the compressed object. ZSTD_seekable init
-	 * walks the seek table (stored at EOF) with many small reads; serving
-	 * those from memory turns init from N live Range GETs into zero.
-	 * Frame body reads (which land outside the tail window) still go to
-	 * S3 on demand, so memory overhead stays bounded regardless of how
-	 * large the full compressed object is.
+	 * Parse the footer to learn the exact seek-table extent, then pull
+	 * just that many bytes from the end of the file. Most dumps have a
+	 * few hundred frames → seek table well under a megabyte. Init reads
+	 * then all hit tail_buf (zero network); frame body reads go to S3
+	 * on demand.
 	 */
-	cookie->tail_len = size < S3_COMP_TAIL_CAP ? (size_t)size : S3_COMP_TAIL_CAP;
+	cookie->tail_len = s3_seek_table_size(object_key, size);
+	if (cookie->tail_len == 0) {
+		pr_err("init_s3_compression: seek-table footer parse failed\n");
+		xfree(cookie);
+		return -1;
+	}
 	cookie->tail_start = size - cookie->tail_len;
 	cookie->tail_buf = xmalloc(cookie->tail_len);
 	if (!cookie->tail_buf) {
