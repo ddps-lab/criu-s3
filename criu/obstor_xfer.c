@@ -149,28 +149,49 @@ static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
  *
  * When the S3 pages-*.img was dumped with --compress, workers need to
  * route fetches through decompress_range() rather than issuing raw Range
- * GETs for `batch.base_offset .. base_offset + total_bytes`. One decompress
- * context per pages_img_id is kept here; workers serialize their
- * decompress_range calls under the per-entry mutex because the underlying
- * ZSTD_seekable instance isn't thread-safe.
+ * GETs for `batch.base_offset .. base_offset + total_bytes`. Two tiers:
  *
- * Entries are created lazily on the first fetch for a given pages_img_id
- * (see xfer_obtain_decompress). A NULL decompress field after
- * initialization means "already probed and confirmed NOT compressed" so
- * subsequent fetches skip the probe path.
+ *  1) xfer_compress_entry — shared, one per pages_img_id. After the
+ *     initial probe it holds only immutable metadata (object_key,
+ *     total_size, is_compressed flag, shared read-only cookie). All
+ *     workers read from it without locking post-probe.
+ *
+ *  2) worker_dctx — thread-local decompress_ctx cache keyed by
+ *     pages_img_id. Each worker lazily constructs its own ZSTD_seekable
+ *     instance so that decompress_range() runs without cross-worker
+ *     serialization. ZSTD_seekable's DCtx + cursor state isn't
+ *     thread-safe, so the fix is per-thread instances rather than a
+ *     big shared mutex.
+ *
+ * The shared probe_lock is held only for the duration of the initial
+ * S3-size probe; once e->probed==true, late arrivals observe is_compressed
+ * without taking the lock.
  * ----------------------------------------------------------------------- */
 
 struct xfer_compress_entry {
 	unsigned int pages_img_id;
 	bool probed;			/* true after probe attempt */
-	struct decompress_ctx *decompress; /* NULL if not compressed */
-	void *cookie;			/* s3_decomp_cookie from compression.c callers */
-	pthread_mutex_t lock;		/* serializes decompress_range calls */
+	bool is_compressed;		/* probe result: seekable magic found */
+	char object_key[PATH_MAX];
+	unsigned long total_size;	/* file length in bytes (post-probe) */
+	void *cookie;			/* xfer_decomp_cookie, shared read-only */
+	pthread_mutex_t probe_lock;	/* held only during initial probe */
 	struct xfer_compress_entry *next;
 };
 
 static struct xfer_compress_entry *xfer_compress_list;
 static pthread_mutex_t xfer_compress_list_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Per-worker decompress_ctx cache — each worker owns one linked list and
+ * never shares its decompress_ctx instances with other workers. */
+struct worker_dctx_entry {
+	unsigned int pages_img_id;
+	struct decompress_ctx *d;
+	struct worker_dctx_entry *next;
+};
+
+static struct worker_dctx_entry **worker_dctx_heads;	/* [num_workers] */
+static int worker_dctx_nheads;
 
 /* Cookie identical in shape to s3_decomp_cookie in pagemap.c but scoped
  * to this module to keep compilation units independent. */
@@ -197,13 +218,13 @@ static int xfer_decomp_read_cb(void *cookie, off_t offset, size_t length,
 }
 
 /*
- * Look up (and lazily create) the decompress_ctx for a given pages_img_id.
- * Returns the entry on success; its ->decompress is NULL when the image
- * is not compressed. NULL return indicates an allocation / probe failure
- * and the caller should fall through to the raw-fetch path.
+ * Look up (and lazily probe) the shared metadata entry for a given
+ * pages_img_id. Returns the entry with e->probed==true on success.
+ * is_compressed reflects the probe outcome; false means the image is raw
+ * and callers should take the direct-fetch path.
  */
 static struct xfer_compress_entry *
-xfer_obtain_decompress(unsigned int pages_img_id, const char *object_key)
+xfer_obtain_compress_entry(unsigned int pages_img_id, const char *object_key)
 {
 	struct xfer_compress_entry *e;
 
@@ -213,11 +234,11 @@ xfer_obtain_decompress(unsigned int pages_img_id, const char *object_key)
 			pthread_mutex_unlock(&xfer_compress_list_lock);
 			/*
 			 * Another worker may still be in the probe critical
-			 * section on this entry. Block on e->lock so we only
-			 * return once e->decompress and e->probed are final.
+			 * section. Block on probe_lock so we only return
+			 * once probed / is_compressed are final.
 			 */
-			pthread_mutex_lock(&e->lock);
-			pthread_mutex_unlock(&e->lock);
+			pthread_mutex_lock(&e->probe_lock);
+			pthread_mutex_unlock(&e->probe_lock);
 			return e;
 		}
 	}
@@ -229,25 +250,22 @@ xfer_obtain_decompress(unsigned int pages_img_id, const char *object_key)
 		return NULL;
 	}
 	e->pages_img_id = pages_img_id;
-	pthread_mutex_init(&e->lock, NULL);
-	/* Hold e->lock before publishing the entry so any concurrent lookup
-	 * that races in will block on it until the probe is complete. */
-	pthread_mutex_lock(&e->lock);
+	snprintf(e->object_key, sizeof(e->object_key), "%s", object_key);
+	pthread_mutex_init(&e->probe_lock, NULL);
+	/* Hold probe_lock before publishing so late lookups block until
+	 * the probe completes. */
+	pthread_mutex_lock(&e->probe_lock);
 	e->next = xfer_compress_list;
 	xfer_compress_list = e;
 	pthread_mutex_unlock(&xfer_compress_list_lock);
 
 	/*
-	 * Probe the image tail for the zstd seekable magic. If we find it,
-	 * stand up a decompress_ctx bound to the object key via our read
-	 * callback. Otherwise leave e->decompress=NULL so future lookups
-	 * take the raw-fetch branch without re-probing.
-	 *
-	 * e->lock is already held from above — we grabbed it before
-	 * publishing this entry into the global list precisely so that
-	 * late-arriving lookups block on it until probing finishes.
+	 * Probe the image for zstd seekable magic. On success record
+	 * total_size + is_compressed + shared cookie and let each worker
+	 * build its own decompress_ctx on demand. On failure leave
+	 * is_compressed=false so the raw-fetch branch is taken.
 	 */
-	if (!e->probed) {
+	{
 		uint8_t tail[4096];
 		unsigned long tail_got = 0;
 		int rc;
@@ -262,14 +280,12 @@ xfer_obtain_decompress(unsigned int pages_img_id, const char *object_key)
 		}
 
 		if (tail_got < sizeof(tail)) {
-			/* File fits in first probe — check its last 4 bytes. */
 			if (decompress_probe(tail + tail_got - 4, 4) != 1) {
 				e->probed = true;
 				goto done;
 			}
 			size = tail_got;
 		} else {
-			/* Geometric size search (mirrors init_s3_compression). */
 			void *scratch = NULL;
 			size_t scratch_cap = 0;
 			size_t step = sizeof(tail);
@@ -315,7 +331,6 @@ xfer_obtain_decompress(unsigned int pages_img_id, const char *object_key)
 			}
 		}
 
-		/* Magic found — wire up the lazy decompressor. */
 		{
 			struct xfer_decomp_cookie *c = xzalloc(sizeof(*c));
 			if (!c) {
@@ -325,24 +340,52 @@ xfer_obtain_decompress(unsigned int pages_img_id, const char *object_key)
 			snprintf(c->object_key, sizeof(c->object_key), "%s",
 				 object_key);
 			c->total_size = size;
-			e->decompress = decompress_create_lazy(NULL, 0,
-							       (off_t)size,
-							       xfer_decomp_read_cb,
-							       c);
-			if (!e->decompress) {
-				xfree(c);
-				e->probed = true;
-				goto done;
-			}
 			e->cookie = c;
+			e->total_size = size;
+			e->is_compressed = true;
 			pr_info("obstor_xfer: detected compressed pages-%u (%lu bytes)\n",
 				pages_img_id, size);
 		}
 		e->probed = true;
 	}
 done:
-	pthread_mutex_unlock(&e->lock);
+	pthread_mutex_unlock(&e->probe_lock);
 	return e;
+}
+
+/*
+ * Return this worker's private decompress_ctx for the given entry,
+ * constructing one on first use. NULL means the worker should fall back
+ * to a raw fetch (either entry is not compressed, or ZSTD init failed).
+ *
+ * The caller must have verified e->is_compressed before calling.
+ */
+static struct decompress_ctx *
+worker_get_decompress(int worker_id, struct xfer_compress_entry *e)
+{
+	struct worker_dctx_entry *w;
+
+	if (worker_id < 0 || worker_id >= worker_dctx_nheads)
+		return NULL;
+
+	for (w = worker_dctx_heads[worker_id]; w; w = w->next) {
+		if (w->pages_img_id == e->pages_img_id)
+			return w->d;
+	}
+
+	w = xzalloc(sizeof(*w));
+	if (!w)
+		return NULL;
+	w->pages_img_id = e->pages_img_id;
+	w->d = decompress_create_lazy(NULL, 0, (off_t)e->total_size,
+				      xfer_decomp_read_cb, e->cookie);
+	if (!w->d) {
+		xfree(w);
+		return NULL;
+	}
+	w->next = worker_dctx_heads[worker_id];
+	worker_dctx_heads[worker_id] = w;
+	return w->d;
 }
 
 /* global_lpi and global_pages_img_id removed — now stored per-IOV in iov_meta */
@@ -1011,22 +1054,24 @@ static void *prefetch_worker(void *arg)
 			pr_debug("obstor_xfer: Worker %d: Fetching %s offset=%lu size=%lu (n=%d)\n",
 				 worker_id, object_key, batch.base_offset, batch.total_bytes, n);
 
-			ce = xfer_obtain_decompress(batch.pages_img_id, object_key);
-			if (ce && ce->decompress) {
+			ce = xfer_obtain_compress_entry(batch.pages_img_id, object_key);
+			if (ce && ce->is_compressed) {
 				/*
 				 * Compressed mode: batch.base_offset is an
-				 * uncompressed offset. Serialize decompress_range
-				 * calls on this pages_img_id — the underlying
-				 * ZSTD_seekable holds per-call state that isn't
-				 * safe to share across threads. (Moving to
-				 * per-worker contexts is the obvious throughput
-				 * follow-up — see phase6-compression-progress.md.)
+				 * uncompressed offset. Each worker holds its
+				 * own ZSTD_seekable, so decompress_range() runs
+				 * in parallel across workers with zero cross-
+				 * worker locking.
 				 */
-				pthread_mutex_lock(&ce->lock);
-				ret = decompress_range(ce->decompress,
-						       (off_t)batch.base_offset,
-						       batch.total_bytes, data);
-				pthread_mutex_unlock(&ce->lock);
+				struct decompress_ctx *d =
+					worker_get_decompress(worker_id, ce);
+				if (d) {
+					ret = decompress_range(d,
+							       (off_t)batch.base_offset,
+							       batch.total_bytes, data);
+				} else {
+					ret = -1;
+				}
 				if (ret != 0) {
 					PREFETCH_WORKER_ERROR_LOG(worker_id, head->iov_index, ret);
 					pr_err("obstor_xfer: Worker %d: compressed fetch failed "
@@ -1126,6 +1171,18 @@ int prefetch_init(int num_worker_threads)
 		return -ENOMEM;
 	}
 
+	/* Allocate per-worker decompress caches (zero-initialized). Each
+	 * worker builds its own ZSTD_seekable lazily on first compressed
+	 * fetch, and only ever touches worker_dctx_heads[worker_id]. */
+	worker_dctx_heads = xzalloc(num_workers * sizeof(*worker_dctx_heads));
+	if (!worker_dctx_heads) {
+		pr_err("Failed to allocate worker decompress caches\n");
+		xfree(worker_threads);
+		worker_threads = NULL;
+		return -ENOMEM;
+	}
+	worker_dctx_nheads = num_workers;
+
 	workers_running = true;
 
 	for (i = 0; i < num_workers; i++) {
@@ -1172,17 +1229,33 @@ void prefetch_cleanup(void)
 		worker_threads = NULL;
 	}
 
-	/* Free compressed-mode decompress entries. Workers are already
-	 * joined at this point so no new entries can be added. */
+	/*
+	 * Tear down the compressed-mode caches. Workers are already joined,
+	 * so per-worker decompress_ctx instances can be destroyed first,
+	 * followed by the shared metadata + cookie.
+	 */
+	if (worker_dctx_heads) {
+		for (i = 0; i < worker_dctx_nheads; i++) {
+			struct worker_dctx_entry *w, *wnext;
+			for (w = worker_dctx_heads[i]; w; w = wnext) {
+				wnext = w->next;
+				if (w->d)
+					decompress_free(w->d);
+				xfree(w);
+			}
+			worker_dctx_heads[i] = NULL;
+		}
+		xfree(worker_dctx_heads);
+		worker_dctx_heads = NULL;
+		worker_dctx_nheads = 0;
+	}
 	{
 		struct xfer_compress_entry *e, *tmp;
 		pthread_mutex_lock(&xfer_compress_list_lock);
 		for (e = xfer_compress_list; e; e = tmp) {
 			tmp = e->next;
-			if (e->decompress)
-				decompress_free(e->decompress);
 			xfree(e->cookie);
-			pthread_mutex_destroy(&e->lock);
+			pthread_mutex_destroy(&e->probe_lock);
 			xfree(e);
 		}
 		xfer_compress_list = NULL;
