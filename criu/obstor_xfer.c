@@ -194,10 +194,21 @@ static struct worker_dctx_entry **worker_dctx_heads;	/* [num_workers] */
 static int worker_dctx_nheads;
 
 /* Cookie identical in shape to s3_decomp_cookie in pagemap.c but scoped
- * to this module to keep compilation units independent. */
+ * to this module to keep compilation units independent.
+ *
+ * tail_buf caches the last tail_len bytes of the compressed pages-*.img —
+ * large enough to cover any realistic seek table. ZSTD_seekable's init
+ * walks the seek table and serves every read from tail_buf (zero network).
+ * Decompress of a frame body issues one Range GET per frame; no state is
+ * shared across workers beyond this read-only tail.
+ */
+#define XFER_COMP_TAIL_CAP (16UL << 20)
 struct xfer_decomp_cookie {
 	char object_key[PATH_MAX];
 	unsigned long total_size;
+	void *tail_buf;
+	unsigned long tail_start;
+	size_t tail_len;
 };
 
 static int xfer_decomp_read_cb(void *cookie, off_t offset, size_t length,
@@ -205,9 +216,19 @@ static int xfer_decomp_read_cb(void *cookie, off_t offset, size_t length,
 {
 	struct xfer_decomp_cookie *c = cookie;
 	unsigned long got = 0;
+	unsigned long uoff = (unsigned long)offset;
 	int rc;
 
-	rc = object_storage_fetch_range_short(c->object_key, (unsigned long)offset,
+	/* Tail cache hit: seek-table & trailing frame reads from memory. */
+	if (c->tail_buf && c->tail_len > 0 &&
+	    uoff >= c->tail_start &&
+	    uoff + length <= c->tail_start + c->tail_len) {
+		memcpy(out, (char *)c->tail_buf + (uoff - c->tail_start), length);
+		return 0;
+	}
+
+	/* Miss — actual frame body. One Range GET. */
+	rc = object_storage_fetch_range_short(c->object_key, uoff,
 					      (unsigned long)length, out, &got,
 					      OBJSTOR_SRC_PREFETCH);
 	if (rc != 0)
@@ -293,6 +314,7 @@ xfer_obtain_compress_entry(unsigned int pages_img_id, const char *object_key)
 
 		{
 			struct xfer_decomp_cookie *c = xzalloc(sizeof(*c));
+			unsigned long got = 0;
 			if (!c) {
 				e->probed = true;
 				goto done;
@@ -300,11 +322,40 @@ xfer_obtain_compress_entry(unsigned int pages_img_id, const char *object_key)
 			snprintf(c->object_key, sizeof(c->object_key), "%s",
 				 object_key);
 			c->total_size = size;
+
+			/*
+			 * Fetch only the tail (or full file if smaller). Every
+			 * ZSTD_seekable init served from memory; frame bodies
+			 * are fetched on demand during decompress_range().
+			 */
+			c->tail_len = size < XFER_COMP_TAIL_CAP ? (size_t)size : XFER_COMP_TAIL_CAP;
+			c->tail_start = size - c->tail_len;
+			c->tail_buf = xmalloc(c->tail_len);
+			if (!c->tail_buf) {
+				pr_err("obstor_xfer: tail xmalloc(%zu) failed\n", c->tail_len);
+				xfree(c);
+				e->probed = true;
+				goto done;
+			}
+			if (object_storage_fetch_range_short(object_key,
+							     c->tail_start,
+							     c->tail_len,
+							     c->tail_buf, &got,
+							     OBJSTOR_SRC_PREFETCH) != 0 ||
+			    got != c->tail_len) {
+				pr_err("obstor_xfer: tail fetch failed (got=%lu/%zu)\n",
+				       got, c->tail_len);
+				xfree(c->tail_buf);
+				xfree(c);
+				e->probed = true;
+				goto done;
+			}
+
 			e->cookie = c;
 			e->total_size = size;
 			e->is_compressed = true;
-			pr_info("obstor_xfer: detected compressed pages-%u (%lu bytes)\n",
-				pages_img_id, size);
+			pr_info("obstor_xfer: detected compressed pages-%u (total=%lu bytes, cached tail=%zu)\n",
+				pages_img_id, size, c->tail_len);
 		}
 		e->probed = true;
 	}
@@ -1214,7 +1265,12 @@ void prefetch_cleanup(void)
 		pthread_mutex_lock(&xfer_compress_list_lock);
 		for (e = xfer_compress_list; e; e = tmp) {
 			tmp = e->next;
-			xfree(e->cookie);
+			if (e->cookie) {
+				struct xfer_decomp_cookie *c = e->cookie;
+				if (c->tail_buf)
+					xfree(c->tail_buf);
+				xfree(c);
+			}
 			pthread_mutex_destroy(&e->probe_lock);
 			xfree(e);
 		}

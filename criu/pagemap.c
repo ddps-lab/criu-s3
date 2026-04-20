@@ -240,37 +240,64 @@ static int read_parent_page(struct page_read *pr, unsigned long vaddr, int nr, v
 }
 
 /*
- * Callback cookie for decompress_create_lazy() on S3 pages-*.img.
- * Gives the seekable decoder a way to issue Range GETs against
- * the object it lives on without pulling the whole file into RAM.
+ * Callback cookie for S3 pages-*.img compressed reads.
+ *
+ * The zstd seekable format puts its seek table (one entry per frame) at
+ * the end of the file. ZSTD_seekable's customFile init walks that table
+ * with many small reads; if every read were a live Range GET, init alone
+ * would cost hundreds of 30-ms RTTs.
+ *
+ * Fix: pre-fetch the tail of the object (large enough to cover any
+ * realistic seek table) into tail_buf once at probe time. s3_decomp_read_cb
+ * serves any read that falls inside [tail_start, tail_start + tail_len)
+ * from memory — so every ZSTD_seekable init hits memory — while reads of
+ * actual compressed frame bytes (anywhere earlier in the file) fall
+ * through to object_storage_fetch_range_short. One Range GET per frame on
+ * decompress, zero RTTs on init.
  */
 struct s3_decomp_cookie {
 	char object_key[PATH_MAX];
 	unsigned long total_size;
+	void *tail_buf;		/* last tail_len bytes of the object */
+	unsigned long tail_start;
+	size_t tail_len;
 };
+
+/* Cap on how much of the file we cache for seek-table parsing. 16 MiB
+ * covers ~1.3 M frames (at 12 bytes/entry with checksum) — far more than
+ * any realistic CRIU dump. Small files are cached in full. */
+#define S3_COMP_TAIL_CAP (16UL << 20)
 
 static int s3_decomp_read_cb(void *cookie, off_t offset, size_t length, void *out)
 {
 	struct s3_decomp_cookie *c = cookie;
 	unsigned long got = 0;
+	unsigned long uoff = (unsigned long)offset;
 	int rc;
 
 	/*
-	 * The seekable decoder requests the last bytes of the file first
-	 * to parse the seek table. Use the tolerant short-read variant so
-	 * tail probes don't error out just because the range extends a few
-	 * bytes past EOF.
+	 * Tail cache hit: entire requested range sits inside the pre-fetched
+	 * tail. Memory serve, no network.
 	 */
-	rc = object_storage_fetch_range_short(c->object_key, (unsigned long)offset,
+	if (c->tail_buf && c->tail_len > 0 &&
+	    uoff >= c->tail_start &&
+	    uoff + length <= c->tail_start + c->tail_len) {
+		memcpy(out, (char *)c->tail_buf + (uoff - c->tail_start), length);
+		return 0;
+	}
+
+	/*
+	 * Miss (i.e. a compressed frame body somewhere earlier in the file).
+	 * Range GET once; short reads past EOF get zero-padded because the
+	 * seekable decoder may overshoot the last frame.
+	 */
+	rc = object_storage_fetch_range_short(c->object_key, uoff,
 					      (unsigned long)length, out, &got,
 					      OBJSTOR_SRC_FAULT);
 	if (rc != 0)
 		return -1;
-	if (got != length) {
-		/* Pad the short tail with zeros; the decoder only indexes
-		 * into bytes it actually wrote and will ignore the pad. */
+	if (got != length)
 		memset((char *)out + got, 0, length - got);
-	}
 	return 0;
 }
 
@@ -315,13 +342,46 @@ static int init_s3_compression(struct page_read *pr, const char *object_key)
 	snprintf(cookie->object_key, sizeof(cookie->object_key), "%s", object_key);
 	cookie->total_size = size;
 
-	pr_info("page-read: detected compressed S3 pages-*.img %s (%lu bytes)\n",
-		object_key, cookie->total_size);
+	/*
+	 * Fetch just the tail of the compressed object. ZSTD_seekable init
+	 * walks the seek table (stored at EOF) with many small reads; serving
+	 * those from memory turns init from N live Range GETs into zero.
+	 * Frame body reads (which land outside the tail window) still go to
+	 * S3 on demand, so memory overhead stays bounded regardless of how
+	 * large the full compressed object is.
+	 */
+	cookie->tail_len = size < S3_COMP_TAIL_CAP ? (size_t)size : S3_COMP_TAIL_CAP;
+	cookie->tail_start = size - cookie->tail_len;
+	cookie->tail_buf = xmalloc(cookie->tail_len);
+	if (!cookie->tail_buf) {
+		pr_err("init_s3_compression: tail xmalloc(%zu) failed\n", cookie->tail_len);
+		xfree(cookie);
+		return -1;
+	}
+	{
+		unsigned long got = 0;
+		if (object_storage_fetch_range_short(object_key,
+						     cookie->tail_start,
+						     cookie->tail_len,
+						     cookie->tail_buf, &got,
+						     OBJSTOR_SRC_FAULT) != 0 ||
+		    got != cookie->tail_len) {
+			pr_err("init_s3_compression: tail fetch failed (got=%lu/%zu)\n",
+			       got, cookie->tail_len);
+			xfree(cookie->tail_buf);
+			xfree(cookie);
+			return -1;
+		}
+	}
+
+	pr_info("page-read: detected compressed S3 pages-*.img %s (total=%lu bytes, cached tail=%zu)\n",
+		object_key, cookie->total_size, cookie->tail_len);
 
 	pr->decompress = decompress_create_lazy(NULL, 0,
 						(off_t)cookie->total_size,
 						s3_decomp_read_cb, cookie);
 	if (!pr->decompress) {
+		xfree(cookie->tail_buf);
 		xfree(cookie);
 		return -1;
 	}
@@ -752,9 +812,24 @@ struct eager_ss {
 	pthread_mutex_t lock;
 };
 
+/*
+ * Per-thread context for an eager-prefetch worker. ss is shared; dctx is
+ * owned by this worker and non-NULL only for compressed-mode page_reads.
+ *
+ * ZSTD_seekable state (held inside decompress_ctx) is not thread-safe, so
+ * each worker decompresses through its own instance rather than serializing
+ * on pr->decompress. The shared cookie is safe to point all of them at
+ * because the read-callback only reads immutable fields.
+ */
+struct eager_worker_ctx {
+	struct eager_ss *ss;
+	struct decompress_ctx *dctx;	/* NULL for raw mode */
+};
+
 static void *eager_drain_worker(void *arg)
 {
-	struct eager_ss *ss = (struct eager_ss *)arg;
+	struct eager_worker_ctx *wctx = (struct eager_worker_ctx *)arg;
+	struct eager_ss *ss = wctx->ss;
 	int idx;
 
 	while (1) {
@@ -766,12 +841,30 @@ static void *eager_drain_worker(void *arg)
 		idx = ss->next++;
 		pthread_mutex_unlock(&ss->lock);
 
-		ss->args[idx].rc = object_storage_fetch_range(
-			ss->args[idx].object_key,
-			ss->args[idx].file_offset,
-			ss->args[idx].len,
-			ss->args[idx].dst,
-			OBJSTOR_SRC_PREFETCH);
+		if (wctx->dctx) {
+			/*
+			 * Compressed mode: file_offset/len are *uncompressed*
+			 * values (from the pagemap). decompress_range() turns
+			 * that into compressed-byte Range GETs internally via
+			 * the seekable decoder and writes the plain pages into
+			 * dst — downstream consumers (eager_buf_lookup etc.)
+			 * see uncompressed bytes just like the raw path.
+			 */
+			if (decompress_range(wctx->dctx,
+					     ss->args[idx].file_offset,
+					     ss->args[idx].len,
+					     ss->args[idx].dst) == 0)
+				ss->args[idx].rc = 0;
+			else
+				ss->args[idx].rc = -1;
+		} else {
+			ss->args[idx].rc = object_storage_fetch_range(
+				ss->args[idx].object_key,
+				ss->args[idx].file_offset,
+				ss->args[idx].len,
+				ss->args[idx].dst,
+				OBJSTOR_SRC_PREFETCH);
+		}
 	}
 	return NULL;
 }
@@ -886,14 +979,6 @@ static int prefetch_eager_ranges(struct page_read *pr)
 	if (!opts.enable_object_storage || pr->maybe_read_page != maybe_read_page_object_storage)
 		return 0;
 
-	/*
-	 * Compressed mode routes every read through decompress_range(), which
-	 * has its own internal seek-table-aware caching. The eager prefetch
-	 * buffer assumes byte offsets into a raw file, so skip it.
-	 */
-	if (pr->compressed_mode)
-		return 0;
-
 	if (collect_eager_ranges(pr, &ranges, &nr_ranges, &total_bytes) != 0)
 		return -1;
 
@@ -970,14 +1055,60 @@ static int prefetch_eager_ranges(struct page_read *pr)
 
 	{
 		struct eager_ss ss;
+		struct eager_worker_ctx *wctxs = NULL;
+
 		ss.args = args;
 		ss.total = nr_ranges;
 		ss.next = 0;
 		pthread_mutex_init(&ss.lock, NULL);
 
+		/*
+		 * Each worker needs its own struct eager_worker_ctx so it can
+		 * carry a private decompress_ctx in compressed mode. For raw
+		 * mode the dctx field stays NULL and the worker just calls
+		 * object_storage_fetch_range as before.
+		 */
+		wctxs = xzalloc(nw * sizeof(*wctxs));
+		if (!wctxs) {
+			pr_warn("eager prefetch: alloc worker ctx failed\n");
+			pthread_mutex_destroy(&ss.lock);
+			xfree(tids);
+			xfree(args);
+			xfree(pr->eager_buf);
+			pr->eager_buf = NULL;
+			pr->eager_buf_cap = 0;
+			xfree(pr->eager_ranges);
+			pr->eager_ranges = NULL;
+			pr->nr_eager_ranges = 0;
+			return 0;
+		}
+
+		for (i = 0; i < nw; i++) {
+			wctxs[i].ss = &ss;
+			wctxs[i].dctx = NULL;
+			if (pr->compressed_mode && pr->decompress_cookie) {
+				struct s3_decomp_cookie *c = pr->decompress_cookie;
+				/*
+				 * Per-worker ZSTD_seekable initialized via the
+				 * tail-cached customFile. Init reads the seek
+				 * table entirely from cookie->tail_buf (zero
+				 * network). Decompress of a frame issues one
+				 * Range GET for that frame's compressed bytes.
+				 */
+				wctxs[i].dctx = decompress_create_lazy(
+					NULL, 0,
+					(off_t)c->total_size,
+					s3_decomp_read_cb, c);
+				if (!wctxs[i].dctx) {
+					pr_warn("eager prefetch: per-worker decompress_ctx init failed (worker %d)\n", i);
+					/* best-effort: fall back to serial decompress via pr->decompress */
+				}
+			}
+		}
+
 		created = 0;
 		for (i = 0; i < nw; i++) {
-			if (pthread_create(&tids[i], NULL, eager_drain_worker, &ss) != 0) {
+			if (pthread_create(&tids[i], NULL, eager_drain_worker, &wctxs[i]) != 0) {
 				pr_warn("eager prefetch: pthread_create %d failed\n", i);
 				break;
 			}
@@ -988,18 +1119,31 @@ static int prefetch_eager_ranges(struct page_read *pr)
 			/* Drain on main thread as last-resort fallback */
 			int idx;
 			for (idx = 0; idx < nr_ranges; idx++) {
-				args[idx].rc = object_storage_fetch_range(
-					args[idx].object_key,
-					args[idx].file_offset,
-					args[idx].len,
-					args[idx].dst,
-					OBJSTOR_SRC_PREFETCH);
+				if (pr->compressed_mode && pr->decompress) {
+					args[idx].rc = decompress_range(pr->decompress,
+									args[idx].file_offset,
+									args[idx].len,
+									args[idx].dst) == 0 ? 0 : -1;
+				} else {
+					args[idx].rc = object_storage_fetch_range(
+						args[idx].object_key,
+						args[idx].file_offset,
+						args[idx].len,
+						args[idx].dst,
+						OBJSTOR_SRC_PREFETCH);
+				}
 			}
 		} else {
 			for (i = 0; i < created; i++)
 				pthread_join(tids[i], NULL);
 		}
 
+		/* Tear down per-worker decompress contexts. */
+		for (i = 0; i < nw; i++) {
+			if (wctxs[i].dctx)
+				decompress_free(wctxs[i].dctx);
+		}
+		xfree(wctxs);
 		pthread_mutex_destroy(&ss.lock);
 	}
 
@@ -1423,7 +1567,10 @@ static void close_page_read(struct page_read *pr)
 		pr->compressed_mode = false;
 	}
 	if (pr->decompress_cookie) {
-		xfree(pr->decompress_cookie);
+		struct s3_decomp_cookie *c = pr->decompress_cookie;
+		if (c->tail_buf)
+			xfree(c->tail_buf);
+		xfree(c);
 		pr->decompress_cookie = NULL;
 	}
 
