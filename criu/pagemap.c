@@ -289,20 +289,20 @@ static int init_local_compression(struct page_read *pr)
 	pr_info("page-read: detected zstd seekable pages-*.img (%lld bytes compressed)\n",
 		(long long)st.st_size);
 
-	/* Slurp compressed file into memory. */
-	src_buf = xmalloc(st.st_size);
-	if (!src_buf)
+	/*
+	 * Map the compressed file read-only instead of slurping via read().
+	 * The seekable decoder only needs random-access bytes; MAP_PRIVATE
+	 * lets the kernel demand-page from the backing file and never
+	 * counts the bytes against CRIU's RSS (unlike a heap slurp).
+	 */
+	src_buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, src_fd, 0);
+	if (src_buf == MAP_FAILED) {
+		pr_perror("init_local_compression: mmap compressed");
+		src_buf = NULL;
 		return -1;
-
-	off = 0;
-	while (off < st.st_size) {
-		n = pread(src_fd, (char *)src_buf + off, st.st_size - off, off);
-		if (n <= 0) {
-			pr_perror("init_local_compression: pread body");
-			goto err;
-		}
-		off += n;
 	}
+	(void)off;
+	(void)n;
 
 	dctx = decompress_create_from_buffer(src_buf, st.st_size);
 	if (!dctx)
@@ -360,7 +360,7 @@ static int init_local_compression(struct page_read *pr)
 	pr->pi->_x.fd = mfd;
 
 	decompress_free(dctx);
-	xfree(src_buf);
+	munmap(src_buf, st.st_size);
 
 	/* Intentionally do NOT set pr->compressed_mode / pr->decompress — from
 	 * this point on pr->pi points at a raw pages-*.img (in memfd). Every
@@ -371,7 +371,7 @@ err:
 	if (dctx)
 		decompress_free(dctx);
 	if (src_buf)
-		xfree(src_buf);
+		munmap(src_buf, st.st_size);
 	if (dst_buf)
 		xfree(dst_buf);
 	return -1;
