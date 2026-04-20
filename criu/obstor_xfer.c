@@ -207,6 +207,8 @@ static int worker_dctx_nheads;
 #define XFER_ZSTD_ENTRY_LEN_BASE 8
 #define XFER_ZSTD_ENTRY_LEN_CS 12
 #define XFER_COMP_TAIL_MAX (16UL << 20)
+/* Full-slurp threshold — see S3_COMP_FULL_SLURP in pagemap.c. */
+#define XFER_COMP_FULL_SLURP (64UL << 20)
 
 struct xfer_decomp_cookie {
 	char object_key[PATH_MAX];
@@ -366,16 +368,19 @@ xfer_obtain_compress_entry(unsigned int pages_img_id, const char *object_key)
 			c->total_size = size;
 
 			/*
-			 * Fetch the exact seek-table bytes at EOF. Every
-			 * ZSTD_seekable init served from memory; frame bodies
-			 * are fetched on demand during decompress_range().
+			 * Small files: cache the whole object so every
+			 * decompress_range() runs 0-RTT. Large files: cache
+			 * just the seek table, frame bodies fetched on demand.
 			 */
-			c->tail_len = xfer_seek_table_size(object_key, size);
-			if (c->tail_len == 0) {
-				pr_err("obstor_xfer: seek-table footer parse failed\n");
-				xfree(c);
-				e->probed = true;
-				goto done;
+			{
+				size_t sk = xfer_seek_table_size(object_key, size);
+				if (sk == 0) {
+					pr_err("obstor_xfer: seek-table footer parse failed\n");
+					xfree(c);
+					e->probed = true;
+					goto done;
+				}
+				c->tail_len = (size <= XFER_COMP_FULL_SLURP) ? (size_t)size : sk;
 			}
 			c->tail_start = size - c->tail_len;
 			c->tail_buf = xmalloc(c->tail_len);
