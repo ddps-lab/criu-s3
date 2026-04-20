@@ -240,6 +240,170 @@ static int read_parent_page(struct page_read *pr, unsigned long vaddr, int nr, v
 }
 
 /*
+ * Callback cookie for decompress_create_lazy() on S3 pages-*.img.
+ * Gives the seekable decoder a way to issue Range GETs against
+ * the object it lives on without pulling the whole file into RAM.
+ */
+struct s3_decomp_cookie {
+	char object_key[PATH_MAX];
+	unsigned long total_size;
+};
+
+static int s3_decomp_read_cb(void *cookie, off_t offset, size_t length, void *out)
+{
+	struct s3_decomp_cookie *c = cookie;
+	unsigned long got = 0;
+	int rc;
+
+	/*
+	 * The seekable decoder requests the last bytes of the file first
+	 * to parse the seek table. Use the tolerant short-read variant so
+	 * tail probes don't error out just because the range extends a few
+	 * bytes past EOF.
+	 */
+	rc = object_storage_fetch_range_short(c->object_key, (unsigned long)offset,
+					      (unsigned long)length, out, &got,
+					      OBJSTOR_SRC_FAULT);
+	if (rc != 0)
+		return -1;
+	if (got != length) {
+		/* Pad the short tail with zeros; the decoder only indexes
+		 * into bytes it actually wrote and will ignore the pad. */
+		memset((char *)out + got, 0, length - got);
+	}
+	return 0;
+}
+
+/*
+ * Detect zstd seekable format on a pages-*.img stored in object storage
+ * and, if present, wire up pr->decompress as the source of truth for
+ * every future fetch. The object key must already be constructed; the
+ * caller passes in an upper bound for the file size (or 0 to probe for
+ * it via a speculative range fetch past a reasonably-sized tail).
+ */
+static int init_s3_compression(struct page_read *pr, const char *object_key)
+{
+	uint8_t tail[4096];
+	unsigned long tail_got = 0;
+	unsigned long probe_len = 4096;
+	off_t probe_off;
+	struct s3_decomp_cookie *cookie;
+	int rc;
+
+	/*
+	 * We don't know the file size up front (no HEAD API). Probe by
+	 * requesting a generous window near the start of the file — S3
+	 * will short-read if the file is smaller. The public fetch_range
+	 * treats a short read as failure, so use the tolerant variant.
+	 */
+	probe_off = 0;
+	rc = object_storage_fetch_range_short(object_key, probe_off, probe_len,
+					      tail, &tail_got, OBJSTOR_SRC_FAULT);
+	if (rc != 0 || tail_got < 4)
+		return 0;
+
+	/*
+	 * If the whole file fits in our probe buffer its last 4 bytes are
+	 * right there; otherwise we need to find out where EOF is and
+	 * reread the last 4. The fast path that matters in practice is the
+	 * small-file case (metadata, test sleeps) — for a big pages-*.img
+	 * we fall back to a binary search.
+	 */
+	if (tail_got < probe_len) {
+		/* Whole file returned; check its tail. */
+		if (decompress_probe(tail + tail_got - 4, 4) != 1)
+			return 0;
+
+		cookie = xzalloc(sizeof(*cookie));
+		if (!cookie)
+			return -1;
+		snprintf(cookie->object_key, sizeof(cookie->object_key),
+			 "%s", object_key);
+		cookie->total_size = tail_got;
+	} else {
+		/*
+		 * File is at least probe_len bytes. Walk forward by doubling
+		 * ranges until we hit EOF. This is O(log N) range GETs.
+		 */
+		unsigned long size = probe_len;
+		unsigned long step = probe_len;
+
+		/*
+		 * Geometric size probe: allocate a sliding scratch buffer
+		 * whose size doubles each iteration, issue a Range GET into
+		 * it starting at `size`, and stop when the response is short.
+		 * O(log N) requests, max buffer = next power of two above
+		 * the actual file size.
+		 */
+		{
+			void *probe_scratch = NULL;
+			size_t scratch_cap = 0;
+			int loop_guard = 0;
+
+			while (loop_guard++ < 48 /* 2^48 > any realistic size */) {
+				unsigned long got = 0;
+
+				step *= 2;
+				if (scratch_cap < step) {
+					void *nb = xrealloc(probe_scratch, step);
+					if (!nb) {
+						xfree(probe_scratch);
+						return -1;
+					}
+					probe_scratch = nb;
+					scratch_cap = step;
+				}
+				rc = object_storage_fetch_range_short(object_key,
+					size, step, probe_scratch, &got,
+					OBJSTOR_SRC_FAULT);
+				if (rc != 0) {
+					xfree(probe_scratch);
+					return 0;
+				}
+				if (got < step) {
+					size += got;
+					break;
+				}
+				size += step;
+			}
+			xfree(probe_scratch);
+		}
+
+		/* Fetch last 4 bytes. */
+		if (object_storage_fetch_range_short(object_key, size - 4, 4,
+					             tail, &tail_got,
+					             OBJSTOR_SRC_FAULT) != 0)
+			return 0;
+		if (tail_got != 4 || decompress_probe(tail, 4) != 1)
+			return 0;
+
+		cookie = xzalloc(sizeof(*cookie));
+		if (!cookie)
+			return -1;
+		snprintf(cookie->object_key, sizeof(cookie->object_key),
+			 "%s", object_key);
+		cookie->total_size = size;
+	}
+
+	pr_info("page-read: detected compressed S3 pages-*.img %s (%lu bytes)\n",
+		object_key, cookie->total_size);
+
+	pr->decompress = decompress_create_lazy(NULL, 0,
+						(off_t)cookie->total_size,
+						s3_decomp_read_cb, cookie);
+	if (!pr->decompress) {
+		xfree(cookie);
+		return -1;
+	}
+	pr->compressed_mode = true;
+	pr->decompress_cookie = cookie;
+	/* Eager prefetch / ra_buf are bypassed in compressed mode — the
+	 * decompressor manages its own read-ahead via the seekable API. */
+
+	return 0;
+}
+
+/*
  * Auto-detect zstd seekable format on a local pages-*.img.
  *
  * Detection: the last 4 bytes of a seekable file hold the seek-table magic.
@@ -792,6 +956,14 @@ static int prefetch_eager_ranges(struct page_read *pr)
 	if (!opts.enable_object_storage || pr->maybe_read_page != maybe_read_page_object_storage)
 		return 0;
 
+	/*
+	 * Compressed mode routes every read through decompress_range(), which
+	 * has its own internal seek-table-aware caching. The eager prefetch
+	 * buffer assumes byte offsets into a raw file, so skip it.
+	 */
+	if (pr->compressed_mode)
+		return 0;
+
 	if (collect_eager_ranges(pr, &ranges, &nr_ranges, &total_bytes) != 0)
 		return -1;
 
@@ -1103,6 +1275,29 @@ static int maybe_read_page_object_storage(struct page_read *pr, unsigned long va
 	}
 
 direct_fetch:
+	/*
+	 * Compressed path: pi_off is an uncompressed offset, so ask the
+	 * seekable decoder to produce the raw bytes for us. It will issue
+	 * its own compressed Range GETs via the s3_decomp_read_cb wired up
+	 * in init_s3_compression().
+	 */
+	if (pr->compressed_mode && pr->decompress) {
+		ret = decompress_range(pr->decompress, pr->pi_off, len, buf);
+		if (ret == 0) {
+			if (pr->io_complete) {
+				ret = pr->io_complete(pr, vaddr, nr);
+				if (ret < 0)
+					pr_err("Object Storage(compressed): io_complete failed for vaddr %lx\n",
+					       vaddr);
+			}
+		} else {
+			pr_err("Object Storage(compressed): decompress_range(off=%lu len=%lu) failed\n",
+			       pr->pi_off, len);
+		}
+		pr->pi_off += len;
+		return ret;
+	}
+
 	/* Fetch data from object storage (fault-driven path: lazy-pages
 	 * daemon is reactively pulling pages for an outstanding UFFD fault). */
 	ret = object_storage_fetch_range(object_key, pr->pi_off, len, buf, OBJSTOR_SRC_FAULT);
@@ -1296,6 +1491,10 @@ static void close_page_read(struct page_read *pr)
 		decompress_free(pr->decompress);
 		pr->decompress = NULL;
 		pr->compressed_mode = false;
+	}
+	if (pr->decompress_cookie) {
+		xfree(pr->decompress_cookie);
+		pr->decompress_cookie = NULL;
 	}
 
 	/* Phase 6: object-storage read-ahead buffer (per-page_read) */
@@ -1685,10 +1884,33 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		pr->maybe_read_page = maybe_read_page_img_streamer;
 	} else if (opts.enable_object_storage) {
 		/* Object Storage: fetch pages from S3/MinIO/compatible storage */
+		char probe_key[PATH_MAX];
+		char probe_image_name[64];
+		const char *probe_prefix;
+
 		pr_info("Assigning maybe_read_page_object_storage (lazy_pages: %d, enable_object_storage: %d)\n",
 		        opts.lazy_pages, opts.enable_object_storage);
 		pr->maybe_read_page = maybe_read_page_object_storage;
 		pr->pieok = false;
+
+		/*
+		 * Probe the pages-*.img tail for the zstd seekable magic; if
+		 * present, wire up pr->decompress so every maybe_read_page
+		 * call runs through decompress_range instead of a raw range
+		 * fetch.
+		 */
+		snprintf(probe_image_name, sizeof(probe_image_name),
+			 "pages-%u.img", pr->pages_img_id);
+		probe_prefix = pr->object_storage_prefix ? pr->object_storage_prefix
+							 : opts.object_storage_object_prefix;
+		if (probe_prefix && strlen(probe_prefix) > 0)
+			snprintf(probe_key, sizeof(probe_key), "%s%s",
+				 probe_prefix, probe_image_name);
+		else
+			snprintf(probe_key, sizeof(probe_key), "%s",
+				 probe_image_name);
+		if (init_s3_compression(pr, probe_key) < 0)
+			return -1;
 
 		/*
 		 * Phase 6: per-page_read read-ahead buffer.
@@ -1710,12 +1932,22 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		 * the per-call fast path falls through to the existing
 		 * single-fetch code unchanged.
 		 */
-		pr->ra_cap = 16UL << 20; /* 16 MB */
-		pr->ra_buf = xmalloc(pr->ra_cap);
-		if (!pr->ra_buf) {
-			pr_warn("page_read[%u]: read-ahead buffer alloc failed; "
-				"falling back to per-call S3 fetches\n", pr->id);
+		/*
+		 * Compressed images route reads through decompress_range(),
+		 * which uses the seekable decoder's own internal caching. No
+		 * point allocating a 16 MB raw-byte read-ahead window on top.
+		 */
+		if (pr->compressed_mode) {
 			pr->ra_cap = 0;
+			pr->ra_buf = NULL;
+		} else {
+			pr->ra_cap = 16UL << 20; /* 16 MB */
+			pr->ra_buf = xmalloc(pr->ra_cap);
+			if (!pr->ra_buf) {
+				pr_warn("page_read[%u]: read-ahead buffer alloc failed; "
+					"falling back to per-call S3 fetches\n", pr->id);
+				pr->ra_cap = 0;
+			}
 		}
 		pr->ra_start = 0;
 		pr->ra_len = 0;

@@ -2212,8 +2212,35 @@ err:
  * =================================================================================
  */
 
+/*
+ * Like object_storage_fetch_range, but returns the number of bytes actually
+ * received (which can be less than `length` when the range ends past EOF)
+ * and does not treat a short read as an error. Intended for probing file
+ * tails (seek-table detection) and for decompressor-driven reads that
+ * naturally clamp at EOF.
+ */
+int object_storage_fetch_range_short(const char *object_key, unsigned long offset,
+				     unsigned long length, void *buffer,
+				     unsigned long *out_got, const char *source);
+
 int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer,
 			       const char *source)
+{
+	unsigned long got = 0;
+	int rc = object_storage_fetch_range_short(object_key, offset, length,
+						  buffer, &got, source);
+	if (rc != 0)
+		return rc;
+	if (got != length) {
+		pr_warn("Object Storage fetch: short read (Expected %lu, Got %lu) — "
+			"likely past EOF, keeping handle warm\n", length, got);
+		return -1;
+	}
+	return 0;
+}
+
+int object_storage_fetch_range_short(const char *object_key, unsigned long offset, unsigned long length, void *buffer,
+				     unsigned long *out_got, const char *source)
 {
 	CURL *curl_handle;
 	CURLcode res;
@@ -2591,13 +2618,15 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	 * read reuses the warm TLS session; the caller is expected to
 	 * retry with a smaller length if it actually needed more data.
 	 */
-	if (chunk.size != length) {
-		pr_warn("Object Storage fetch: short read (Expected %lu, Got %zu) — "
-			"likely past EOF, keeping handle warm\n", length, chunk.size);
-		free(error_response.memory);
-		ret = -1;
-		goto cleanup;
-	}
+	/*
+	 * Short read = requested range extended past EOF. S3 responds with
+	 * HTTP 206 and only the available bytes. Return success; the caller
+	 * can check *out_got (via the _short variant) to see the actual
+	 * byte count. The public fetch_range wrapper above turns it back
+	 * into -1 for callers that require an exact match.
+	 */
+	if (out_got)
+		*out_got = chunk.size;
 
 	/* Calculate fetch duration and log completion */
 	clock_gettime(CLOCK_MONOTONIC, &fetch_end);

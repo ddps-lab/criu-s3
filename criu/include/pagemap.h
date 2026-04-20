@@ -156,6 +156,7 @@ struct page_read {
 	 */
 	bool compressed_mode;
 	struct decompress_ctx *decompress;
+	void *decompress_cookie;	/* xfree'd by close_page_read */
 };
 
 /* flags for ->read_pages */

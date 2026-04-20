@@ -146,6 +146,15 @@ int object_storage_init(void);
  */
 int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer,
 			       const char *source);
+/*
+ * Tolerant variant: returns 0 on success (any byte count, including 0
+ * and short reads past EOF) and stores the number of bytes actually
+ * read in *out_got. Used by the compression probe path and by the
+ * seekable decoder's lazy read callback.
+ */
+int object_storage_fetch_range_short(const char *object_key, unsigned long offset,
+				     unsigned long length, void *buffer,
+				     unsigned long *out_got, const char *source);
 
 /*
  * Upload an object to object storage (simple PUT, for files < 5GB)
