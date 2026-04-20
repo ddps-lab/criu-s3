@@ -58,9 +58,18 @@ struct page_xfer {
 		int etags_count;
 		int etags_cap;
 		int active;		/* 1 if S3 upload is in progress */
+
+		/*
+		 * When --compress is set and this is the S3 upload path, the
+		 * per-IOV frames and multipart parts flow through the
+		 * parallel pipeline in compress_pipeline.c instead of the
+		 * serial part_buf above. Exactly one of {part_buf path,
+		 * compress_pipe path} is active at a time.
+		 */
+		struct compress_pipeline *compress_pipe;
 	} object_storage;
 
-	/* zstd seekable compression state (set when opts.compress) */
+	/* zstd seekable compression state (set when opts.compress) — local path */
 	struct compress_stream *compress;
 
 	struct page_read *parent;

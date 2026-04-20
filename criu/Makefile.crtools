@@ -111,6 +111,7 @@ obj-y			+= hash-table.o
 obj-y			+= obstor_xfer.o
 obj-y			+= obstor_prefetch.o
 obj-y			+= compression.o
+obj-y			+= compress_pipeline.o
 
 # zstd seekable format (vendored from facebook/zstd v1.5.5)
 obj-y			+= contrib/zstd_seekable/zstdseek_compress.o

@@ -20,6 +20,7 @@
 #include "page-pipe.h"
 #include "object-storage.h"
 #include "compression.h"
+#include "compress_pipeline.h"
 #include "util.h"
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
@@ -593,6 +594,62 @@ static int write_pages_object_storage(struct page_xfer *xfer, int p, unsigned lo
 	int ret;
 
 	/*
+	 * --compress path: drain this full IOV into a staging buffer and
+	 * hand it to the parallel compress pipeline as a single zstd frame.
+	 * compress_pipeline_submit() returns immediately after queueing;
+	 * compress and S3 upload run in background threads.
+	 *
+	 * The pipeline itself is created lazily on first write to avoid
+	 * launching worker threads while CRIU is still running parasite
+	 * RPCs in the target process.
+	 */
+	if (opts.compress && !xfer->object_storage.compress_pipe) {
+		int nc = opts.compress_workers;
+		int nu = opts.compress_upload_workers;
+		if (nc <= 0) {
+			int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+			nc = ncpu / 4;
+			if (nc < 1) nc = 1;
+			if (nc > 8) nc = 8;
+		}
+		if (nu <= 0)
+			nu = 4;
+		xfer->object_storage.compress_pipe = compress_pipeline_create(
+			xfer->object_storage.pages_key,
+			xfer->object_storage.upload_id,
+			opts.compress_level, nc, nu);
+		if (!xfer->object_storage.compress_pipe) {
+			pr_err("object_storage(compress): pipeline init failed\n");
+			return -1;
+		}
+		pr_info("object_storage(compress): pipeline started "
+			"(%d compress, %d upload workers, level %d)\n",
+			nc, nu, opts.compress_level);
+	}
+
+	if (xfer->object_storage.compress_pipe) {
+		void *buf;
+		unsigned long got = 0;
+
+		buf = xmalloc(len);
+		if (!buf)
+			return -1;
+		while (got < len) {
+			ssize_t n = read(p, (char *)buf + got, len - got);
+			if (n <= 0) {
+				pr_err("object_storage(compress): pipe read failed\n");
+				xfree(buf);
+				return -1;
+			}
+			got += (unsigned long)n;
+		}
+		ret = compress_pipeline_submit(xfer->object_storage.compress_pipe,
+					       buf, len);
+		xfree(buf);
+		return ret;
+	}
+
+	/*
 	 * Read pages from pipe directly into buffer for both local write
 	 * and object storage upload. We read from the pipe into a temp buffer,
 	 * write to local file, and accumulate in the part buffer for upload.
@@ -654,6 +711,51 @@ static void close_page_xfer_object_storage(struct page_xfer *xfer)
 	int i;
 
 	if (xfer->object_storage.active) {
+		/*
+		 * --compress path: drain the parallel pipeline. Compress
+		 * workers finish their remaining frames, writer appends the
+		 * seek table to the last part, upload workers land all parts.
+		 * Etags come back owned by us.
+		 */
+		if (xfer->object_storage.compress_pipe) {
+			char **etags = NULL;
+			int n_parts = 0;
+			int rc;
+
+			rc = compress_pipeline_finalize(
+					xfer->object_storage.compress_pipe,
+					&etags, &n_parts);
+			compress_pipeline_destroy(xfer->object_storage.compress_pipe);
+			xfer->object_storage.compress_pipe = NULL;
+
+			if (rc < 0 || !etags || n_parts == 0) {
+				pr_err("object_storage(compress): pipeline failed; aborting upload\n");
+				object_storage_multipart_abort(
+					xfer->object_storage.pages_key,
+					xfer->object_storage.upload_id);
+				if (etags) {
+					for (i = 0; i < n_parts; i++)
+						xfree(etags[i]);
+					xfree(etags);
+				}
+				goto cleanup;
+			}
+
+			rc = object_storage_multipart_complete(
+				xfer->object_storage.pages_key,
+				xfer->object_storage.upload_id,
+				n_parts, (const char **)etags);
+			if (rc < 0)
+				pr_err("object_storage(compress): multipart complete failed for %s\n",
+				       xfer->object_storage.pages_key);
+
+			for (i = 0; i < n_parts; i++)
+				xfree(etags[i]);
+			xfree(etags);
+
+			goto upload_pagemap;
+		}
+
 		/* Flush remaining part buffer */
 		if (xfer->object_storage.part_buf_used > 0 || xfer->object_storage.part_number == 0) {
 			char etag[256];
@@ -696,6 +798,8 @@ static void close_page_xfer_object_storage(struct page_xfer *xfer)
 			if (ret < 0)
 				pr_err("object_storage: multipart complete failed for %s\n", xfer->object_storage.pages_key);
 		}
+
+upload_pagemap:
 
 		/*
 		 * Upload pagemap: close local files first to flush buffered writes,
@@ -836,6 +940,15 @@ static int open_page_object_storage_xfer(struct page_xfer *xfer, int fd_type, un
 	}
 
 	xfer->object_storage.active = 1;
+
+	/*
+	 * Pipeline creation is deferred to the first write_pages call —
+	 * spawning compress worker threads here (while CRIU is still
+	 * negotiating with the parasite via a separate control pipe) makes
+	 * the parasite RPC hang with "Trimmed message received". By the
+	 * time write_pages is invoked, the parasite->main page stream is
+	 * already flowing and worker thread creation is safe.
+	 */
 
 	/* Override write/close functions with S3 wrappers */
 	xfer->write_pagemap = write_pagemap_object_storage;
