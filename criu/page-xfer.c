@@ -19,6 +19,7 @@
 #include "page-xfer.h"
 #include "page-pipe.h"
 #include "object-storage.h"
+#include "compression.h"
 #include "util.h"
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
@@ -253,10 +254,63 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 }
 
 /* local xfer */
+/*
+ * Callback for compress_stream_add_frame: write compressed bytes to the
+ * local pages-*.img via the image's raw fd. cookie is the fd.
+ */
+static int pxfer_loc_compress_write_cb(void *cookie, const void *buf, size_t len)
+{
+	int fd = (int)(intptr_t)cookie;
+	const char *p = buf;
+	size_t off = 0;
+
+	while (off < len) {
+		ssize_t n = write(fd, p + off, len - off);
+		if (n <= 0) {
+			pr_perror("page-xfer: compressed write failed");
+			return -1;
+		}
+		off += (size_t)n;
+	}
+	return 0;
+}
+
 static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 {
 	ssize_t ret;
 	ssize_t curr = 0;
+
+	/*
+	 * Compressed local mode: read the full IOV into a staging buffer,
+	 * feed it as one seekable frame (one pagemap entry = one frame), and
+	 * write the compressed bytes out. Fall back to splice() when
+	 * --compress is not set or we somehow ended up without a compressor.
+	 */
+	if (opts.compress && xfer->compress) {
+		void *buf;
+		size_t got = 0;
+		int rc;
+
+		buf = xmalloc(len);
+		if (!buf)
+			return -1;
+
+		while (got < len) {
+			ssize_t n = read(p, (char *)buf + got, len - got);
+			if (n <= 0) {
+				pr_perror("page-xfer: pipe read failed (compress)");
+				xfree(buf);
+				return -1;
+			}
+			got += (size_t)n;
+		}
+
+		rc = compress_stream_add_frame(xfer->compress, buf, len,
+					       pxfer_loc_compress_write_cb,
+					       (void *)(intptr_t)img_raw_fd(xfer->pi));
+		xfree(buf);
+		return rc;
+	}
 
 	while (1) {
 		ret = splice(p, NULL, img_raw_fd(xfer->pi), NULL, len - curr, SPLICE_F_MOVE);
@@ -359,6 +413,19 @@ static void close_page_xfer(struct page_xfer *xfer)
 		xfree(xfer->parent);
 		xfer->parent = NULL;
 	}
+	/*
+	 * Flush the seek table (trailing skippable frame) into the pages
+	 * image before closing it. Any error here is logged but does not
+	 * stop teardown — we still need to close the fds.
+	 */
+	if (xfer->compress && xfer->pi) {
+		if (compress_stream_finalize(xfer->compress,
+					     pxfer_loc_compress_write_cb,
+					     (void *)(intptr_t)img_raw_fd(xfer->pi)) < 0)
+			pr_err("page-xfer: compress_stream_finalize failed\n");
+		compress_stream_free(xfer->compress);
+		xfer->compress = NULL;
+	}
 	if (xfer->pi)
 		close_image(xfer->pi);
 	if (xfer->pmi)
@@ -376,6 +443,20 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	xfer->pi = open_pages_image(O_DUMP, xfer->pmi, &pages_id);
 	if (!xfer->pi)
 		goto err_pmi;
+
+	/*
+	 * Create the zstd seekable compressor for this pages-*.img when
+	 * --compress is on. Only applies to the local write path; the S3
+	 * mode uses a separate parallel pipeline (see open_page_object_storage_xfer).
+	 */
+	if (opts.compress && !opts.object_storage_upload) {
+		xfer->compress = compress_stream_create(opts.compress_level);
+		if (!xfer->compress) {
+			pr_err("page-xfer: failed to init compressor for img_id=%lu\n",
+			       img_id);
+			goto err_pi;
+		}
+	}
 
 	/*
 	 * Open page-read for parent images (if it exists). It will

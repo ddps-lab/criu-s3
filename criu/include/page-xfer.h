@@ -60,6 +60,9 @@ struct page_xfer {
 		int active;		/* 1 if S3 upload is in progress */
 	} object_storage;
 
+	/* zstd seekable compression state (set when opts.compress) */
+	struct compress_stream *compress;
+
 	struct page_read *parent;
 };
 
