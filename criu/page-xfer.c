@@ -446,6 +446,14 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 		goto err_pmi;
 
 	/*
+	 * The page_xfer struct lives on the caller's stack (cr-dump.c,
+	 * shmem.c, mem.c) and is not zero-initialized. Clear fields that
+	 * close_page_xfer branches on so stale stack data doesn't get
+	 * dereferenced when --compress is not in effect.
+	 */
+	xfer->compress = NULL;
+
+	/*
 	 * Create the zstd seekable compressor for this pages-*.img when
 	 * --compress is on. Only applies to the local write path; the S3
 	 * mode uses a separate parallel pipeline (see open_page_object_storage_xfer).
