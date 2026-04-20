@@ -448,6 +448,12 @@ void init_opts(void)
 	opts.prefetch_workers = 0;		/* 0 = auto-detect from NIC speed */
 	opts.prefetch_batch_bytes = 64UL * 1024 * 1024;  /* 64 MB default; 0 disables batching */
 
+	/* Initialize compression options (--compress: zstd seekable) */
+	opts.compress = false;
+	opts.compress_level = 1;
+	opts.compress_workers = 0;		/* 0 = auto: min(nproc/4, 8) */
+	opts.compress_upload_workers = 4;
+
 	/* Initialize exclude ranges */
 	INIT_LIST_HEAD(&opts.exclude_ranges);
 	INIT_LIST_HEAD(&opts.no_parent_ranges);
@@ -742,6 +748,10 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "no-semi-sync-iov", no_argument, NULL, 1117 },
 		{ "no-hot-vma-seed", no_argument, NULL, 1118 },
 		{ "prefetch-batch-bytes", required_argument, 0, 1119 },
+		{ "compress", no_argument, NULL, 1120 },
+		{ "compress-level", required_argument, 0, 1121 },
+		{ "compress-workers", required_argument, 0, 1122 },
+		{ "compress-upload-workers", required_argument, 0, 1123 },
 		{},
 	};
 
@@ -1184,6 +1194,18 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		case 1119:
 			opts.prefetch_batch_bytes = strtoul(optarg, NULL, 10);
 			break;
+		case 1120:
+			opts.compress = true;
+			break;
+		case 1121:
+			opts.compress_level = atoi(optarg);
+			break;
+		case 1122:
+			opts.compress_workers = atoi(optarg);
+			break;
+		case 1123:
+			opts.compress_upload_workers = atoi(optarg);
+			break;
 		default:
 			return 2;
 		}
@@ -1225,6 +1247,12 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		pr_info("Async Prefetch Enabled\n");
 		pr_info("  Prefetch Workers: %d\n", opts.prefetch_workers);
 		pr_info("  Hot VMA Seed: %s\n", opts.hot_vma_seed ? "enabled" : "disabled");
+	}
+	if (opts.compress) {
+		pr_info("Compression Enabled (zstd seekable)\n");
+		pr_info("  Level: %d\n", opts.compress_level);
+		pr_info("  Compress Workers: %d (0=auto)\n", opts.compress_workers);
+		pr_info("  Upload Workers: %d\n", opts.compress_upload_workers);
 	}
 
 	return 0;

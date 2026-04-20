@@ -275,6 +275,12 @@ struct cr_options {
 	int prefetch_workers;
 	unsigned long prefetch_batch_bytes; /* obstor_xfer worker batch coalescing limit (0 = disabled) */
 
+	/* zstd seekable compression of pages-*.img (--compress) */
+	bool compress;
+	int compress_level;		/* zstd level, default 1 */
+	int compress_workers;		/* 0 = auto: min(nproc/4, 8) */
+	int compress_upload_workers;	/* default 4 */
+
 	/* Hot VMA exclude ranges for pre-dump */
 	struct list_head exclude_ranges;
 	/* No-parent ranges: dump normally but without parent reference */
