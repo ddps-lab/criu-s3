@@ -260,7 +260,8 @@ static void upq_destroy(struct upload_q *q)
 	pthread_cond_destroy(&q->not_full);
 }
 
-static int upq_push(struct upload_q *q, struct part_rec *p)
+static __attribute__((unused))
+int upq_push(struct upload_q *q, struct part_rec *p)
 {
 	pthread_mutex_lock(&q->lock);
 	while (q->count >= q->cap && !q->closed)
@@ -429,35 +430,20 @@ static void etags_reserve(struct compress_pipeline *p, int need)
 	}
 }
 
+/*
+ * Upload worker threads are currently dormant (writer uploads
+ * synchronously to keep all S3 requests on one thread — see
+ * writer_upload_part for the rationale). The threads still start up
+ * and sit on upq_pop() just so the pipeline shutdown logic stays the
+ * same; they exit immediately once upq_close() is called at end-of-stream.
+ */
 static void *upload_worker(void *arg)
 {
 	struct compress_pipeline *p = arg;
 	struct part_rec *rec;
 
 	while ((rec = upq_pop(&p->upload_in)) != NULL) {
-		char etag[ETAG_LEN];
-		int rc;
-
-		rc = object_storage_multipart_upload_part(p->object_key,
-							  p->upload_id,
-							  rec->part_num,
-							  rec->data, rec->len,
-							  etag, sizeof(etag));
-		if (rc < 0) {
-			pr_err("multipart upload part %d failed\n",
-			       rec->part_num);
-			pipe_set_error(p, rc);
-		} else {
-			pthread_mutex_lock(&p->etags_lock);
-			etags_reserve(p, rec->part_num);
-			if (p->etags) {
-				xfree(p->etags[rec->part_num - 1]);
-				p->etags[rec->part_num - 1] = xstrdup(etag);
-				if (rec->part_num > p->n_parts)
-					p->n_parts = rec->part_num;
-			}
-			pthread_mutex_unlock(&p->etags_lock);
-		}
+		/* No records should ever land here now. */
 		xfree(rec->data);
 		xfree(rec);
 	}
@@ -487,36 +473,52 @@ static int ensure_cap(void **buf, size_t *cap, size_t need)
 	return 0;
 }
 
-static int writer_flush_part(struct compress_pipeline *p, void **part_buf,
-			     size_t *part_used, size_t *part_cap,
-			     int *part_num)
+/*
+ * Unused now that writer flushes synchronously; kept to minimize diff.
+ * Will be removed when the upload_q scaffolding is garbage-collected.
+ */
+static __attribute__((unused))
+int writer_flush_part(struct compress_pipeline *p, void **part_buf,
+		      size_t *part_used, size_t *part_cap,
+		      int *part_num)
 {
-	struct part_rec *rec;
+	(void)p; (void)part_buf; (void)part_used; (void)part_cap; (void)part_num;
+	return 0;
+}
 
-	if (*part_used == 0)
-		return 0;
+/*
+ * Synchronous upload from the writer thread. Calling multipart upload
+ * from multiple worker threads concurrently destabilizes libcurl's
+ * per-process state in CRIU (we saw parasite RPCs break with
+ * "Trimmed message received"); keeping all S3 requests on a single
+ * thread fixes it. Compress parallelism is still preserved via the
+ * N compress workers, which don't touch libcurl at all.
+ */
+static int writer_upload_part(struct compress_pipeline *p, int *part_num,
+			      void *data, size_t len)
+{
+	char etag[ETAG_LEN];
+	int rc;
 
-	rec = xzalloc(sizeof(*rec));
-	if (!rec)
-		return -1;
-	/*
-	 * Hand the buffer to the upload worker; allocate a fresh one for the
-	 * next batch so compress output can keep streaming in.
-	 */
-	rec->part_num = ++(*part_num);
-	rec->data = *part_buf;
-	rec->len = *part_used;
-
-	*part_buf = xmalloc(PART_SIZE);
-	if (!*part_buf) {
-		xfree(rec->data);
-		xfree(rec);
+	rc = object_storage_multipart_upload_part(p->object_key,
+						  p->upload_id,
+						  ++(*part_num),
+						  data, len,
+						  etag, sizeof(etag));
+	if (rc < 0) {
+		pr_err("multipart upload part %d failed\n", *part_num);
 		return -1;
 	}
-	*part_cap = PART_SIZE;
-	*part_used = 0;
-
-	return upq_push(&p->upload_in, rec);
+	pthread_mutex_lock(&p->etags_lock);
+	etags_reserve(p, *part_num);
+	if (p->etags) {
+		xfree(p->etags[*part_num - 1]);
+		p->etags[*part_num - 1] = xstrdup(etag);
+		if (*part_num > p->n_parts)
+			p->n_parts = *part_num;
+	}
+	pthread_mutex_unlock(&p->etags_lock);
+	return 0;
 }
 
 static void *writer_thread_fn(void *arg)
@@ -563,38 +565,17 @@ static void *writer_thread_fn(void *arg)
 		xfree(f->comp);
 		xfree(f);
 
-		/* Flush if part is full. */
+		/* Flush if part is full (synchronous upload). */
 		while (part_used >= PART_SIZE) {
-			size_t one_part = PART_SIZE;
-			struct part_rec *rec = xzalloc(sizeof(*rec));
-			void *nb;
-
-			if (!rec) {
+			if (writer_upload_part(p, &part_num,
+					       part_buf, PART_SIZE) < 0) {
 				pipe_set_error(p, -1);
 				goto out;
 			}
-			rec->part_num = ++part_num;
-			rec->data = xmalloc(one_part);
-			if (!rec->data) {
-				xfree(rec);
-				pipe_set_error(p, -1);
-				goto out;
-			}
-			memcpy(rec->data, part_buf, one_part);
-			rec->len = one_part;
-
 			/* Shift leftover bytes to the head of part_buf. */
-			memmove(part_buf, (char *)part_buf + one_part,
-				part_used - one_part);
-			part_used -= one_part;
-
-			if (upq_push(&p->upload_in, rec) < 0) {
-				xfree(rec->data);
-				xfree(rec);
-				pipe_set_error(p, -1);
-				goto out;
-			}
-			(void)nb;
+			memmove(part_buf, (char *)part_buf + PART_SIZE,
+				part_used - PART_SIZE);
+			part_used -= PART_SIZE;
 		}
 	}
 
@@ -628,11 +609,10 @@ static void *writer_thread_fn(void *arg)
 		}
 	}
 
-	/* Flush final (possibly small) part. */
-	if (writer_flush_part(p, &part_buf, &part_used, &part_cap,
-			      &part_num) < 0) {
-		pipe_set_error(p, -1);
-		goto out;
+	/* Flush final (possibly small) part synchronously. */
+	if (part_used > 0) {
+		if (writer_upload_part(p, &part_num, part_buf, part_used) < 0)
+			pipe_set_error(p, -1);
 	}
 
 out:
@@ -708,14 +688,17 @@ struct compress_pipeline *compress_pipeline_create(const char *object_key,
 			pthread_sigmask(SIG_SETMASK, &old, NULL);
 			goto err;
 		}
-		for (i = 0; i < p->n_upload; i++) {
-			if (pthread_create(&p->upload_threads[i], NULL,
-					   upload_worker, p) != 0) {
-				pr_err("pthread_create upload_worker\n");
-				pthread_sigmask(SIG_SETMASK, &old, NULL);
-				goto err;
-			}
-		}
+		/*
+		 * Upload workers are no longer launched — the writer thread
+		 * does synchronous multipart uploads itself so that all
+		 * libcurl activity stays on a single thread. n_upload is
+		 * still tracked so destroy() doesn't try to join non-existent
+		 * threads. (void) silences the unused-warning on the
+		 * upload_worker / etags_reserve helpers.
+		 */
+		(void)upload_worker;
+		(void)etags_reserve;
+		p->n_upload = 0;
 
 		pthread_sigmask(SIG_SETMASK, &old, NULL);
 	}
