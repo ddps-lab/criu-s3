@@ -87,6 +87,12 @@ struct decompress_ctx *decompress_create_lazy(const void *seek_table_buf,
 int decompress_range(struct decompress_ctx *d, off_t off, size_t len,
 		     void *out);
 
+/* Total uncompressed size: sum of decompressed sizes across all frames. */
+unsigned long long decompress_total_raw_size(struct decompress_ctx *d);
+
+/* Number of frames in the seek table. */
+unsigned decompress_num_frames(struct decompress_ctx *d);
+
 /*
  * Map an uncompressed range to the compressed byte range it overlaps.
  * Useful when the caller wants to issue the Range GET itself and feed

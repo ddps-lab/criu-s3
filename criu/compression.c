@@ -369,6 +369,22 @@ int decompress_range(struct decompress_ctx *d, off_t off, size_t len,
 	return 0;
 }
 
+unsigned long long decompress_total_raw_size(struct decompress_ctx *d)
+{
+	unsigned long long total = 0;
+	unsigned nf = ZSTD_seekable_getNumFrames(d->zs);
+	unsigned i;
+
+	for (i = 0; i < nf; i++)
+		total += ZSTD_seekable_getFrameDecompressedSize(d->zs, i);
+	return total;
+}
+
+unsigned decompress_num_frames(struct decompress_ctx *d)
+{
+	return ZSTD_seekable_getNumFrames(d->zs);
+}
+
 int decompress_map_range(struct decompress_ctx *d, off_t uoff, size_t ulen,
 			 off_t *comp_off, size_t *comp_len)
 {

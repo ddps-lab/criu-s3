@@ -1249,6 +1249,17 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		pr_info("  Hot VMA Seed: %s\n", opts.hot_vma_seed ? "enabled" : "disabled");
 	}
 	if (opts.compress) {
+		/*
+		 * auto-dedup punches holes in raw pages-*.img, which is
+		 * meaningless on a seekable compressed image: the byte
+		 * ranges at pi_off are frame bodies, not page data. Reject
+		 * the combination here rather than silently produce a
+		 * broken dump.
+		 */
+		if (opts.auto_dedup) {
+			pr_err("--compress is incompatible with --auto-dedup\n");
+			return -1;
+		}
 		pr_info("Compression Enabled (zstd seekable)\n");
 		pr_info("  Level: %d\n", opts.compress_level);
 		pr_info("  Compress Workers: %d (0=auto)\n", opts.compress_workers);

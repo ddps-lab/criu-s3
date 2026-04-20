@@ -3,6 +3,9 @@
 #include <unistd.h>
 #include <linux/falloc.h>
 #include <sys/uio.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/mman.h>
 #include <limits.h>
 #include <string.h>
 #include <pthread.h>
@@ -22,6 +25,7 @@
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
 #include "object-storage.h"
+#include "compression.h"
 
 #ifndef SEEK_DATA
 #define SEEK_DATA 3
@@ -235,11 +239,160 @@ static int read_parent_page(struct page_read *pr, unsigned long vaddr, int nr, v
 	return 0;
 }
 
+/*
+ * Auto-detect zstd seekable format on a local pages-*.img.
+ *
+ * Detection: the last 4 bytes of a seekable file hold the seek-table magic.
+ *
+ * On detection we fully decompress the image into a memfd and replace the
+ * cr_img fd with the memfd. Every downstream path that reads pages
+ * (parasite preadv(), read_local_page(), premap, dedup) sees what looks
+ * like a raw pages-*.img and needs no modification. The in-memory raw
+ * size matches the original uncompressed dump, but that's memory the
+ * restore process is about to consume anyway.
+ *
+ * If the file is compressed but decoder setup or full-decompress fails,
+ * we bail out — falling back to raw reads of compressed bytes would
+ * corrupt the restore.
+ */
+static int init_local_compression(struct page_read *pr)
+{
+	int src_fd, mfd;
+	struct stat st;
+	uint8_t tail[4];
+	ssize_t n;
+	void *src_buf = NULL;
+	void *dst_buf = NULL;
+	struct decompress_ctx *dctx = NULL;
+	off_t off;
+	unsigned int n_frames, i;
+	unsigned long long total_raw;
+
+	src_fd = img_raw_fd(pr->pi);
+	if (src_fd < 0)
+		return 0;
+	if (fstat(src_fd, &st) < 0) {
+		pr_perror("init_local_compression: fstat");
+		return -1;
+	}
+	if (st.st_size < 4)
+		return 0;
+
+	n = pread(src_fd, tail, 4, st.st_size - 4);
+	if (n != 4) {
+		pr_perror("init_local_compression: pread tail");
+		return -1;
+	}
+	if (decompress_probe(tail, sizeof(tail)) != 1)
+		return 0;
+
+	pr_info("page-read: detected zstd seekable pages-*.img (%lld bytes compressed)\n",
+		(long long)st.st_size);
+
+	/* Slurp compressed file into memory. */
+	src_buf = xmalloc(st.st_size);
+	if (!src_buf)
+		return -1;
+
+	off = 0;
+	while (off < st.st_size) {
+		n = pread(src_fd, (char *)src_buf + off, st.st_size - off, off);
+		if (n <= 0) {
+			pr_perror("init_local_compression: pread body");
+			goto err;
+		}
+		off += n;
+	}
+
+	dctx = decompress_create_from_buffer(src_buf, st.st_size);
+	if (!dctx)
+		goto err;
+
+	n_frames = decompress_num_frames(dctx);
+	total_raw = decompress_total_raw_size(dctx);
+	(void)i;
+	(void)dst_buf;
+
+	pr_info("page-read: decompressing %u frames -> %llu raw bytes into memfd\n",
+		n_frames, total_raw);
+
+	/*
+	 * Memory strategy: allocate the uncompressed size as a memfd, mmap
+	 * it shared, then decompress directly into the mapping. This
+	 * avoids doubling memory vs. the xmalloc-then-write approach —
+	 * we pay exactly one raw-sized allocation which the kernel
+	 * accounts as tmpfs, not heap.
+	 */
+	mfd = syscall(SYS_memfd_create, "criu-decompressed-pages", 0);
+	if (mfd < 0) {
+		pr_perror("init_local_compression: memfd_create");
+		goto err;
+	}
+	if (ftruncate(mfd, total_raw) < 0) {
+		pr_perror("init_local_compression: ftruncate memfd");
+		close(mfd);
+		goto err;
+	}
+	{
+		void *map = mmap(NULL, total_raw, PROT_READ | PROT_WRITE,
+				 MAP_SHARED, mfd, 0);
+		if (map == MAP_FAILED) {
+			pr_perror("init_local_compression: mmap memfd");
+			close(mfd);
+			goto err;
+		}
+		if (decompress_range(dctx, 0, total_raw, map) < 0) {
+			pr_err("init_local_compression: decompress_range failed\n");
+			munmap(map, total_raw);
+			close(mfd);
+			goto err;
+		}
+		munmap(map, total_raw);
+	}
+	if (lseek(mfd, 0, SEEK_SET) < 0) {
+		pr_perror("init_local_compression: lseek memfd");
+		close(mfd);
+		goto err;
+	}
+
+	/* Close the original compressed fd and put the memfd in its place. */
+	close(pr->pi->_x.fd);
+	pr->pi->_x.fd = mfd;
+
+	decompress_free(dctx);
+	xfree(src_buf);
+
+	/* Intentionally do NOT set pr->compressed_mode / pr->decompress — from
+	 * this point on pr->pi points at a raw pages-*.img (in memfd). Every
+	 * downstream path runs unmodified, including parasite preadv(). */
+	return 0;
+
+err:
+	if (dctx)
+		decompress_free(dctx);
+	if (src_buf)
+		xfree(src_buf);
+	if (dst_buf)
+		xfree(dst_buf);
+	return -1;
+}
+
 static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned long len, void *buf)
 {
 	int fd;
 	ssize_t ret;
 	size_t curr = 0;
+
+	/* Compressed pages-*.img: skip fd read, decompress from the
+	 * in-memory seekable stream. pi_off is an uncompressed offset. */
+	if (pr->compressed_mode) {
+		if (decompress_range(pr->decompress, pr->pi_off, len, buf) < 0) {
+			pr_err("read_local_page: decompress_range(off=%" PRIx64 ", len=%lu) failed\n",
+			       (uint64_t)pr->pi_off, len);
+			return -1;
+		}
+		return 0;
+	}
 
 	fd = img_raw_fd(pr->pi);
 	if (fd < 0) {
@@ -265,7 +418,13 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 			break;
 	}
 
-	if (opts.auto_dedup && !pr->disable_dedup) {
+	/*
+	 * auto-dedup works by punching holes into pages-*.img at the
+	 * *raw* byte offset of the read. That doesn't exist on a
+	 * compressed pages-*.img — the bytes at pi_off are zstd frame
+	 * data, not raw pages. Skip the hole-punch when compressed.
+	 */
+	if (opts.auto_dedup && !pr->disable_dedup && !pr->compressed_mode) {
 		ret = punch_hole(pr, pr->pi_off, len, false);
 		if (ret == -1)
 			return -1;
@@ -1129,6 +1288,16 @@ static void close_page_read(struct page_read *pr)
 	if (pr->pmes)
 		free_pagemaps(pr);
 
+	/*
+	 * Free the zstd seekable decompressor first (it holds a pointer
+	 * into ra_buf when compressed_mode is set).
+	 */
+	if (pr->decompress) {
+		decompress_free(pr->decompress);
+		pr->decompress = NULL;
+		pr->compressed_mode = false;
+	}
+
 	/* Phase 6: object-storage read-ahead buffer (per-page_read) */
 	if (pr->ra_buf) {
 		xfree(pr->ra_buf);
@@ -1562,7 +1731,27 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		pr_info("Assigning maybe_read_page_local (lazy_pages: %d, enable_object_storage: %d)\n",
 		        opts.lazy_pages, opts.enable_object_storage);
 		pr->maybe_read_page = maybe_read_page_local;
-		if (!pr->parent && !opts.lazy_pages)
+
+		/*
+		 * Auto-detect zstd seekable format: the last 4 bytes of a
+		 * seekable file are the seek-table magic (0x8F92EAB1). If we
+		 * see it, slurp the whole pages-*.img into memory and hand it
+		 * to decompress_create_from_buffer. Small enough to keep in
+		 * RAM for local restore; the S3 restore path uses the lazy
+		 * callback flavor to avoid that requirement.
+		 */
+		if (init_local_compression(pr) < 0)
+			return -1;
+
+		/*
+		 * pieok lets parasite engine pread() raw page bytes directly
+		 * out of pages-*.img — we can't do that on a compressed file
+		 * because the parasite runs in restored-process context and
+		 * doesn't link zstd. Force pages through the userspace path
+		 * (maybe_read_page_local -> read_local_page -> decompress)
+		 * whenever the image is compressed.
+		 */
+		if (!pr->parent && !opts.lazy_pages && !pr->compressed_mode)
 			pr->pieok = true;
 		else
 			pr->pieok = false;
