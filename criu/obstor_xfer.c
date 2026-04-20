@@ -31,6 +31,7 @@
 #include "util.h"
 #include "page-xfer.h"
 #include "page.h"
+#include "compression.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "prefetch: "
@@ -142,6 +143,207 @@ static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 /* Statistics */
 static struct prefetch_stats stats;
 static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ----------------------------------------------------------------------- *
+ * Per-pages_img_id compressed-mode cache.
+ *
+ * When the S3 pages-*.img was dumped with --compress, workers need to
+ * route fetches through decompress_range() rather than issuing raw Range
+ * GETs for `batch.base_offset .. base_offset + total_bytes`. One decompress
+ * context per pages_img_id is kept here; workers serialize their
+ * decompress_range calls under the per-entry mutex because the underlying
+ * ZSTD_seekable instance isn't thread-safe.
+ *
+ * Entries are created lazily on the first fetch for a given pages_img_id
+ * (see xfer_obtain_decompress). A NULL decompress field after
+ * initialization means "already probed and confirmed NOT compressed" so
+ * subsequent fetches skip the probe path.
+ * ----------------------------------------------------------------------- */
+
+struct xfer_compress_entry {
+	unsigned int pages_img_id;
+	bool probed;			/* true after probe attempt */
+	struct decompress_ctx *decompress; /* NULL if not compressed */
+	void *cookie;			/* s3_decomp_cookie from compression.c callers */
+	pthread_mutex_t lock;		/* serializes decompress_range calls */
+	struct xfer_compress_entry *next;
+};
+
+static struct xfer_compress_entry *xfer_compress_list;
+static pthread_mutex_t xfer_compress_list_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Cookie identical in shape to s3_decomp_cookie in pagemap.c but scoped
+ * to this module to keep compilation units independent. */
+struct xfer_decomp_cookie {
+	char object_key[PATH_MAX];
+	unsigned long total_size;
+};
+
+static int xfer_decomp_read_cb(void *cookie, off_t offset, size_t length,
+			       void *out)
+{
+	struct xfer_decomp_cookie *c = cookie;
+	unsigned long got = 0;
+	int rc;
+
+	rc = object_storage_fetch_range_short(c->object_key, (unsigned long)offset,
+					      (unsigned long)length, out, &got,
+					      OBJSTOR_SRC_PREFETCH);
+	if (rc != 0)
+		return -1;
+	if (got != length)
+		memset((char *)out + got, 0, length - got);
+	return 0;
+}
+
+/*
+ * Look up (and lazily create) the decompress_ctx for a given pages_img_id.
+ * Returns the entry on success; its ->decompress is NULL when the image
+ * is not compressed. NULL return indicates an allocation / probe failure
+ * and the caller should fall through to the raw-fetch path.
+ */
+static struct xfer_compress_entry *
+xfer_obtain_decompress(unsigned int pages_img_id, const char *object_key)
+{
+	struct xfer_compress_entry *e;
+
+	pthread_mutex_lock(&xfer_compress_list_lock);
+	for (e = xfer_compress_list; e; e = e->next) {
+		if (e->pages_img_id == pages_img_id) {
+			pthread_mutex_unlock(&xfer_compress_list_lock);
+			/*
+			 * Another worker may still be in the probe critical
+			 * section on this entry. Block on e->lock so we only
+			 * return once e->decompress and e->probed are final.
+			 */
+			pthread_mutex_lock(&e->lock);
+			pthread_mutex_unlock(&e->lock);
+			return e;
+		}
+	}
+
+	/* Not seen before — create an un-probed placeholder. */
+	e = xzalloc(sizeof(*e));
+	if (!e) {
+		pthread_mutex_unlock(&xfer_compress_list_lock);
+		return NULL;
+	}
+	e->pages_img_id = pages_img_id;
+	pthread_mutex_init(&e->lock, NULL);
+	/* Hold e->lock before publishing the entry so any concurrent lookup
+	 * that races in will block on it until the probe is complete. */
+	pthread_mutex_lock(&e->lock);
+	e->next = xfer_compress_list;
+	xfer_compress_list = e;
+	pthread_mutex_unlock(&xfer_compress_list_lock);
+
+	/*
+	 * Probe the image tail for the zstd seekable magic. If we find it,
+	 * stand up a decompress_ctx bound to the object key via our read
+	 * callback. Otherwise leave e->decompress=NULL so future lookups
+	 * take the raw-fetch branch without re-probing.
+	 *
+	 * e->lock is already held from above — we grabbed it before
+	 * publishing this entry into the global list precisely so that
+	 * late-arriving lookups block on it until probing finishes.
+	 */
+	if (!e->probed) {
+		uint8_t tail[4096];
+		unsigned long tail_got = 0;
+		int rc;
+		unsigned long size;
+
+		rc = object_storage_fetch_range_short(object_key, 0, sizeof(tail),
+						      tail, &tail_got,
+						      OBJSTOR_SRC_PREFETCH);
+		if (rc != 0 || tail_got < 4) {
+			e->probed = true;
+			goto done;
+		}
+
+		if (tail_got < sizeof(tail)) {
+			/* File fits in first probe — check its last 4 bytes. */
+			if (decompress_probe(tail + tail_got - 4, 4) != 1) {
+				e->probed = true;
+				goto done;
+			}
+			size = tail_got;
+		} else {
+			/* Geometric size search (mirrors init_s3_compression). */
+			void *scratch = NULL;
+			size_t scratch_cap = 0;
+			size_t step = sizeof(tail);
+			int guard = 0;
+
+			size = step;
+			while (guard++ < 48) {
+				unsigned long got = 0;
+				step *= 2;
+				if (scratch_cap < step) {
+					void *nb = xrealloc(scratch, step);
+					if (!nb) {
+						xfree(scratch);
+						e->probed = true;
+						goto done;
+					}
+					scratch = nb;
+					scratch_cap = step;
+				}
+				rc = object_storage_fetch_range_short(object_key,
+					size, step, scratch, &got,
+					OBJSTOR_SRC_PREFETCH);
+				if (rc != 0) {
+					xfree(scratch);
+					e->probed = true;
+					goto done;
+				}
+				if (got < step) {
+					size += got;
+					break;
+				}
+				size += step;
+			}
+			xfree(scratch);
+
+			if (object_storage_fetch_range_short(object_key, size - 4, 4,
+						             tail, &tail_got,
+						             OBJSTOR_SRC_PREFETCH) != 0 ||
+			    tail_got != 4 ||
+			    decompress_probe(tail, 4) != 1) {
+				e->probed = true;
+				goto done;
+			}
+		}
+
+		/* Magic found — wire up the lazy decompressor. */
+		{
+			struct xfer_decomp_cookie *c = xzalloc(sizeof(*c));
+			if (!c) {
+				e->probed = true;
+				goto done;
+			}
+			snprintf(c->object_key, sizeof(c->object_key), "%s",
+				 object_key);
+			c->total_size = size;
+			e->decompress = decompress_create_lazy(NULL, 0,
+							       (off_t)size,
+							       xfer_decomp_read_cb,
+							       c);
+			if (!e->decompress) {
+				xfree(c);
+				e->probed = true;
+				goto done;
+			}
+			e->cookie = c;
+			pr_info("obstor_xfer: detected compressed pages-%u (%lu bytes)\n",
+				pages_img_id, size);
+		}
+		e->probed = true;
+	}
+done:
+	pthread_mutex_unlock(&e->lock);
+	return e;
+}
 
 /* global_lpi and global_pages_img_id removed — now stored per-IOV in iov_meta */
 
@@ -797,6 +999,8 @@ static void *prefetch_worker(void *arg)
 		}
 
 		if (opts.enable_object_storage) {
+			struct xfer_compress_entry *ce;
+
 			snprintf(image_name, sizeof(image_name), "pages-%u.img", batch.pages_img_id);
 			if (opts.object_storage_object_prefix && strlen(opts.object_storage_object_prefix) > 0)
 				snprintf(object_key, sizeof(object_key), "%s%s",
@@ -807,13 +1011,39 @@ static void *prefetch_worker(void *arg)
 			pr_debug("obstor_xfer: Worker %d: Fetching %s offset=%lu size=%lu (n=%d)\n",
 				 worker_id, object_key, batch.base_offset, batch.total_bytes, n);
 
-			ret = object_storage_fetch_range(object_key, batch.base_offset,
-							 batch.total_bytes, data,
-							 OBJSTOR_SRC_PREFETCH);
-			if (ret != 0) {
-				PREFETCH_WORKER_ERROR_LOG(worker_id, head->iov_index, ret);
-				pr_err("obstor_xfer: Worker %d: batch fetch failed %s ret=%d\n",
-				       worker_id, object_key, ret);
+			ce = xfer_obtain_decompress(batch.pages_img_id, object_key);
+			if (ce && ce->decompress) {
+				/*
+				 * Compressed mode: batch.base_offset is an
+				 * uncompressed offset. Serialize decompress_range
+				 * calls on this pages_img_id — the underlying
+				 * ZSTD_seekable holds per-call state that isn't
+				 * safe to share across threads. (Moving to
+				 * per-worker contexts is the obvious throughput
+				 * follow-up — see phase6-compression-progress.md.)
+				 */
+				pthread_mutex_lock(&ce->lock);
+				ret = decompress_range(ce->decompress,
+						       (off_t)batch.base_offset,
+						       batch.total_bytes, data);
+				pthread_mutex_unlock(&ce->lock);
+				if (ret != 0) {
+					PREFETCH_WORKER_ERROR_LOG(worker_id, head->iov_index, ret);
+					pr_err("obstor_xfer: Worker %d: compressed fetch failed "
+					       "%s off=%lu size=%lu ret=%d\n",
+					       worker_id, object_key,
+					       batch.base_offset, batch.total_bytes, ret);
+				}
+			} else {
+				ret = object_storage_fetch_range(object_key,
+								 batch.base_offset,
+								 batch.total_bytes, data,
+								 OBJSTOR_SRC_PREFETCH);
+				if (ret != 0) {
+					PREFETCH_WORKER_ERROR_LOG(worker_id, head->iov_index, ret);
+					pr_err("obstor_xfer: Worker %d: batch fetch failed %s ret=%d\n",
+					       worker_id, object_key, ret);
+				}
 			}
 		}
 
@@ -940,6 +1170,23 @@ void prefetch_cleanup(void)
 
 		xfree(worker_threads);
 		worker_threads = NULL;
+	}
+
+	/* Free compressed-mode decompress entries. Workers are already
+	 * joined at this point so no new entries can be added. */
+	{
+		struct xfer_compress_entry *e, *tmp;
+		pthread_mutex_lock(&xfer_compress_list_lock);
+		for (e = xfer_compress_list; e; e = tmp) {
+			tmp = e->next;
+			if (e->decompress)
+				decompress_free(e->decompress);
+			xfree(e->cookie);
+			pthread_mutex_destroy(&e->lock);
+			xfree(e);
+		}
+		xfer_compress_list = NULL;
+		pthread_mutex_unlock(&xfer_compress_list_lock);
 	}
 
 	/* Free remaining requests */
