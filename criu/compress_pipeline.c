@@ -327,8 +327,8 @@ struct compress_pipeline {
 	struct q compress_in;
 	struct waitlist writer_in;
 
-	/* Writer stage */
-	pthread_t writer_thread;
+	/* Writer stage — runs on the main thread during finalize(), not a
+	 * dedicated thread. See writer_drain() for the rationale. */
 	unsigned int n_frames_submitted;
 	ZSTD_frameLog *frame_log;
 
@@ -521,9 +521,24 @@ static int writer_upload_part(struct compress_pipeline *p, int *part_num,
 	return 0;
 }
 
-static void *writer_thread_fn(void *arg)
+/*
+ * Drain the waitlist of compressed frames, buffering into 8 MB parts and
+ * uploading them synchronously.
+ *
+ * This runs on the main thread during compress_pipeline_finalize(), not in
+ * a dedicated writer thread. We used to have a writer thread but its
+ * pthread_key destructor calling curl_easy_cleanup during thread exit
+ * deterministically broke the parasite's tsock on workloads with
+ * compress-workers > ~3 (parasite saw "Trimmed message received (12/0)").
+ * Keeping libcurl usage on the main thread — the only thread that ever
+ * interacts with the parasite RPC socket — avoids the whole class of
+ * libcurl/OpenSSL cross-thread cleanup interactions.
+ *
+ * Compression parallelism is still preserved via the N compress workers;
+ * only the final part-accumulation and upload serialize here.
+ */
+static void writer_drain(struct compress_pipeline *p)
 {
-	struct compress_pipeline *p = arg;
 	void *part_buf;
 	size_t part_cap = PART_SIZE;
 	size_t part_used = 0;
@@ -533,7 +548,7 @@ static void *writer_thread_fn(void *arg)
 	part_buf = xmalloc(part_cap);
 	if (!part_buf) {
 		pipe_set_error(p, -1);
-		return NULL;
+		return;
 	}
 
 	while ((f = waitlist_pop_in_order(&p->writer_in)) != NULL) {
@@ -618,7 +633,6 @@ static void *writer_thread_fn(void *arg)
 out:
 	xfree(part_buf);
 	upq_close(&p->upload_in);
-	return NULL;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -682,19 +696,14 @@ struct compress_pipeline *compress_pipeline_create(const char *object_key,
 				goto err;
 			}
 		}
-		if (pthread_create(&p->writer_thread, NULL,
-				   writer_thread_fn, p) != 0) {
-			pr_err("pthread_create writer\n");
-			pthread_sigmask(SIG_SETMASK, &old, NULL);
-			goto err;
-		}
 		/*
-		 * Upload workers are no longer launched — the writer thread
-		 * does synchronous multipart uploads itself so that all
-		 * libcurl activity stays on a single thread. n_upload is
-		 * still tracked so destroy() doesn't try to join non-existent
-		 * threads. (void) silences the unused-warning on the
-		 * upload_worker / etags_reserve helpers.
+		 * The writer role is handled by the main thread during
+		 * compress_pipeline_finalize(). No separate writer or upload
+		 * worker thread is launched: a background thread doing
+		 * curl_easy_cleanup on its pthread_key destructor
+		 * deterministically broke the parasite RPC socket for any
+		 * --compress-workers above ~3 (see writer_drain comment).
+		 * All libcurl activity is pinned to the main thread.
 		 */
 		(void)upload_worker;
 		(void)etags_reserve;
@@ -745,15 +754,27 @@ int compress_pipeline_finalize(struct compress_pipeline *p,
 	/* No more submits: close compress queue so workers drain. */
 	q_close(&p->compress_in);
 
-	/* Wait for compress workers to finish, then close writer input. */
-	for (i = 0; i < p->n_compress; i++)
+	/*
+	 * Wait for compress workers to finish, then close writer input.
+	 * Zero each handle as we join so compress_pipeline_destroy() below
+	 * doesn't double-join the same tid — pthread_join on an
+	 * already-joined thread is undefined behavior and crashed for us
+	 * at --compress-workers >= 5 on a 4-CPU box.
+	 */
+	for (i = 0; i < p->n_compress; i++) {
 		pthread_join(p->compress_threads[i], NULL);
+		p->compress_threads[i] = 0;
+	}
 	waitlist_close(&p->writer_in);
 
-	/* Wait for writer to finish (it'll close the upload queue). */
-	pthread_join(p->writer_thread, NULL);
+	/*
+	 * Drain the waitlist + upload all parts + seek table from the main
+	 * thread. Done inline (not a separate thread) to keep every libcurl
+	 * call on the thread that also drives parasite RPC; see writer_drain().
+	 */
+	writer_drain(p);
 
-	/* Wait for upload workers. */
+	/* Wait for upload workers (dormant — kept for shutdown symmetry). */
 	for (i = 0; i < p->n_upload; i++)
 		pthread_join(p->upload_threads[i], NULL);
 
@@ -786,8 +807,6 @@ void compress_pipeline_destroy(struct compress_pipeline *p)
 		xfree(p->compress_threads);
 	}
 	waitlist_close(&p->writer_in);
-	if (p->writer_thread)
-		pthread_join(p->writer_thread, NULL);
 	upq_close(&p->upload_in);
 	if (p->upload_threads) {
 		for (i = 0; i < p->n_upload; i++)
