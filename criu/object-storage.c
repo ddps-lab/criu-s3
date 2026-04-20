@@ -1909,6 +1909,84 @@ int object_storage_get_object(const char *object_key, void **out_data, unsigned 
 
 /*
  * =================================================================================
+ * HEAD Object — fetch only the Content-Length, no body.
+ *
+ * Replaces the geometric Range-GET probe that restore-side compression
+ * detection used to discover the compressed pages-*.img length. One
+ * round-trip instead of O(log N). S3 and MinIO both answer HEAD cheaply.
+ * =================================================================================
+ */
+int object_storage_head_object(const char *object_key, unsigned long *out_length)
+{
+	struct object_url_info url_info;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	curl_off_t content_length = -1;
+	struct curl_slist *headers = NULL;
+
+	if (!object_key || !out_length) {
+		pr_err("head_object: NULL parameter\n");
+		return -1;
+	}
+
+	*out_length = 0;
+
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	curl_handle = _get_curl_handle();
+	if (!curl_handle)
+		return -1;
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, url_info.url);
+	curl_easy_setopt(curl_handle, CURLOPT_NOBODY, 1L);
+	/* No write callback — HEAD doesn't return a body. Range/GET handlers
+	 * still leaked into reused handles elsewhere, so clear them. */
+	curl_easy_setopt(curl_handle, CURLOPT_RANGE, NULL);
+
+	if (_build_auth_headers("HEAD", url_info.auth_host, url_info.canonical_uri,
+				NULL, EMPTY_PAYLOAD_HASH, NULL, -1, &headers) != 0)
+		return -1;
+	if (headers)
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+	curl_easy_getinfo(curl_handle, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_length);
+
+	/* Reset transient options so the reused handle doesn't stay NOBODY. */
+	curl_easy_setopt(curl_handle, CURLOPT_NOBODY, 0L);
+
+	if (headers)
+		curl_slist_free_all(headers);
+
+	if (res != CURLE_OK) {
+		pr_err("HEAD %s failed: %s\n", object_key, curl_easy_strerror(res));
+		return -1;
+	}
+	if (http_code == 404)
+		return -ENOENT;
+	if (http_code < 200 || http_code >= 300) {
+		pr_err("HEAD %s failed with HTTP %ld\n", object_key, http_code);
+		return -1;
+	}
+	if (content_length < 0) {
+		pr_err("HEAD %s: server returned no Content-Length\n", object_key);
+		return -1;
+	}
+	*out_length = (unsigned long)content_length;
+	pr_debug("HEAD %s: %lu bytes (HTTP %ld)\n", object_key, *out_length, http_code);
+	return 0;
+}
+
+/*
+ * =================================================================================
  * List Objects V2 — enumerates keys under a prefix for bulk metadata prefetch.
  * Used by obstor_prefetch to discover all metadata files before opening any
  * image so that per-image opens become in-memory cache hits instead of one

@@ -179,6 +179,17 @@ int object_storage_put_object(const char *object_key, const void *data, unsigned
 int object_storage_get_object(const char *object_key, void **out_data, unsigned long *out_length);
 
 /*
+ * HEAD an object: one round-trip to get Content-Length without the body.
+ *
+ * Used by restore-side compression detection to discover the compressed
+ * pages-*.img size in a single request instead of an O(log N) geometric
+ * Range-GET probe.
+ *
+ * Returns 0 on success, -ENOENT if not found, -1 on other failure.
+ */
+int object_storage_head_object(const char *object_key, unsigned long *out_length);
+
+/*
  * Enumerate object keys under a prefix using S3 ListObjectsV2.
  * Handles pagination; returned keys are all under the given prefix.
  *

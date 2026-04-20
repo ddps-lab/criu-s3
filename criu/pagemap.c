@@ -283,107 +283,37 @@ static int s3_decomp_read_cb(void *cookie, off_t offset, size_t length, void *ou
  */
 static int init_s3_compression(struct page_read *pr, const char *object_key)
 {
-	uint8_t tail[4096];
+	uint8_t tail[4];
 	unsigned long tail_got = 0;
-	unsigned long probe_len = 4096;
-	off_t probe_off;
+	unsigned long size = 0;
 	struct s3_decomp_cookie *cookie;
 	int rc;
 
 	/*
-	 * We don't know the file size up front (no HEAD API). Probe by
-	 * requesting a generous window near the start of the file — S3
-	 * will short-read if the file is smaller. The public fetch_range
-	 * treats a short read as failure, so use the tolerant variant.
+	 * One HEAD request to learn the total object size, then a single
+	 * Range GET for the trailing 4 magic bytes. Replaces the previous
+	 * O(log N) geometric Range-GET probe.
 	 */
-	probe_off = 0;
-	rc = object_storage_fetch_range_short(object_key, probe_off, probe_len,
-					      tail, &tail_got, OBJSTOR_SRC_FAULT);
-	if (rc != 0 || tail_got < 4)
+	rc = object_storage_head_object(object_key, &size);
+	if (rc == -ENOENT)
+		return 0;
+	if (rc != 0)
+		return 0;
+	if (size < 4)
 		return 0;
 
-	/*
-	 * If the whole file fits in our probe buffer its last 4 bytes are
-	 * right there; otherwise we need to find out where EOF is and
-	 * reread the last 4. The fast path that matters in practice is the
-	 * small-file case (metadata, test sleeps) — for a big pages-*.img
-	 * we fall back to a binary search.
-	 */
-	if (tail_got < probe_len) {
-		/* Whole file returned; check its tail. */
-		if (decompress_probe(tail + tail_got - 4, 4) != 1)
-			return 0;
+	if (object_storage_fetch_range_short(object_key, (off_t)size - 4, 4,
+					     tail, &tail_got,
+					     OBJSTOR_SRC_FAULT) != 0)
+		return 0;
+	if (tail_got != 4 || decompress_probe(tail, 4) != 1)
+		return 0;
 
-		cookie = xzalloc(sizeof(*cookie));
-		if (!cookie)
-			return -1;
-		snprintf(cookie->object_key, sizeof(cookie->object_key),
-			 "%s", object_key);
-		cookie->total_size = tail_got;
-	} else {
-		/*
-		 * File is at least probe_len bytes. Walk forward by doubling
-		 * ranges until we hit EOF. This is O(log N) range GETs.
-		 */
-		unsigned long size = probe_len;
-		unsigned long step = probe_len;
-
-		/*
-		 * Geometric size probe: allocate a sliding scratch buffer
-		 * whose size doubles each iteration, issue a Range GET into
-		 * it starting at `size`, and stop when the response is short.
-		 * O(log N) requests, max buffer = next power of two above
-		 * the actual file size.
-		 */
-		{
-			void *probe_scratch = NULL;
-			size_t scratch_cap = 0;
-			int loop_guard = 0;
-
-			while (loop_guard++ < 48 /* 2^48 > any realistic size */) {
-				unsigned long got = 0;
-
-				step *= 2;
-				if (scratch_cap < step) {
-					void *nb = xrealloc(probe_scratch, step);
-					if (!nb) {
-						xfree(probe_scratch);
-						return -1;
-					}
-					probe_scratch = nb;
-					scratch_cap = step;
-				}
-				rc = object_storage_fetch_range_short(object_key,
-					size, step, probe_scratch, &got,
-					OBJSTOR_SRC_FAULT);
-				if (rc != 0) {
-					xfree(probe_scratch);
-					return 0;
-				}
-				if (got < step) {
-					size += got;
-					break;
-				}
-				size += step;
-			}
-			xfree(probe_scratch);
-		}
-
-		/* Fetch last 4 bytes. */
-		if (object_storage_fetch_range_short(object_key, size - 4, 4,
-					             tail, &tail_got,
-					             OBJSTOR_SRC_FAULT) != 0)
-			return 0;
-		if (tail_got != 4 || decompress_probe(tail, 4) != 1)
-			return 0;
-
-		cookie = xzalloc(sizeof(*cookie));
-		if (!cookie)
-			return -1;
-		snprintf(cookie->object_key, sizeof(cookie->object_key),
-			 "%s", object_key);
-		cookie->total_size = size;
-	}
+	cookie = xzalloc(sizeof(*cookie));
+	if (!cookie)
+		return -1;
+	snprintf(cookie->object_key, sizeof(cookie->object_key), "%s", object_key);
+	cookie->total_size = size;
 
 	pr_info("page-read: detected compressed S3 pages-*.img %s (%lu bytes)\n",
 		object_key, cookie->total_size);

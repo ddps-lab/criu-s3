@@ -264,71 +264,31 @@ xfer_obtain_compress_entry(unsigned int pages_img_id, const char *object_key)
 	 * total_size + is_compressed + shared cookie and let each worker
 	 * build its own decompress_ctx on demand. On failure leave
 	 * is_compressed=false so the raw-fetch branch is taken.
+	 *
+	 * HEAD gives the total length in one request; a 4-byte trailing
+	 * Range GET then confirms the seekable magic. O(1) RTTs instead of
+	 * the O(log N) geometric probe we used before.
 	 */
 	{
-		uint8_t tail[4096];
+		uint8_t tail[4];
 		unsigned long tail_got = 0;
+		unsigned long size = 0;
 		int rc;
-		unsigned long size;
 
-		rc = object_storage_fetch_range_short(object_key, 0, sizeof(tail),
-						      tail, &tail_got,
-						      OBJSTOR_SRC_PREFETCH);
-		if (rc != 0 || tail_got < 4) {
+		rc = object_storage_head_object(object_key, &size);
+		if (rc != 0 || size < 4) {
 			e->probed = true;
 			goto done;
 		}
 
-		if (tail_got < sizeof(tail)) {
-			if (decompress_probe(tail + tail_got - 4, 4) != 1) {
-				e->probed = true;
-				goto done;
-			}
-			size = tail_got;
-		} else {
-			void *scratch = NULL;
-			size_t scratch_cap = 0;
-			size_t step = sizeof(tail);
-			int guard = 0;
-
-			size = step;
-			while (guard++ < 48) {
-				unsigned long got = 0;
-				step *= 2;
-				if (scratch_cap < step) {
-					void *nb = xrealloc(scratch, step);
-					if (!nb) {
-						xfree(scratch);
-						e->probed = true;
-						goto done;
-					}
-					scratch = nb;
-					scratch_cap = step;
-				}
-				rc = object_storage_fetch_range_short(object_key,
-					size, step, scratch, &got,
-					OBJSTOR_SRC_PREFETCH);
-				if (rc != 0) {
-					xfree(scratch);
-					e->probed = true;
-					goto done;
-				}
-				if (got < step) {
-					size += got;
-					break;
-				}
-				size += step;
-			}
-			xfree(scratch);
-
-			if (object_storage_fetch_range_short(object_key, size - 4, 4,
-						             tail, &tail_got,
-						             OBJSTOR_SRC_PREFETCH) != 0 ||
-			    tail_got != 4 ||
-			    decompress_probe(tail, 4) != 1) {
-				e->probed = true;
-				goto done;
-			}
+		if (object_storage_fetch_range_short(object_key,
+						     (off_t)size - 4, 4,
+						     tail, &tail_got,
+						     OBJSTOR_SRC_PREFETCH) != 0 ||
+		    tail_got != 4 ||
+		    decompress_probe(tail, 4) != 1) {
+			e->probed = true;
+			goto done;
 		}
 
 		{
