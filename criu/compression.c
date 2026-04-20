@@ -192,18 +192,49 @@ void compress_stream_free(struct compress_stream *cs)
  * Decompression (restore side)
  * ====================================================================== */
 
+/*
+ * Per-frame directory extracted from the seek table at probe time. Lets
+ * us do exactly one Range GET per frame touched during decompress,
+ * bypassing ZSTD_seekable_decompress's chunked customFile reads.
+ */
+struct zstd_frame_entry {
+	unsigned long long comp_off;
+	unsigned long long comp_size;
+	unsigned long long decomp_off;
+	unsigned long long decomp_size;
+};
+
 struct decompress_ctx {
+	/* Buffer-mode (small files slurped in full): ZSTD_seekable over
+	 * the full compressed buffer, decompress_range delegates directly
+	 * to ZSTD_seekable_decompress (zero network). */
 	ZSTD_seekable *zs;
-
-	/* Lazy-read mode: callback into the caller's S3 fetcher. */
-	decompress_read_cb read_cb;
-	void *read_cookie;
-	off_t total_size;
-	off_t cursor;
-
-	/* Buffer mode: keep caller-owned buffer alive via a stable pointer. */
 	const void *buffer;
 	size_t buffer_len;
+
+	/*
+	 * Lazy-mode (large files): frame directory extracted at init,
+	 * plus a ZSTD_DCtx and a range-fetch callback. decompress_range
+	 * issues one callback per frame → 1 Range GET per frame, same
+	 * shape as the raw-page path.
+	 */
+	struct zstd_frame_entry *frames;
+	unsigned int num_frames;
+	ZSTD_DCtx *dctx;
+	decompress_read_cb read_cb;
+	void *read_cookie;
+
+	/* Scratch buffers, resized as needed. */
+	void *comp_scratch;
+	size_t comp_scratch_cap;
+	void *decomp_scratch;
+	size_t decomp_scratch_cap;
+
+	off_t total_size;
+
+	/* Only used by the ZSTD_seekable customFile during the one-shot
+	 * init pass that parses the seek table. Not touched afterwards. */
+	off_t cursor;
 };
 
 int decompress_probe(const void *tail_buf, size_t tail_len)
@@ -297,6 +328,15 @@ static int adv_seek(void *opaque, long long offset, int origin)
 	return 0;
 }
 
+/*
+ * Init path: use ZSTD_seekable once to parse the seek table via the
+ * caller's read_cb (which should serve those reads from a pre-fetched
+ * tail buffer), snapshot every frame's {comp_off, comp_size, decomp_off,
+ * decomp_size} into our own array, then free ZSTD_seekable. Decompress
+ * from this point on is driven by frames[] and ZSTD_DCtx — ZSTD_seekable
+ * no longer touches the read_cb, so there is no per-frame customFile
+ * read amplification.
+ */
 struct decompress_ctx *decompress_create_lazy(const void *seek_table_buf,
 					      size_t seek_table_len,
 					      off_t total_comp_size,
@@ -304,8 +344,10 @@ struct decompress_ctx *decompress_create_lazy(const void *seek_table_buf,
 					      void *cookie)
 {
 	struct decompress_ctx *d;
+	ZSTD_seekable *parse_zs = NULL;
 	ZSTD_seekable_customFile cf;
 	size_t rc;
+	unsigned i, nf;
 
 	(void)seek_table_buf;
 	(void)seek_table_len;
@@ -314,82 +356,238 @@ struct decompress_ctx *decompress_create_lazy(const void *seek_table_buf,
 	if (!d)
 		return NULL;
 
-	d->zs = ZSTD_seekable_create();
-	if (!d->zs) {
-		pr_err("ZSTD_seekable_create failed\n");
-		goto err;
-	}
-
 	d->read_cb = read_cb;
 	d->read_cookie = cookie;
 	d->total_size = total_comp_size;
 	d->cursor = 0;
 
+	parse_zs = ZSTD_seekable_create();
+	if (!parse_zs) {
+		pr_err("ZSTD_seekable_create failed\n");
+		goto err;
+	}
+
 	cf.opaque = d;
 	cf.read = adv_read;
 	cf.seek = adv_seek;
 
-	rc = ZSTD_seekable_initAdvanced(d->zs, cf);
+	rc = ZSTD_seekable_initAdvanced(parse_zs, cf);
 	if (ZSTD_isError(rc)) {
 		pr_err("ZSTD_seekable_initAdvanced: %s\n",
 		       ZSTD_getErrorName(rc));
 		goto err;
 	}
 
+	nf = ZSTD_seekable_getNumFrames(parse_zs);
+	if (nf == 0) {
+		pr_err("decompress_create_lazy: seek table reports 0 frames\n");
+		goto err;
+	}
+
+	d->frames = xzalloc(nf * sizeof(*d->frames));
+	if (!d->frames)
+		goto err;
+	for (i = 0; i < nf; i++) {
+		d->frames[i].comp_off   = ZSTD_seekable_getFrameCompressedOffset(parse_zs, i);
+		d->frames[i].comp_size  = ZSTD_seekable_getFrameCompressedSize(parse_zs, i);
+		d->frames[i].decomp_off = ZSTD_seekable_getFrameDecompressedOffset(parse_zs, i);
+		d->frames[i].decomp_size = ZSTD_seekable_getFrameDecompressedSize(parse_zs, i);
+	}
+	d->num_frames = nf;
+
+	ZSTD_seekable_free(parse_zs);
+	parse_zs = NULL;
+
+	d->dctx = ZSTD_createDCtx();
+	if (!d->dctx) {
+		pr_err("ZSTD_createDCtx failed\n");
+		goto err;
+	}
+
 	return d;
 err:
+	if (parse_zs)
+		ZSTD_seekable_free(parse_zs);
 	decompress_free(d);
 	return NULL;
+}
+
+/*
+ * Find the frame containing the given uncompressed byte offset via
+ * binary search on frames[].decomp_off. Returns num_frames if the
+ * offset sits past the last frame.
+ */
+static unsigned find_frame(const struct zstd_frame_entry *frames,
+			   unsigned num_frames, unsigned long long uoff)
+{
+	unsigned lo = 0, hi = num_frames;
+	while (lo < hi) {
+		unsigned mid = lo + (hi - lo) / 2;
+		unsigned long long fo = frames[mid].decomp_off;
+		unsigned long long fe = fo + frames[mid].decomp_size;
+		if (uoff < fo)
+			hi = mid;
+		else if (uoff >= fe)
+			lo = mid + 1;
+		else
+			return mid;
+	}
+	return num_frames;
+}
+
+/*
+ * Grow a scratch buffer in place if cap is too small. Returns 0 on ok.
+ */
+static int ensure_scratch(void **buf, size_t *cap, size_t need)
+{
+	void *nb;
+	if (need <= *cap)
+		return 0;
+	nb = xrealloc(*buf, need);
+	if (!nb)
+		return -1;
+	*buf = nb;
+	*cap = need;
+	return 0;
 }
 
 int decompress_range(struct decompress_ctx *d, off_t off, size_t len,
 		     void *out)
 {
-	size_t got = 0;
-	size_t rc;
-
-	/* The seekable API returns the count decompressed on each call; for
-	 * large reads it may satisfy the request in multiple steps. */
-	while (got < len) {
-		rc = ZSTD_seekable_decompress(d->zs,
-					      (char *)out + got, len - got,
-					      (unsigned long long)(off + got));
-		if (ZSTD_isError(rc)) {
-			pr_err("ZSTD_seekable_decompress: %s\n",
-			       ZSTD_getErrorName(rc));
-			return -1;
+	/* Buffer-mode: delegate to ZSTD_seekable which has full bytes in
+	 * memory already. No Range GETs, so amplification doesn't matter. */
+	if (d->zs) {
+		size_t got = 0;
+		size_t rc;
+		while (got < len) {
+			rc = ZSTD_seekable_decompress(d->zs,
+						      (char *)out + got, len - got,
+						      (unsigned long long)(off + got));
+			if (ZSTD_isError(rc)) {
+				pr_err("ZSTD_seekable_decompress: %s\n",
+				       ZSTD_getErrorName(rc));
+				return -1;
+			}
+			if (rc == 0) {
+				pr_err("ZSTD_seekable_decompress returned 0 at offset %lld\n",
+				       (long long)(off + got));
+				return -1;
+			}
+			got += rc;
 		}
-		if (rc == 0) {
-			pr_err("ZSTD_seekable_decompress returned 0 at offset %lld\n",
-			       (long long)(off + got));
-			return -1;
-		}
-		got += rc;
+		return 0;
 	}
-	return 0;
+
+	/* Lazy/frame-table mode. */
+	if (!d->frames || !d->dctx || !d->read_cb) {
+		pr_err("decompress_range: ctx not initialized for frame-table mode\n");
+		return -1;
+	}
+
+	{
+		unsigned long long uoff = (unsigned long long)off;
+		unsigned long long uend = uoff + len;
+		unsigned i = find_frame(d->frames, d->num_frames, uoff);
+		char *dst = (char *)out;
+		size_t done = 0;
+
+		while (uoff < uend) {
+			struct zstd_frame_entry *f;
+			size_t dec;
+
+			if (i >= d->num_frames) {
+				pr_err("decompress_range: ran past frames (uoff=%llu)\n",
+				       uoff);
+				return -1;
+			}
+			f = &d->frames[i];
+
+			/*
+			 * Fetch the full compressed body of this frame in a
+			 * single Range GET (one network RTT per frame).
+			 */
+			if (ensure_scratch(&d->comp_scratch, &d->comp_scratch_cap,
+					   f->comp_size) < 0)
+				return -1;
+			if (d->read_cb(d->read_cookie, (off_t)f->comp_off,
+				       (size_t)f->comp_size, d->comp_scratch) != 0) {
+				pr_err("decompress_range: read_cb failed for frame %u (comp_off=%llu, len=%llu)\n",
+				       i, f->comp_off, f->comp_size);
+				return -1;
+			}
+
+			if (uoff == f->decomp_off && (uend - uoff) >= f->decomp_size) {
+				/* Whole frame fits in the caller's buffer — decompress directly. */
+				dec = ZSTD_decompressDCtx(d->dctx,
+							  dst + done,
+							  (size_t)f->decomp_size,
+							  d->comp_scratch,
+							  (size_t)f->comp_size);
+				if (ZSTD_isError(dec)) {
+					pr_err("ZSTD_decompressDCtx frame %u: %s\n",
+					       i, ZSTD_getErrorName(dec));
+					return -1;
+				}
+				done += dec;
+				uoff += dec;
+			} else {
+				/* Partial frame — decompress into scratch then copy. */
+				size_t frame_off_in = (size_t)(uoff - f->decomp_off);
+				size_t want = (size_t)(uend - uoff);
+				size_t avail = (size_t)(f->decomp_size - frame_off_in);
+				size_t take = want < avail ? want : avail;
+
+				if (ensure_scratch(&d->decomp_scratch, &d->decomp_scratch_cap,
+						   (size_t)f->decomp_size) < 0)
+					return -1;
+				dec = ZSTD_decompressDCtx(d->dctx,
+							  d->decomp_scratch,
+							  (size_t)f->decomp_size,
+							  d->comp_scratch,
+							  (size_t)f->comp_size);
+				if (ZSTD_isError(dec)) {
+					pr_err("ZSTD_decompressDCtx frame %u: %s\n",
+					       i, ZSTD_getErrorName(dec));
+					return -1;
+				}
+				memcpy(dst + done,
+				       (char *)d->decomp_scratch + frame_off_in, take);
+				done += take;
+				uoff += take;
+			}
+			i++;
+		}
+		return 0;
+	}
 }
 
 unsigned long long decompress_total_raw_size(struct decompress_ctx *d)
 {
 	unsigned long long total = 0;
-	unsigned nf = ZSTD_seekable_getNumFrames(d->zs);
 	unsigned i;
 
-	for (i = 0; i < nf; i++)
-		total += ZSTD_seekable_getFrameDecompressedSize(d->zs, i);
+	if (d->zs) {
+		unsigned nf = ZSTD_seekable_getNumFrames(d->zs);
+		for (i = 0; i < nf; i++)
+			total += ZSTD_seekable_getFrameDecompressedSize(d->zs, i);
+	} else if (d->frames) {
+		for (i = 0; i < d->num_frames; i++)
+			total += d->frames[i].decomp_size;
+	}
 	return total;
 }
 
 unsigned decompress_num_frames(struct decompress_ctx *d)
 {
-	return ZSTD_seekable_getNumFrames(d->zs);
+	if (d->zs)
+		return ZSTD_seekable_getNumFrames(d->zs);
+	return d->num_frames;
 }
 
 int decompress_map_range(struct decompress_ctx *d, off_t uoff, size_t ulen,
 			 off_t *comp_off, size_t *comp_len)
 {
-	unsigned first, last, f;
-	unsigned long long start_off, end_off;
+	unsigned first, last;
 
 	if (ulen == 0) {
 		*comp_off = 0;
@@ -397,31 +595,36 @@ int decompress_map_range(struct decompress_ctx *d, off_t uoff, size_t ulen,
 		return 0;
 	}
 
-	first = ZSTD_seekable_offsetToFrameIndex(d->zs,
-						 (unsigned long long)uoff);
-	/*
-	 * offsetToFrameIndex() on an offset one past a frame boundary can
-	 * return the *next* frame, which is fine for the "last" bound —
-	 * probe (uoff+ulen-1) to pick the frame containing the final byte.
-	 */
-	last = ZSTD_seekable_offsetToFrameIndex(d->zs,
-						(unsigned long long)(uoff + ulen - 1));
-	if (last < first)
-		last = first;
+	if (d->zs) {
+		unsigned long long start_off, end_off;
+		unsigned f;
 
-	start_off = ZSTD_seekable_getFrameCompressedOffset(d->zs, first);
-	end_off = ZSTD_seekable_getFrameCompressedOffset(d->zs, last);
-	if (start_off == ZSTD_SEEKABLE_FRAMEINDEX_TOOLARGE ||
-	    end_off == ZSTD_SEEKABLE_FRAMEINDEX_TOOLARGE) {
-		pr_err("seekable map_range: frame index out of range (first=%u last=%u)\n",
-		       first, last);
-		return -1;
+		first = ZSTD_seekable_offsetToFrameIndex(d->zs, (unsigned long long)uoff);
+		last = ZSTD_seekable_offsetToFrameIndex(d->zs,
+							(unsigned long long)(uoff + ulen - 1));
+		if (last < first)
+			last = first;
+		start_off = ZSTD_seekable_getFrameCompressedOffset(d->zs, first);
+		end_off = ZSTD_seekable_getFrameCompressedOffset(d->zs, last);
+		if (start_off == ZSTD_SEEKABLE_FRAMEINDEX_TOOLARGE ||
+		    end_off == ZSTD_SEEKABLE_FRAMEINDEX_TOOLARGE)
+			return -1;
+		f = last;
+		end_off += ZSTD_seekable_getFrameCompressedSize(d->zs, f);
+		*comp_off = (off_t)start_off;
+		*comp_len = (size_t)(end_off - start_off);
+		return 0;
 	}
-	f = last;
-	end_off += ZSTD_seekable_getFrameCompressedSize(d->zs, f);
 
-	*comp_off = (off_t)start_off;
-	*comp_len = (size_t)(end_off - start_off);
+	/* Frame-table mode. */
+	first = find_frame(d->frames, d->num_frames, (unsigned long long)uoff);
+	last = find_frame(d->frames, d->num_frames,
+			  (unsigned long long)(uoff + ulen - 1));
+	if (first >= d->num_frames || last >= d->num_frames)
+		return -1;
+	*comp_off = (off_t)d->frames[first].comp_off;
+	*comp_len = (size_t)((d->frames[last].comp_off + d->frames[last].comp_size) -
+			     d->frames[first].comp_off);
 	return 0;
 }
 
@@ -431,5 +634,13 @@ void decompress_free(struct decompress_ctx *d)
 		return;
 	if (d->zs)
 		ZSTD_seekable_free(d->zs);
+	if (d->dctx)
+		ZSTD_freeDCtx(d->dctx);
+	if (d->frames)
+		xfree(d->frames);
+	if (d->comp_scratch)
+		xfree(d->comp_scratch);
+	if (d->decomp_scratch)
+		xfree(d->decomp_scratch);
 	xfree(d);
 }

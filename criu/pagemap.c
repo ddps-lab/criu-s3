@@ -278,16 +278,6 @@ struct s3_decomp_cookie {
 /* Safety ceiling in case the footer reports a corrupt num_frames. */
 #define S3_COMP_TAIL_MAX (16UL << 20)
 
-/*
- * Files at or below this size are slurped in full into the cookie. Every
- * subsequent decompress_range() serves frame headers and bodies from
- * memory — a single Range GET at probe time beats N tiny per-frame GETs
- * once the compressed object fits in this window. Chosen so a typical
- * CRIU checkpoint's pages-*.img (compressed) rounds down to a single
- * S3 object fetch in the common case.
- */
-#define S3_COMP_FULL_SLURP (64UL << 20)
-
 static inline uint32_t read_le32(const uint8_t *p)
 {
 	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -405,23 +395,16 @@ static int init_s3_compression(struct page_read *pr, const char *object_key)
 	cookie->total_size = size;
 
 	/*
-	 * Parse the footer for the seek-table extent. Then choose the
-	 * tail size:
-	 *
-	 *  - If the compressed object is small (≤ S3_COMP_FULL_SLURP), cache
-	 *    the whole file so decompress_range() serves every read —
-	 *    including frame headers and bodies — from memory.
-	 *  - Otherwise cache just enough to cover the seek table. Frame
-	 *    bodies go to S3 on demand, in parallel across workers.
+	 * Cache exactly the seek-table bytes at EOF — enough for
+	 * decompress_create_lazy() to extract the frame directory on the
+	 * init pass. Frame bodies are never read through the tail cache;
+	 * decompress_range() fetches each frame via the callback directly.
 	 */
-	{
-		size_t sk = s3_seek_table_size(object_key, size);
-		if (sk == 0) {
-			pr_err("init_s3_compression: seek-table footer parse failed\n");
-			xfree(cookie);
-			return -1;
-		}
-		cookie->tail_len = (size <= S3_COMP_FULL_SLURP) ? (size_t)size : sk;
+	cookie->tail_len = s3_seek_table_size(object_key, size);
+	if (cookie->tail_len == 0) {
+		pr_err("init_s3_compression: seek-table footer parse failed\n");
+		xfree(cookie);
+		return -1;
 	}
 	cookie->tail_start = size - cookie->tail_len;
 	cookie->tail_buf = xmalloc(cookie->tail_len);
