@@ -198,6 +198,22 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 
 	dump_all_pages = should_dump_entire_vma(vma->e);
 
+	/*
+	 * Compressed dumps: force the next page_pipe iov to start fresh at
+	 * every VMA boundary. Without this, VA-adjacent VMAs (common in
+	 * slab-heavy workloads like memcached) get merged into one iov →
+	 * one pagemap entry → one zstd frame that spans multiple VMAs.
+	 * Restore's collect_iovs() then splits that pagemap entry back into
+	 * per-VMA lazy IOVs (UFFDIO_COPY can't cross VMAs), and every one
+	 * of them re-fetches + re-decompresses the same shared frame.
+	 *
+	 * Raw mode doesn't care — Range GETs are naturally disjoint per iov
+	 * — so this is gated on opts.compress to avoid perturbing the
+	 * non-compressed pagemap layout.
+	 */
+	if (opts.compress)
+		page_pipe_split_iov(pp);
+
 	nr_scanned = 0;
 	for (vaddr = *pvaddr; vaddr < vma->e->end; vaddr += PAGE_SIZE, nr_scanned++) {
 		unsigned int ppb_flags = 0;

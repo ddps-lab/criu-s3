@@ -1,6 +1,7 @@
 #ifndef __CR_PAGE_PIPE_H__
 #define __CR_PAGE_PIPE_H__
 
+#include <stdbool.h>
 #include <sys/uio.h>
 #include "common/list.h"
 
@@ -128,6 +129,18 @@ struct page_pipe {
 	struct iovec *holes;	/* holes */
 	unsigned int *hole_flags;
 	unsigned int flags; /* PP_FOO flags below */
+	/*
+	 * One-shot signal from the producer: "the next add_page() must start
+	 * a fresh iov even if the address happens to be VA-contiguous with
+	 * the previous one". Cleared on use.
+	 *
+	 * Used by generate_iovs() at every VMA boundary when --compress is
+	 * enabled, so each pagemap entry (= one zstd frame at dump) stays
+	 * within a single VMA. Otherwise a single frame can span multiple
+	 * VMAs, and restore (where UFFDIO_COPY can't cross VMAs) splits it
+	 * into several lazy IOVs that all re-fetch+decompress the same frame.
+	 */
+	bool split_next_iov;
 };
 
 #define PP_CHUNK_MODE 0x1 /* Restrict the maximum buffer size of pipes and dump memory for a few iterations */
@@ -137,6 +150,7 @@ struct page_pipe *create_page_pipe(unsigned int nr_segs, struct iovec *iovs, uns
 extern void destroy_page_pipe(struct page_pipe *p);
 extern int page_pipe_add_page(struct page_pipe *p, unsigned long addr, unsigned int flags);
 extern int page_pipe_add_hole(struct page_pipe *pp, unsigned long addr, unsigned int flags);
+extern void page_pipe_split_iov(struct page_pipe *pp);
 
 extern void debug_show_page_pipe(struct page_pipe *pp);
 void page_pipe_reinit(struct page_pipe *pp);
