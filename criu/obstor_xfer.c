@@ -463,7 +463,6 @@ struct controller_stats {
 	unsigned long queue_removes;
 	unsigned long priority_promotions;
 	unsigned long obsolete_prevented;  /* Removed before worker fetched */
-	unsigned long proximity_removed;   /* Removed due to proximity to fault */
 	unsigned long hot_vma_faults;      /* Faults on hot VMA pages */
 	unsigned long cold_vma_faults;     /* Faults on non-hot VMA pages */
 	unsigned long hot_vma_prefetched;  /* Hot VMA IOVs prefetched before fault */
@@ -472,8 +471,6 @@ static struct controller_stats controller_stats;
 static pthread_mutex_t controller_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Controller tuning */
-#define PROXIMITY_WINDOW 8           /* Forward IOVs to remove on fault */
-#define ENABLE_PROXIMITY_REMOVAL 1   /* Feature flag: set 0 to disable */
 #define PROMOTE_DISTANCE 32          /* Fixed: promote next N IOVs on fault */
 
 /* ========== IOV Metadata Functions ========== */
@@ -1379,12 +1376,11 @@ void prefetch_cleanup(void)
 	pthread_mutex_unlock(&stats_lock);
 
 	pthread_mutex_lock(&controller_stats_lock);
-	pr_info("CONTROLLER faults=%lu removes=%lu promotes=%lu obsolete=%lu proximity=%lu hot_faults=%lu cold_faults=%lu hot_prefetched=%lu\n",
+	pr_info("CONTROLLER faults=%lu removes=%lu promotes=%lu obsolete=%lu hot_faults=%lu cold_faults=%lu hot_prefetched=%lu\n",
 		controller_stats.faults_processed,
 		controller_stats.queue_removes,
 		controller_stats.priority_promotions,
 		controller_stats.obsolete_prevented,
-		controller_stats.proximity_removed,
 		controller_stats.hot_vma_faults,
 		controller_stats.cold_vma_faults,
 		controller_stats.hot_vma_prefetched);
@@ -1740,44 +1736,17 @@ void prefetch_on_fault(void *lpi, int iov_index)
 		}
 	}
 
-#if ENABLE_PROXIMITY_REMOVAL
-	/* 2. Proximity removal: remove next PROXIMITY_WINDOW forward IOVs.
-	 *
-	 * CRITICAL: these IOVs are being evicted from the worker queue, but
-	 * their iov_meta entries are still in state IOV_QUEUED. If we don't
-	 * reset the state, `obstor_xfer_iov_is_pending()` will forever report
-	 * them as pending to the main-loop xfer_pages path, and the main loop
-	 * will spin on them (no worker will ever pick them up — the request
-	 * object is gone). Reset to IOV_NOT_REQUESTED so the main-loop sync
-	 * fallback path in xfer_pages can handle them.
+	/*
+	 * 2. Promote ahead IOVs: fixed window starting one index past the
+	 * faulted IOV. Previously we also evicted the next 8 IOVs from the
+	 * async queue under a spatial-locality assumption ("they'll fault
+	 * next too, let main-thread sync-fetch them"). Measured on mc4gb
+	 * ablation 2026-04-21: the assumption backfires for fault-heavy
+	 * paths — every eviction costs one async install and the workload
+	 * often ends up fetching the same IOV via a UFFD fault anyway. COMP
+	 * 5_full daemon drops 19.3s → 11.6s (−40%) once eviction is off.
 	 */
-	for (i = 1; i <= PROXIMITY_WINDOW; i++) {
-		int prox_idx = iov_index + i;
-		struct prefetch_request *prox_req;
-		if (prox_idx >= total_iovs)
-			break;
-		prox_req = hash_table_lookup(&request_hash_table, prox_idx);
-		if (prox_req) {
-			struct iov_meta *prox_meta;
-			list_del(&prox_req->list);
-			hash_table_remove(&request_hash_table, prox_idx);
-			xfree(prox_req);
-			queue_size--;
-			controller_stats.proximity_removed++;
-
-			/* Restore state-machine invariant:
-			 * state == QUEUED ⇒ request is in a queue. */
-			pthread_mutex_lock(&iov_meta_lock);
-			prox_meta = iov_index_map[prox_idx];
-			if (prox_meta && prox_meta->state == IOV_QUEUED)
-				prox_meta->state = IOV_NOT_REQUESTED;
-			pthread_mutex_unlock(&iov_meta_lock);
-		}
-	}
-#endif
-
-	/* 3. Promote ahead IOVs: fixed window */
-	for (i = PROXIMITY_WINDOW + 1; i <= PROXIMITY_WINDOW + PROMOTE_DISTANCE; i++) {
+	for (i = 1; i <= PROMOTE_DISTANCE; i++) {
 		int ahead_idx = iov_index + i;
 		struct prefetch_request *existing;
 		if (ahead_idx >= total_iovs)
