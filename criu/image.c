@@ -1,4 +1,8 @@
 #include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <stdarg.h>
 #include <fcntl.h>
@@ -21,6 +25,7 @@
 #include "namespaces.h"
 #include "object-storage.h"
 #include "obstor_prefetch.h"
+#include "compression.h"
 
 bool ns_per_id = false;
 bool img_common_magic = true;
@@ -526,6 +531,7 @@ struct cr_imgset *cr_glob_imgset_open(int mode)
 }
 
 static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long flags, char *path);
+static void maybe_swap_compressed_pages(struct cr_img *img, u32 pages_img_id);
 
 struct cr_img *open_image_at(int dfd, int type, unsigned long flags, ...)
 {
@@ -563,6 +569,21 @@ struct cr_img *open_image_at(int dfd, int type, unsigned long flags, ...)
 	if (do_open_image(img, dfd, type, oflags, path)) {
 		close_image(img);
 		return NULL;
+	}
+
+	/*
+	 * Transparent zstd-seekable decompression for every restore-side open
+	 * of a pages-*.img. Both open_pages_image_at() (page-read path) and
+	 * open_image(CR_FD_PAGES, ...) (prepare_vma_ios parasite path) funnel
+	 * through here, so any compressed pages image is swapped to a shared
+	 * decompressed memfd before any caller sees the fd. Id is recovered
+	 * from the already-formatted path so we don't have to change the
+	 * public signature.
+	 */
+	if (type == CR_FD_PAGES && (oflags & O_ACCMODE) == O_RDONLY) {
+		unsigned int pages_img_id = 0;
+		if (sscanf(path, "pages-%u.img", &pages_img_id) == 1)
+			maybe_swap_compressed_pages(img, (u32)pages_img_id);
 	}
 
 	return img;
@@ -1099,6 +1120,174 @@ void up_page_ids_base(void)
 	page_ids += 0x10000;
 }
 
+/*
+ * =============================================================================
+ * Transparent zstd-seekable decompression for pages-*.img on restore.
+ *
+ * A compressed pages-*.img can be opened from several places during restore
+ * (open_page_read_at, prepare_vma_ios, dedup paths, ...). Each such open
+ * returns a fresh fd that currently points at the on-disk compressed bytes.
+ * The parasite preadv path expects raw page bytes, so the first parasite iov
+ * gets 0-length reads and loops forever.
+ *
+ * Fix: on the first restore-side open of a given pages_img_id, detect the
+ * seek-table magic at the file tail, decompress the whole file into a
+ * memfd, and keep the memfd in a process-wide cache keyed on pages_img_id.
+ * Every open_pages_image_at() that follows returns a dup of the cached
+ * memfd, so any caller (page-read, prepare_vma_ios, parasite) sees raw
+ * uncompressed bytes with identical semantics to a raw dump. The on-disk
+ * compressed file is kept only long enough for the initial decompress read.
+ *
+ * Cache lifetime is whole-process; the memfd is dropped by fork/exec or
+ * criu exit. Good enough for one-shot restores.
+ * =============================================================================
+ */
+
+struct pages_mfd_cache_entry {
+	u32 pages_img_id;
+	int mfd;		/* decompressed memfd, shared */
+	struct pages_mfd_cache_entry *next;
+};
+
+static struct pages_mfd_cache_entry *pages_mfd_cache;
+
+static int pages_mfd_cache_get(u32 pages_img_id)
+{
+	struct pages_mfd_cache_entry *e;
+	for (e = pages_mfd_cache; e; e = e->next) {
+		if (e->pages_img_id == pages_img_id)
+			return e->mfd;
+	}
+	return -1;
+}
+
+static int pages_mfd_cache_put(u32 pages_img_id, int mfd)
+{
+	struct pages_mfd_cache_entry *e = xzalloc(sizeof(*e));
+	if (!e)
+		return -1;
+	e->pages_img_id = pages_img_id;
+	e->mfd = mfd;
+	e->next = pages_mfd_cache;
+	pages_mfd_cache = e;
+	return 0;
+}
+
+/*
+ * Decompress the fd's contents (a zstd-seekable pages-*.img) into a memfd
+ * and return the memfd (with cursor at 0). Returns -1 on failure.
+ */
+static int decompress_pages_to_memfd(int src_fd)
+{
+	struct stat st;
+	uint8_t tail[4];
+	void *src_buf = NULL;
+	struct decompress_ctx *dctx = NULL;
+	int mfd = -1;
+	unsigned long long total_raw;
+	void *map;
+
+	if (fstat(src_fd, &st) < 0 || st.st_size < 4)
+		return -1;
+	if (pread(src_fd, tail, 4, st.st_size - 4) != 4)
+		return -1;
+	if (decompress_probe(tail, sizeof(tail)) != 1)
+		return -1;
+
+	src_buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, src_fd, 0);
+	if (src_buf == MAP_FAILED) {
+		pr_perror("pages-compress: mmap src");
+		return -1;
+	}
+
+	dctx = decompress_create_from_buffer(src_buf, st.st_size);
+	if (!dctx)
+		goto err;
+	total_raw = decompress_total_raw_size(dctx);
+
+	mfd = syscall(SYS_memfd_create, "criu-decompressed-pages", 0);
+	if (mfd < 0) {
+		pr_perror("pages-compress: memfd_create");
+		goto err;
+	}
+	if (ftruncate(mfd, total_raw) < 0) {
+		pr_perror("pages-compress: ftruncate memfd");
+		goto err;
+	}
+	map = mmap(NULL, total_raw, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+	if (map == MAP_FAILED) {
+		pr_perror("pages-compress: mmap memfd");
+		goto err;
+	}
+	if (decompress_range(dctx, 0, total_raw, map) < 0) {
+		pr_err("pages-compress: decompress_range failed\n");
+		munmap(map, total_raw);
+		goto err;
+	}
+	munmap(map, total_raw);
+	if (lseek(mfd, 0, SEEK_SET) < 0) {
+		pr_perror("pages-compress: lseek memfd");
+		goto err;
+	}
+
+	decompress_free(dctx);
+	munmap(src_buf, st.st_size);
+	pr_info("pages-compress: decompressed %lld B -> %llu B memfd\n",
+		(long long)st.st_size, total_raw);
+	return mfd;
+
+err:
+	if (mfd >= 0)
+		close(mfd);
+	if (dctx)
+		decompress_free(dctx);
+	if (src_buf && src_buf != MAP_FAILED)
+		munmap(src_buf, st.st_size);
+	return -1;
+}
+
+/*
+ * If the pages image is zstd-seekable, swap img->_x.fd to a decompressed
+ * memfd shared across every restore-side open of the same pages_img_id.
+ * Raw (non-compressed) images are left untouched.
+ */
+static void maybe_swap_compressed_pages(struct cr_img *img, u32 pages_img_id)
+{
+	int cached, new_fd, mfd;
+
+	if (!img || img->_x.fd < 0 || empty_image(img) || lazy_image(img))
+		return;
+
+	/* Cache hit: dup and install. */
+	cached = pages_mfd_cache_get(pages_img_id);
+	if (cached >= 0) {
+		new_fd = dup(cached);
+		if (new_fd < 0) {
+			pr_perror("pages-compress: dup cached memfd");
+			return;
+		}
+		close(img->_x.fd);
+		img->_x.fd = new_fd;
+		return;
+	}
+
+	/* Miss: probe + decompress + cache. */
+	mfd = decompress_pages_to_memfd(img->_x.fd);
+	if (mfd < 0)
+		return;	/* not compressed or decompress failed */
+	if (pages_mfd_cache_put(pages_img_id, mfd) < 0) {
+		close(mfd);
+		return;
+	}
+	new_fd = dup(mfd);
+	if (new_fd < 0) {
+		pr_perror("pages-compress: dup fresh memfd");
+		return;
+	}
+	close(img->_x.fd);
+	img->_x.fd = new_fd;
+}
+
 struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
 {
 	if (flags == O_RDONLY || flags == O_RDWR) {
@@ -1114,6 +1303,11 @@ struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *
 			return NULL;
 	}
 
+	/*
+	 * Compression handling is centralized in open_image_at() — it fires
+	 * for every restore-side CR_FD_PAGES open regardless of whether the
+	 * caller routes through here or through open_image() directly.
+	 */
 	return open_image_at(dfd, CR_FD_PAGES, flags, *id);
 }
 

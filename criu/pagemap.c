@@ -449,22 +449,13 @@ static int init_s3_compression(struct page_read *pr, const char *object_key)
 }
 
 /*
- * Auto-detect zstd seekable format on a local pages-*.img.
- *
- * Detection: the last 4 bytes of a seekable file hold the seek-table magic.
- *
- * On detection we fully decompress the image into a memfd and replace the
- * cr_img fd with the memfd. Every downstream path that reads pages
- * (parasite preadv(), read_local_page(), premap, dedup) sees what looks
- * like a raw pages-*.img and needs no modification. The in-memory raw
- * size matches the original uncompressed dump, but that's memory the
- * restore process is about to consume anyway.
- *
- * If the file is compressed but decoder setup or full-decompress fails,
- * we bail out — falling back to raw reads of compressed bytes would
- * corrupt the restore.
+ * Retained for reference: local-mode compression was folded into
+ * open_pages_image_at() in image.c, so this helper is no longer called
+ * on the normal path. Left in place as dead code for the moment so
+ * git-blame / diffs stay sensible.
  */
-static int init_local_compression(struct page_read *pr)
+static __attribute__((unused))
+int init_local_compression(struct page_read *pr)
 {
 	int src_fd, mfd;
 	struct stat st;
@@ -571,9 +562,6 @@ static int init_local_compression(struct page_read *pr)
 	decompress_free(dctx);
 	munmap(src_buf, st.st_size);
 
-	/* Intentionally do NOT set pr->compressed_mode / pr->decompress — from
-	 * this point on pr->pi points at a raw pages-*.img (in memfd). Every
-	 * downstream path runs unmodified, including parasite preadv(). */
 	return 0;
 
 err:
@@ -2116,25 +2104,14 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		pr->maybe_read_page = maybe_read_page_local;
 
 		/*
-		 * Auto-detect zstd seekable format: the last 4 bytes of a
-		 * seekable file are the seek-table magic (0x8F92EAB1). If we
-		 * see it, slurp the whole pages-*.img into memory and hand it
-		 * to decompress_create_from_buffer. Small enough to keep in
-		 * RAM for local restore; the S3 restore path uses the lazy
-		 * callback flavor to avoid that requirement.
+		 * Compression is handled transparently inside
+		 * open_pages_image_at() — if the pages image was zstd-seekable
+		 * that function already swapped pr->pi->_x.fd to a memfd of
+		 * raw decompressed bytes. Every downstream reader (parasite
+		 * preadv, dedup, prepare_vma_ios) sees the memfd directly.
 		 */
-		if (init_local_compression(pr) < 0)
-			return -1;
 
-		/*
-		 * pieok lets parasite engine pread() raw page bytes directly
-		 * out of pages-*.img — we can't do that on a compressed file
-		 * because the parasite runs in restored-process context and
-		 * doesn't link zstd. Force pages through the userspace path
-		 * (maybe_read_page_local -> read_local_page -> decompress)
-		 * whenever the image is compressed.
-		 */
-		if (!pr->parent && !opts.lazy_pages && !pr->compressed_mode)
+		if (!pr->parent && !opts.lazy_pages)
 			pr->pieok = true;
 		else
 			pr->pieok = false;
