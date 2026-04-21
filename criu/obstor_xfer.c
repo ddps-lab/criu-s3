@@ -797,13 +797,6 @@ struct obstor_batch {
 	int head_priority;
 };
 
-static int priority_class(int p)
-{
-	if (p >= 70) return 2;
-	if (p >= 40) return 1;
-	return 0;
-}
-
 static int dequeue_batch(struct obstor_batch *b, unsigned long max_bytes)
 {
 	struct prefetch_request *head;
@@ -835,7 +828,16 @@ static int dequeue_batch(struct obstor_batch *b, unsigned long max_bytes)
 	/* Walk forward looking for adjacent requests in the hash table.
 	 * Uses iov_index ordering, which mirrors the original VMA walk
 	 * order from collect_iovs(); adjacent indices map to adjacent
-	 * file_offsets in the typical case. */
+	 * file_offsets in the typical case.
+	 *
+	 * We intentionally do NOT check priority_class here: priority only
+	 * determines which queue the head is dequeued from. Once we have a
+	 * head, any adjacent IOV (file_offset + vaddr strictly contiguous)
+	 * should be batched regardless of its own priority class — a mixed-
+	 * priority Range GET still installs all slices correctly. Excluding
+	 * on priority fragmented batches badly in workloads with lots of
+	 * PROMOTE events (e.g. compressed lazy-pages where every fault
+	 * promotes 32 neighbours → queue_low walk breaks every few IOVs). */
 	next_idx = head->iov_index + 1;
 	while (b->n_iovs < OBSTOR_BATCH_MAX_IOVS) {
 		struct prefetch_request *next;
@@ -847,8 +849,6 @@ static int dequeue_batch(struct obstor_batch *b, unsigned long max_bytes)
 		if (!next)
 			break;
 		if (next->pages_img_id != b->pages_img_id)
-			break;
-		if (priority_class(next->priority) != priority_class(b->head_priority))
 			break;
 
 		expected_offset = b->base_offset + b->total_bytes;
