@@ -235,7 +235,36 @@ struct decompress_ctx {
 	/* Only used by the ZSTD_seekable customFile during the one-shot
 	 * init pass that parses the seek table. Not touched afterwards. */
 	off_t cursor;
+
+	/*
+	 * Per-ctx decompress instrumentation. Accumulated in decompress_range
+	 * and logged once in decompress_free so we can see for each worker
+	 * (and the main-thread pr->decompress) how much time was spent in
+	 * read_cb (S3 Range GET) vs ZSTD_decompressDCtx (CPU), plus the
+	 * observed compression ratio. Intended output shape:
+	 *
+	 *   decompress[frametable]: calls=N frames=M comp=XMB→raw=YMB
+	 *       (ratio=Z) fetch=FMs decomp=DMs ...
+	 */
+	unsigned long stat_calls;
+	unsigned long stat_frames;
+	unsigned long long stat_bytes_comp;
+	unsigned long long stat_bytes_decomp;
+	unsigned long long stat_fetch_ns;
+	unsigned long long stat_decomp_ns;
 };
+
+#ifdef __linux__
+#include <time.h>
+static inline unsigned long long _mono_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (unsigned long long)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+#else
+static inline unsigned long long _mono_ns(void) { return 0; }
+#endif
 
 int decompress_probe(const void *tail_buf, size_t tail_len)
 {
@@ -521,12 +550,18 @@ int decompress_range(struct decompress_ctx *d, off_t off, size_t len,
 		if (ensure_scratch(&d->comp_scratch, &d->comp_scratch_cap,
 				   span_comp_size) < 0)
 			return -1;
-		if (d->read_cb(d->read_cookie, (off_t)span_comp_off,
-			       span_comp_size, d->comp_scratch) != 0) {
-			pr_err("decompress_range: batched read_cb failed (frames %u..%u, comp_off=%llu, size=%zu)\n",
-			       first, last, span_comp_off, span_comp_size);
-			return -1;
+		{
+			unsigned long long _t0 = _mono_ns();
+			int _rc = d->read_cb(d->read_cookie, (off_t)span_comp_off,
+					     span_comp_size, d->comp_scratch);
+			d->stat_fetch_ns += _mono_ns() - _t0;
+			if (_rc != 0) {
+				pr_err("decompress_range: batched read_cb failed (frames %u..%u, comp_off=%llu, size=%zu)\n",
+				       first, last, span_comp_off, span_comp_size);
+				return -1;
+			}
 		}
+		d->stat_bytes_comp += span_comp_size;
 
 		for (i = first; i <= last; i++) {
 			struct zstd_frame_entry *f = &d->frames[i];
@@ -534,22 +569,27 @@ int decompress_range(struct decompress_ctx *d, off_t off, size_t len,
 				(const char *)d->comp_scratch +
 				(f->comp_off - span_comp_off);
 			size_t dec;
+			unsigned long long _t0;
 
 			if (uoff >= f->decomp_off + f->decomp_size)
 				continue; /* caller's range starts after this frame */
 
 			if (uoff == f->decomp_off && (uend - uoff) >= f->decomp_size) {
 				/* Whole frame fits in the caller's buffer. */
+				_t0 = _mono_ns();
 				dec = ZSTD_decompressDCtx(d->dctx,
 							  dst + done,
 							  (size_t)f->decomp_size,
 							  cbytes,
 							  (size_t)f->comp_size);
+				d->stat_decomp_ns += _mono_ns() - _t0;
 				if (ZSTD_isError(dec)) {
 					pr_err("ZSTD_decompressDCtx frame %u: %s\n",
 					       i, ZSTD_getErrorName(dec));
 					return -1;
 				}
+				d->stat_frames++;
+				d->stat_bytes_decomp += dec;
 				done += dec;
 				uoff += dec;
 			} else {
@@ -562,16 +602,20 @@ int decompress_range(struct decompress_ctx *d, off_t off, size_t len,
 				if (ensure_scratch(&d->decomp_scratch, &d->decomp_scratch_cap,
 						   (size_t)f->decomp_size) < 0)
 					return -1;
+				_t0 = _mono_ns();
 				dec = ZSTD_decompressDCtx(d->dctx,
 							  d->decomp_scratch,
 							  (size_t)f->decomp_size,
 							  cbytes,
 							  (size_t)f->comp_size);
+				d->stat_decomp_ns += _mono_ns() - _t0;
 				if (ZSTD_isError(dec)) {
 					pr_err("ZSTD_decompressDCtx frame %u: %s\n",
 					       i, ZSTD_getErrorName(dec));
 					return -1;
 				}
+				d->stat_frames++;
+				d->stat_bytes_decomp += dec;
 				memcpy(dst + done,
 				       (char *)d->decomp_scratch + frame_off_in, take);
 				done += take;
@@ -580,6 +624,7 @@ int decompress_range(struct decompress_ctx *d, off_t off, size_t len,
 			if (uoff >= uend)
 				break;
 		}
+		d->stat_calls++;
 		return 0;
 	}
 }
@@ -655,6 +700,34 @@ void decompress_free(struct decompress_ctx *d)
 {
 	if (!d)
 		return;
+	/*
+	 * Per-ctx usage summary. Emitted only when the ctx actually did work
+	 * (stat_calls > 0), so short-lived init contexts don't spam the log.
+	 * Shape is stable and keyed by "decompress_stats:" for `parse_ablation.py`.
+	 * bytes_comp is bytes pulled by read_cb (what the network actually
+	 * moved). bytes_decomp is uncompressed bytes produced. ratio is
+	 * comp/decomp so smaller = better compression.
+	 */
+	if (d->stat_calls > 0) {
+		double fetch_ms = d->stat_fetch_ns / 1e6;
+		double decomp_ms = d->stat_decomp_ns / 1e6;
+		double ratio = d->stat_bytes_decomp
+			? (double)d->stat_bytes_comp / (double)d->stat_bytes_decomp
+			: 0.0;
+		double comp_mbps = fetch_ms > 0
+			? (d->stat_bytes_comp / 1048576.0) / (fetch_ms / 1000.0)
+			: 0.0;
+		double decomp_mbps = decomp_ms > 0
+			? (d->stat_bytes_decomp / 1048576.0) / (decomp_ms / 1000.0)
+			: 0.0;
+		pr_info("decompress_stats: mode=%s calls=%lu frames=%lu "
+			"bytes_comp=%llu bytes_decomp=%llu ratio=%.3f "
+			"fetch_ms=%.1f decomp_ms=%.1f fetch_mbps=%.0f decomp_mbps=%.0f\n",
+			d->zs ? "buffer" : "lazy",
+			d->stat_calls, d->stat_frames,
+			d->stat_bytes_comp, d->stat_bytes_decomp, ratio,
+			fetch_ms, decomp_ms, comp_mbps, decomp_mbps);
+	}
 	if (d->zs)
 		ZSTD_seekable_free(d->zs);
 	if (d->dctx)

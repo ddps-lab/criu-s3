@@ -346,7 +346,30 @@ struct compress_pipeline {
 	/* Error propagation */
 	pthread_mutex_t err_lock;
 	int err;
+
+	/*
+	 * Accumulated compress-side stats. Protected by stat_lock (workers run
+	 * in parallel). Logged once in compress_pipeline_destroy so we can
+	 * see for a whole dump how many frames were produced, the aggregate
+	 * uncompressed-byte throughput of the compress stage, and the
+	 * ratio achieved. Same key "compress_stats:" that
+	 * `parse_ablation.py` picks up alongside decompress_stats.
+	 */
+	pthread_mutex_t stat_lock;
+	unsigned long stat_frames;
+	unsigned long long stat_bytes_in;   /* uncompressed */
+	unsigned long long stat_bytes_out;  /* compressed */
+	unsigned long long stat_compress_ns;
 };
+
+/* Monotonic ns helper (same as compression.c's). */
+#include <time.h>
+static inline unsigned long long _mono_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (unsigned long long)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
 
 /* Record the first error; subsequent callers overwrite silently. */
 static void pipe_set_error(struct compress_pipeline *p, int err)
@@ -384,12 +407,14 @@ static void *compress_worker(void *arg)
 	while ((f = q_pop(&p->compress_in)) != NULL) {
 		size_t bound = ZSTD_compressBound(f->raw_len);
 		size_t rc;
+		unsigned long long t0;
 
 		f->comp = xmalloc(bound);
 		if (!f->comp) {
 			pipe_set_error(p, -1);
 			break;
 		}
+		t0 = _mono_ns();
 		rc = ZSTD_compress2(ctx, f->comp, bound, f->raw, f->raw_len);
 		if (ZSTD_isError(rc)) {
 			pr_err("ZSTD_compress2: %s\n", ZSTD_getErrorName(rc));
@@ -397,6 +422,14 @@ static void *compress_worker(void *arg)
 			break;
 		}
 		f->comp_len = rc;
+
+		pthread_mutex_lock(&p->stat_lock);
+		p->stat_frames++;
+		p->stat_bytes_in += f->raw_len;
+		p->stat_bytes_out += rc;
+		p->stat_compress_ns += _mono_ns() - t0;
+		pthread_mutex_unlock(&p->stat_lock);
+
 		/* raw bytes aren't needed anymore — writer only wants comp */
 		xfree(f->raw);
 		f->raw = NULL;
@@ -663,6 +696,7 @@ struct compress_pipeline *compress_pipeline_create(const char *object_key,
 	upq_init(&p->upload_in, p->n_upload * 2);
 	pthread_mutex_init(&p->etags_lock, NULL);
 	pthread_mutex_init(&p->err_lock, NULL);
+	pthread_mutex_init(&p->stat_lock, NULL);
 
 	/* checksumFlag=0: see compression.c rationale for monolithic. */
 	p->frame_log = ZSTD_seekable_createFrameLog(0);
@@ -815,11 +849,35 @@ void compress_pipeline_destroy(struct compress_pipeline *p)
 		xfree(p->upload_threads);
 	}
 
+	/*
+	 * Per-pipeline compress stats. n_compress workers ran in parallel;
+	 * compress_ms is the wall sum across them (actual elapsed time is
+	 * compress_ms / n_compress in an ideal case). bytes_out/in ratio is
+	 * what landed on S3. Log shape kept in sync with decompress_stats:
+	 * so parse_ablation.py can pick both up with the same grep.
+	 */
+	if (p->stat_frames > 0) {
+		double compress_ms = p->stat_compress_ns / 1e6;
+		double ratio = p->stat_bytes_in
+			? (double)p->stat_bytes_out / (double)p->stat_bytes_in
+			: 0.0;
+		double mbps = compress_ms > 0
+			? (p->stat_bytes_in / 1048576.0) / (compress_ms / 1000.0)
+			: 0.0;
+		pr_info("compress_stats: key=%s n_workers=%d frames=%lu "
+			"bytes_in=%llu bytes_out=%llu ratio=%.3f "
+			"compress_ms_sum=%.1f compress_mbps_per_worker=%.0f\n",
+			p->object_key, p->n_compress, p->stat_frames,
+			p->stat_bytes_in, p->stat_bytes_out, ratio,
+			compress_ms, mbps);
+	}
+
 	q_destroy(&p->compress_in);
 	waitlist_destroy(&p->writer_in);
 	upq_destroy(&p->upload_in);
 	pthread_mutex_destroy(&p->etags_lock);
 	pthread_mutex_destroy(&p->err_lock);
+	pthread_mutex_destroy(&p->stat_lock);
 
 	if (p->frame_log)
 		ZSTD_seekable_freeFrameLog(p->frame_log);
