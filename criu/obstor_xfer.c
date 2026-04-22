@@ -901,55 +901,18 @@ out:
 }
 
 /*
- * NIC speed -based default for prefetch_workers when --prefetch-workers is
- * not given (or set to 0). Walks /sys/class/net to find the highest-speed
- * non-loopback interface; assumes ~100 MB/s = 800 Mbps per worker stream;
- * caps at 32. Falls back to 8 if detection fails (virtual NIC reports -1,
- * etc).
+ * Fixed default for prefetch_workers when --prefetch-workers is not
+ * given (or passed as 0). Previously we tried to infer this from
+ * /sys/class/net/<iface>/speed, but on cloud providers (AWS ENA, GCP
+ * gVNIC, Azure hv_netvsc) that file is empty, so detection always fell
+ * through to this same conservative constant anyway. Worker-count
+ * policy now lives in the deployment layer (Kubernetes operator picks
+ * N per node instance type; experiment scripts pass --prefetch-workers
+ * explicitly). CRIU just ships a reasonable built-in default that
+ * behaves on commodity hardware and a 10 Gbps-class cloud NIC.
+ * See issues/phase6-worker-count-notes.md.
  */
-#define OBSTOR_DEFAULT_WORKERS_FALLBACK 8
-#define OBSTOR_DEFAULT_WORKERS_CAP 32
-
-static int detect_default_workers(void)
-{
-	DIR *d;
-	struct dirent *e;
-	int best = 0;
-
-	d = opendir("/sys/class/net");
-	if (!d)
-		return OBSTOR_DEFAULT_WORKERS_FALLBACK;
-
-	while ((e = readdir(d))) {
-		char path[PATH_MAX];
-		FILE *f;
-		int speed_mbps;
-
-		if (e->d_name[0] == '.')
-			continue;
-		if (!strcmp(e->d_name, "lo"))
-			continue;
-
-		snprintf(path, sizeof(path), "/sys/class/net/%s/speed", e->d_name);
-		f = fopen(path, "r");
-		if (!f)
-			continue;
-		if (fscanf(f, "%d", &speed_mbps) == 1 && speed_mbps > 0) {
-			/* per-worker ~800 Mbps */
-			int w = speed_mbps / 800;
-			if (w > best)
-				best = w;
-		}
-		fclose(f);
-	}
-	closedir(d);
-
-	if (best <= 0)
-		return OBSTOR_DEFAULT_WORKERS_FALLBACK;
-	if (best > OBSTOR_DEFAULT_WORKERS_CAP)
-		return OBSTOR_DEFAULT_WORKERS_CAP;
-	return best;
-}
+#define OBSTOR_DEFAULT_WORKERS 8
 
 /*
  * Per-IOV install for one batch element. Looks up the meta by exact
@@ -1207,8 +1170,8 @@ int prefetch_init(int num_worker_threads)
 	int i;
 
 	if (num_worker_threads <= 0) {
-		num_worker_threads = detect_default_workers();
-		pr_info("obstor_xfer: auto-detected %d worker threads (NIC speed)\n",
+		num_worker_threads = OBSTOR_DEFAULT_WORKERS;
+		pr_info("obstor_xfer: no --prefetch-workers given; using default %d\n",
 			num_worker_threads);
 	}
 
