@@ -42,6 +42,7 @@
 #include "compress_pipeline.h"
 #include "log.h"
 #include "object-storage.h"
+#include "upload_pool.h"
 #include "xmalloc.h"
 
 #define PART_SIZE	(8UL * 1024 * 1024)
@@ -327,10 +328,19 @@ struct compress_pipeline {
 	struct q compress_in;
 	struct waitlist writer_in;
 
-	/* Writer stage — runs on the main thread during finalize(), not a
-	 * dedicated thread. See writer_drain() for the rationale. */
+	/* Writer stage — runs in its own thread spawned at create() time.
+	 *
+	 * The writer thread owns the upload_pool: it creates it on entry,
+	 * drives CURLM, submits SG parts as compress workers produce frames,
+	 * and runs upload_pool_wait() / get_etags() on exit. This lets
+	 * compress and S3 upload overlap (raw path already overlapped via
+	 * inline _flush_object_storage_part; compressed path used to
+	 * stall all uploads until finalize). All libcurl/CURLM calls stay
+	 * on this single thread so no cross-thread libcurl interaction. */
 	unsigned int n_frames_submitted;
 	ZSTD_frameLog *frame_log;
+	pthread_t writer_thread;
+	int writer_thread_started;
 
 	/* Upload stage */
 	int n_upload;
@@ -483,118 +493,121 @@ static void *upload_worker(void *arg)
 	return NULL;
 }
 
-/* ----- Writer thread ----- */
-
 /*
- * Grow a heap buffer to hold at least `need` bytes. Returns 0 on success
- * or -1 on allocation failure.
+ * Submit a SG list of compressed-frame chunks as one S3 multipart part.
+ * Pool takes ownership of the chunks array AND each chunks[i].data on
+ * success or failure (upload_pool_submit_sg contract). The chunk-list
+ * pointer/counters are zeroed out so the caller can keep filling a
+ * fresh batch.
  */
-static int ensure_cap(void **buf, size_t *cap, size_t need)
+static int writer_sg_submit(struct upload_pool *pool, int part_num,
+			    struct upload_sg_chunk **chunks_inout,
+			    int *n_inout, int *cap_inout,
+			    size_t *sum_inout)
 {
-	size_t new_cap = *cap ? *cap : PART_SIZE;
-	void *nb;
-
-	if (need <= *cap)
-		return 0;
-	while (new_cap < need)
-		new_cap *= 2;
-	nb = xrealloc(*buf, new_cap);
-	if (!nb)
-		return -1;
-	*buf = nb;
-	*cap = new_cap;
-	return 0;
+	int rc = upload_pool_submit_sg(pool, part_num,
+				       *chunks_inout, *n_inout, *sum_inout);
+	*chunks_inout = NULL;
+	*n_inout = 0;
+	*cap_inout = 0;
+	*sum_inout = 0;
+	return rc;
 }
 
 /*
- * Unused now that writer flushes synchronously; kept to minimize diff.
- * Will be removed when the upload_q scaffolding is garbage-collected.
+ * Append one chunk (compressed frame body) to the in-progress chunk list.
+ * Grows the array geometrically. Caller transfers ownership of `data`
+ * to the chunks list — pool will xfree it once the part lands.
  */
-static __attribute__((unused))
-int writer_flush_part(struct compress_pipeline *p, void **part_buf,
-		      size_t *part_used, size_t *part_cap,
-		      int *part_num)
+static int writer_sg_append(struct upload_sg_chunk **chunks,
+			    int *n, int *cap, size_t *sum,
+			    void *data, size_t len)
 {
-	(void)p; (void)part_buf; (void)part_used; (void)part_cap; (void)part_num;
-	return 0;
-}
-
-/*
- * Synchronous upload from the writer thread. Calling multipart upload
- * from multiple worker threads concurrently destabilizes libcurl's
- * per-process state in CRIU (we saw parasite RPCs break with
- * "Trimmed message received"); keeping all S3 requests on a single
- * thread fixes it. Compress parallelism is still preserved via the
- * N compress workers, which don't touch libcurl at all.
- */
-static int writer_upload_part(struct compress_pipeline *p, int *part_num,
-			      void *data, size_t len)
-{
-	char etag[ETAG_LEN];
-	int rc;
-
-	rc = object_storage_multipart_upload_part(p->object_key,
-						  p->upload_id,
-						  ++(*part_num),
-						  data, len,
-						  etag, sizeof(etag));
-	if (rc < 0) {
-		pr_err("multipart upload part %d failed\n", *part_num);
-		return -1;
+	if (*n >= *cap) {
+		int new_cap = *cap ? *cap * 2 : 32;
+		struct upload_sg_chunk *nc = xrealloc(*chunks,
+			new_cap * sizeof(**chunks));
+		if (!nc)
+			return -1;
+		*chunks = nc;
+		*cap = new_cap;
 	}
-	pthread_mutex_lock(&p->etags_lock);
-	etags_reserve(p, *part_num);
-	if (p->etags) {
-		xfree(p->etags[*part_num - 1]);
-		p->etags[*part_num - 1] = xstrdup(etag);
-		if (*part_num > p->n_parts)
-			p->n_parts = *part_num;
-	}
-	pthread_mutex_unlock(&p->etags_lock);
+	(*chunks)[*n].data = data;
+	(*chunks)[*n].len = len;
+	(*n)++;
+	*sum += len;
 	return 0;
 }
 
 /*
- * Drain the waitlist of compressed frames, buffering into 8 MB parts and
- * uploading them synchronously.
+ * Drain the waitlist of compressed frames, assemble PART_SIZE-aligned
+ * scatter-gather batches, and feed them to the CURLM upload_pool. The
+ * frame buffers are forwarded zero-copy: each frame's compressed bytes
+ * become a chunk in the SG list that libcurl reads through directly
+ * (_upload_sg_read_callback in object-storage.c), so writer never needs
+ * to memcpy frames into a monolithic part_buf.
  *
- * This runs on the main thread during compress_pipeline_finalize(), not in
- * a dedicated writer thread. We used to have a writer thread but its
- * pthread_key destructor calling curl_easy_cleanup during thread exit
- * deterministically broke the parasite's tsock on workloads with
- * compress-workers > ~3 (parasite saw "Trimmed message received (12/0)").
- * Keeping libcurl usage on the main thread — the only thread that ever
- * interacts with the parasite RPC socket — avoids the whole class of
- * libcurl/OpenSSL cross-thread cleanup interactions.
+ * Runs in its own thread spawned by compress_pipeline_create(). The
+ * thread owns the upload_pool: it creates it on entry, drives CURLM
+ * via upload_pool_submit_sg as compress workers produce frames, and
+ * runs upload_pool_wait/get_etags on exit. Compress workers push to
+ * writer_in waitlist concurrently; this thread pops in seq order and
+ * submits each PART_SIZE chunk batch as soon as it's full.
  *
- * Compression parallelism is still preserved via the N compress workers;
- * only the final part-accumulation and upload serialize here.
+ * Why a separate thread: previously this ran on the main thread inside
+ * compress_pipeline_finalize() — i.e. only after all compress workers
+ * had joined. That serialized compress and upload, so wall =
+ * T_compress + T_upload_drain even though raw path overlaps both
+ * (raw _flush_object_storage_part submits to upload_pool inline as
+ * 8 MB part_buf fills up). Moving writer to a thread lets compressed
+ * dumps achieve the same compress/upload overlap as raw.
+ *
+ * Why this is NOT the previous failed parallel writer: that one
+ * memcpy'd frames into a contiguous part_buf in the writer thread
+ * before submitting, which added ~700 ms of memcpy on 7 GB compressed
+ * (mc-16gb) and caused a +3.4 % regression. This one keeps the SG
+ * path (zero-copy) and only changes WHEN the upload_pool is driven.
+ *
+ * libcurl/CURLM is touched ONLY here. Main thread never calls libcurl
+ * for compressed-mode uploads, so the historical "pthread_key
+ * destructor → curl_easy_cleanup → parasite tsock break" failure mode
+ * does not apply (single owning thread, libcurl state not shared).
  */
 static void writer_drain(struct compress_pipeline *p)
 {
-	void *part_buf;
-	size_t part_cap = PART_SIZE;
-	size_t part_used = 0;
+	struct upload_pool *pool = NULL;
+	struct upload_sg_chunk *chunks = NULL;
+	int n_chunks = 0;
+	int cap_chunks = 0;
+	size_t chunk_sum = 0;
 	int part_num = 0;
 	struct frame_rec *f;
+	int m_workers;
+	const char **pool_etags = NULL;
+	int n_pool_etags = 0;
+	int failed_part = 0;
+	int i;
+	void *seek_buf = NULL;
+	size_t seek_cap = 0, seek_used = 0;
 
-	part_buf = xmalloc(part_cap);
-	if (!part_buf) {
+	m_workers = p->n_upload > 0 ? p->n_upload : 4;
+	pool = upload_pool_create(p->object_key, p->upload_id, m_workers);
+	if (!pool) {
+		pr_err("writer_drain: upload_pool_create failed\n");
 		pipe_set_error(p, -1);
-		return;
+		goto cleanup;
 	}
 
 	while ((f = waitlist_pop_in_order(&p->writer_in)) != NULL) {
-		/* Append compressed frame to current part. */
-		if (ensure_cap(&part_buf, &part_cap,
-			       part_used + f->comp_len) < 0) {
+		if (writer_sg_append(&chunks, &n_chunks, &cap_chunks,
+				     &chunk_sum, f->comp, f->comp_len) < 0) {
 			pipe_set_error(p, -1);
+			xfree(f->comp);
+			xfree(f);
 			break;
 		}
-		memcpy((char *)part_buf + part_used, f->comp, f->comp_len);
-		part_used += f->comp_len;
+		/* Pool now owns f->comp; don't free it via f. */
 
-		/* Log frame into the seekable frame log. */
 		{
 			size_t rc = ZSTD_seekable_logFrame(p->frame_log,
 							   (unsigned)f->comp_len,
@@ -604,46 +617,48 @@ static void writer_drain(struct compress_pipeline *p)
 				pr_err("ZSTD_seekable_logFrame: %s\n",
 				       ZSTD_getErrorName(rc));
 				pipe_set_error(p, -1);
-				xfree(f->comp);
 				xfree(f);
 				break;
 			}
 		}
+		xfree(f);  /* frame record; data still in chunks[] */
 
-		xfree(f->comp);
-		xfree(f);
-
-		/* Flush if part is full (synchronous upload). */
-		while (part_used >= PART_SIZE) {
-			if (writer_upload_part(p, &part_num,
-					       part_buf, PART_SIZE) < 0) {
+		if (chunk_sum >= PART_SIZE) {
+			if (writer_sg_submit(pool, ++part_num,
+					     &chunks, &n_chunks,
+					     &cap_chunks, &chunk_sum) < 0) {
+				pr_err("writer_drain: chunk-part submit failed\n");
 				pipe_set_error(p, -1);
-				goto out;
+				goto cleanup;
 			}
-			/* Shift leftover bytes to the head of part_buf. */
-			memmove(part_buf, (char *)part_buf + PART_SIZE,
-				part_used - PART_SIZE);
-			part_used -= PART_SIZE;
 		}
 	}
 
-	/*
-	 * End of input. Append the seek table to the last part buffer. The
-	 * seekable format's writeSeekTable is a streaming API — call it
-	 * repeatedly until it returns 0.
-	 */
+	/* Serialize seek table into a heap buffer; appended as the last
+	 * chunk of the final part so the file ends with the seekable
+	 * footer S3 readers expect. */
 	{
 		size_t remaining = 1;
 		ZSTD_outBuffer out;
 
+		seek_cap = 64 * 1024;
+		seek_buf = xmalloc(seek_cap);
+		if (!seek_buf) {
+			pipe_set_error(p, -1);
+			goto cleanup;
+		}
 		while (remaining > 0) {
-			if (ensure_cap(&part_buf, &part_cap,
-				       part_used + 4096) < 0) {
-				pipe_set_error(p, -1);
-				goto out;
+			if (seek_used + 4096 > seek_cap) {
+				void *nb = xrealloc(seek_buf, seek_cap * 2);
+				if (!nb) {
+					pipe_set_error(p, -1);
+					goto cleanup;
+				}
+				seek_buf = nb;
+				seek_cap *= 2;
 			}
-			out.dst = (char *)part_buf + part_used;
-			out.size = part_cap - part_used;
+			out.dst = (char *)seek_buf + seek_used;
+			out.size = seek_cap - seek_used;
 			out.pos = 0;
 			remaining = ZSTD_seekable_writeSeekTable(p->frame_log,
 								 &out);
@@ -651,21 +666,78 @@ static void writer_drain(struct compress_pipeline *p)
 				pr_err("ZSTD_seekable_writeSeekTable: %s\n",
 				       ZSTD_getErrorName(remaining));
 				pipe_set_error(p, -1);
-				goto out;
+				goto cleanup;
 			}
-			part_used += out.pos;
+			seek_used += out.pos;
 		}
 	}
 
-	/* Flush final (possibly small) part synchronously. */
-	if (part_used > 0) {
-		if (writer_upload_part(p, &part_num, part_buf, part_used) < 0)
+	if (seek_used > 0) {
+		if (writer_sg_append(&chunks, &n_chunks, &cap_chunks,
+				     &chunk_sum, seek_buf, seek_used) < 0) {
 			pipe_set_error(p, -1);
+			xfree(seek_buf);
+			goto cleanup;
+		}
+		seek_buf = NULL;  /* now owned by chunks[] */
 	}
 
-out:
-	xfree(part_buf);
+	if (n_chunks > 0 || part_num == 0) {
+		if (writer_sg_submit(pool, ++part_num,
+				     &chunks, &n_chunks,
+				     &cap_chunks, &chunk_sum) < 0) {
+			pr_err("writer_drain: final part submit failed\n");
+			pipe_set_error(p, -1);
+			goto cleanup;
+		}
+	}
+
+	if (upload_pool_wait(pool, &failed_part) < 0) {
+		pr_err("writer_drain: upload_pool_wait failed (part %d)\n",
+		       failed_part);
+		pipe_set_error(p, -1);
+		goto cleanup;
+	}
+
+	if (upload_pool_get_etags(pool, &pool_etags, &n_pool_etags) < 0) {
+		pr_err("writer_drain: upload_pool_get_etags failed\n");
+		pipe_set_error(p, -1);
+		goto cleanup;
+	}
+
+	pthread_mutex_lock(&p->etags_lock);
+	etags_reserve(p, n_pool_etags);
+	if (p->etags) {
+		for (i = 0; i < n_pool_etags; i++) {
+			if (pool_etags[i]) {
+				xfree(p->etags[i]);
+				p->etags[i] = xstrdup(pool_etags[i]);
+			}
+		}
+		p->n_parts = n_pool_etags;
+	}
+	pthread_mutex_unlock(&p->etags_lock);
+
+cleanup:
+	if (chunks) {
+		for (i = 0; i < n_chunks; i++) {
+			if (chunks[i].data)
+				xfree(chunks[i].data);
+		}
+		xfree(chunks);
+	}
+	if (seek_buf)
+		xfree(seek_buf);
+	if (pool)
+		upload_pool_destroy(pool);
 	upq_close(&p->upload_in);
+}
+
+static void *writer_thread_fn(void *arg)
+{
+	struct compress_pipeline *p = arg;
+	writer_drain(p);
+	return NULL;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -731,17 +803,21 @@ struct compress_pipeline *compress_pipeline_create(const char *object_key,
 			}
 		}
 		/*
-		 * The writer role is handled by the main thread during
-		 * compress_pipeline_finalize(). No separate writer or upload
-		 * worker thread is launched: a background thread doing
-		 * curl_easy_cleanup on its pthread_key destructor
-		 * deterministically broke the parasite RPC socket for any
-		 * --compress-workers above ~3 (see writer_drain comment).
-		 * All libcurl activity is pinned to the main thread.
+		 * Writer thread: owns the upload_pool, drives all CURLM
+		 * activity. Spawned now (not at finalize) so compress and
+		 * upload can overlap during the dump phase. See writer_drain
+		 * comment for the rationale and the failed-pwriter contrast.
 		 */
+		if (pthread_create(&p->writer_thread, NULL,
+				   writer_thread_fn, p) != 0) {
+			pr_err("pthread_create writer_thread\n");
+			pthread_sigmask(SIG_SETMASK, &old, NULL);
+			goto err;
+		}
+		p->writer_thread_started = 1;
+
 		(void)upload_worker;
 		(void)etags_reserve;
-		p->n_upload = 0;
 
 		pthread_sigmask(SIG_SETMASK, &old, NULL);
 	}
@@ -752,23 +828,30 @@ err:
 	return NULL;
 }
 
+/*
+ * Ownership note: `data` must be a heap-allocated buffer (xmalloc/xzalloc)
+ * that the caller is handing off to the pipeline. On success, the
+ * compress worker xfree()s it after reading. On failure, this function
+ * xfree()s it before returning -1. The caller must NOT free the buffer
+ * itself either way. This avoids the previous per-frame memcpy that
+ * was capping input throughput around 1.3 GB/s.
+ */
 int compress_pipeline_submit(struct compress_pipeline *p,
-			     const void *data, size_t len)
+			     void *data, size_t len)
 {
 	struct frame_rec *f;
 
-	if (compress_pipeline_error(p))
-		return -1;
-
-	f = xzalloc(sizeof(*f));
-	if (!f)
-		return -1;
-	f->raw = xmalloc(len);
-	if (!f->raw) {
-		xfree(f);
+	if (compress_pipeline_error(p)) {
+		xfree(data);
 		return -1;
 	}
-	memcpy(f->raw, data, len);
+
+	f = xzalloc(sizeof(*f));
+	if (!f) {
+		xfree(data);
+		return -1;
+	}
+	f->raw = data;
 	f->raw_len = len;
 	f->seq = p->n_frames_submitted++;
 
@@ -789,11 +872,10 @@ int compress_pipeline_finalize(struct compress_pipeline *p,
 	q_close(&p->compress_in);
 
 	/*
-	 * Wait for compress workers to finish, then close writer input.
-	 * Zero each handle as we join so compress_pipeline_destroy() below
-	 * doesn't double-join the same tid — pthread_join on an
-	 * already-joined thread is undefined behavior and crashed for us
-	 * at --compress-workers >= 5 on a 4-CPU box.
+	 * Wait for compress workers to finish, then close writer input so
+	 * the writer thread sees end-of-stream and serializes the seek
+	 * table + final part. Zero each handle as we join so destroy()
+	 * doesn't double-join (UB).
 	 */
 	for (i = 0; i < p->n_compress; i++) {
 		pthread_join(p->compress_threads[i], NULL);
@@ -802,15 +884,13 @@ int compress_pipeline_finalize(struct compress_pipeline *p,
 	waitlist_close(&p->writer_in);
 
 	/*
-	 * Drain the waitlist + upload all parts + seek table from the main
-	 * thread. Done inline (not a separate thread) to keep every libcurl
-	 * call on the thread that also drives parasite RPC; see writer_drain().
+	 * Writer thread does the rest: drains remaining waitlist, builds
+	 * seek table into the final part, upload_pool_wait, get_etags.
 	 */
-	writer_drain(p);
-
-	/* Wait for upload workers (dormant — kept for shutdown symmetry). */
-	for (i = 0; i < p->n_upload; i++)
-		pthread_join(p->upload_threads[i], NULL);
+	if (p->writer_thread_started) {
+		pthread_join(p->writer_thread, NULL);
+		p->writer_thread_started = 0;
+	}
 
 	if (compress_pipeline_error(p))
 		return -1;
@@ -841,6 +921,10 @@ void compress_pipeline_destroy(struct compress_pipeline *p)
 		xfree(p->compress_threads);
 	}
 	waitlist_close(&p->writer_in);
+	if (p->writer_thread_started) {
+		pthread_join(p->writer_thread, NULL);
+		p->writer_thread_started = 0;
+	}
 	upq_close(&p->upload_in);
 	if (p->upload_threads) {
 		for (i = 0; i < p->n_upload; i++)
