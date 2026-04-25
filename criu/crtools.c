@@ -609,7 +609,7 @@ usage:
 	       "  --compress-level N            zstd compression level (default 1, range 1-22)\n"
 	       "  --compress-workers N          number of parallel compress worker threads\n"
 	       "                                (0 = auto: min(nproc/4, 8))\n"
-	       "  --compress-upload-workers N   number of parallel S3 upload worker threads (default 4)\n"
+	       "  --compress-upload-workers N   DEPRECATED — alias for --upload-workers\n"
 	       "\n"
 	       "Hot VMA options (for dump/pre-dump):\n"
 	       "  --exclude-range START:END     exclude address range from pre-dump (hex)\n"

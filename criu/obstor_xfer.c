@@ -20,6 +20,7 @@
 #include <dirent.h>
 
 #include "obstor_xfer.h"
+#include "auto_nic.h"
 #include "log.h"
 #include "xmalloc.h"
 #include "object-storage.h"
@@ -1170,9 +1171,22 @@ int prefetch_init(int num_worker_threads)
 	int i;
 
 	if (num_worker_threads <= 0) {
-		num_worker_threads = OBSTOR_DEFAULT_WORKERS;
-		pr_info("obstor_xfer: no --prefetch-workers given; using default %d\n",
-			num_worker_threads);
+		int nic_mbps = auto_nic_mbps();
+		int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+		/*
+		 * Restore: each pthread worker runs its own libcurl easy
+		 * handle (blocking curl_easy_perform on Range GETs).
+		 * Empirical per-worker throughput on libcurl Range GET is
+		 * ~480 Mbps — higher than S3 PUT per slot because GETs skip
+		 * SigV4 body hashing and libcurl read-callback overhead.
+		 */
+		num_worker_threads = auto_pool_workers(nic_mbps, ncpu,
+						       64, 480);
+		if (nic_mbps <= 0)
+			num_worker_threads = OBSTOR_DEFAULT_WORKERS;
+		pr_info("obstor_xfer: auto prefetch-workers=%d "
+			"(NIC %d Mbps, ncpu %d)\n",
+			num_worker_threads, nic_mbps, ncpu);
 	}
 
 	pr_info("Initializing prefetch system with %d workers (batch_bytes=%lu)\n",

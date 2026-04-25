@@ -112,10 +112,21 @@ obj-y			+= obstor_xfer.o
 obj-y			+= obstor_prefetch.o
 obj-y			+= compression.o
 obj-y			+= compress_pipeline.o
+obj-y			+= auto_nic.o
 
 # zstd seekable format (vendored from facebook/zstd v1.5.5)
 obj-y			+= contrib/zstd_seekable/zstdseek_compress.o
 obj-y			+= contrib/zstd_seekable/zstdseek_decompress.o
+
+# Codegen cloud-instance NIC table (AWS today, Azure/GCP placeholders).
+# The generated header is included by auto_nic.c at compile time. If
+# contrib/nic-table.csv changes, the header rebuilds.
+$(obj)/include/nic_table_gen.h: $(obj)/contrib/nic-table.csv scripts/gen_nic_table.py
+	@echo '  GEN     $@'
+	$(Q) python3 scripts/gen_nic_table.py $< > $@
+
+$(obj)/auto_nic.d: $(obj)/include/nic_table_gen.h
+$(obj)/auto_nic.o: $(obj)/include/nic_table_gen.h
 
 PROTOBUF_GEN := scripts/protobuf-gen.sh
 

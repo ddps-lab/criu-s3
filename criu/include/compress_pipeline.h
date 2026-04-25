@@ -49,8 +49,13 @@ struct compress_pipeline *compress_pipeline_create(const char *object_key,
  * or -1 if a worker has reported an error (use compress_pipeline_error() to
  * check state mid-stream).
  */
+/*
+ * Ownership: `data` is a heap buffer the caller transfers to the
+ * pipeline. The pipeline xfree()s it (on success, after compression;
+ * on failure, before returning -1). Caller must NOT free it.
+ */
 int compress_pipeline_submit(struct compress_pipeline *p,
-			     const void *data, size_t len);
+			     void *data, size_t len);
 
 /*
  * Finalize: drain compress queue, append the zstd seekable seek table,
