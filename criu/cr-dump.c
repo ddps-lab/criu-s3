@@ -2027,6 +2027,17 @@ static int cr_dump_finish(int ret)
 {
 	int post_dump_ret = 0;
 
+	/*
+	 * Wait for any object-storage page uploads that were deferred past
+	 * their close_page_xfer (raw path only). This lets the last PUTs
+	 * of one page_xfer overlap with the next page_xfer's pipe-reads +
+	 * submits on the same thread. By here we block on response
+	 * collection + multipart_complete, which is a few hundred ms per
+	 * pending object at most.
+	 */
+	if (page_xfer_drain_deferred_uploads() < 0)
+		ret = -1;
+
 	if (disconnect_from_page_server())
 		ret = -1;
 

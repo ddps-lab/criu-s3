@@ -19,6 +19,10 @@
 #include "page-xfer.h"
 #include "page-pipe.h"
 #include "object-storage.h"
+#include "compression.h"
+#include "compress_pipeline.h"
+#include "upload_pool.h"
+#include "auto_nic.h"
 #include "util.h"
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
@@ -253,10 +257,63 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 }
 
 /* local xfer */
+/*
+ * Callback for compress_stream_add_frame: write compressed bytes to the
+ * local pages-*.img via the image's raw fd. cookie is the fd.
+ */
+static int pxfer_loc_compress_write_cb(void *cookie, const void *buf, size_t len)
+{
+	int fd = (int)(intptr_t)cookie;
+	const char *p = buf;
+	size_t off = 0;
+
+	while (off < len) {
+		ssize_t n = write(fd, p + off, len - off);
+		if (n <= 0) {
+			pr_perror("page-xfer: compressed write failed");
+			return -1;
+		}
+		off += (size_t)n;
+	}
+	return 0;
+}
+
 static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 {
 	ssize_t ret;
 	ssize_t curr = 0;
+
+	/*
+	 * Compressed local mode: read the full IOV into a staging buffer,
+	 * feed it as one seekable frame (one pagemap entry = one frame), and
+	 * write the compressed bytes out. Fall back to splice() when
+	 * --compress is not set or we somehow ended up without a compressor.
+	 */
+	if (opts.compress && xfer->compress) {
+		void *buf;
+		size_t got = 0;
+		int rc;
+
+		buf = xmalloc(len);
+		if (!buf)
+			return -1;
+
+		while (got < len) {
+			ssize_t n = read(p, (char *)buf + got, len - got);
+			if (n <= 0) {
+				pr_perror("page-xfer: pipe read failed (compress)");
+				xfree(buf);
+				return -1;
+			}
+			got += (size_t)n;
+		}
+
+		rc = compress_stream_add_frame(xfer->compress, buf, len,
+					       pxfer_loc_compress_write_cb,
+					       (void *)(intptr_t)img_raw_fd(xfer->pi));
+		xfree(buf);
+		return rc;
+	}
 
 	while (1) {
 		ret = splice(p, NULL, img_raw_fd(xfer->pi), NULL, len - curr, SPLICE_F_MOVE);
@@ -359,6 +416,19 @@ static void close_page_xfer(struct page_xfer *xfer)
 		xfree(xfer->parent);
 		xfer->parent = NULL;
 	}
+	/*
+	 * Flush the seek table (trailing skippable frame) into the pages
+	 * image before closing it. Any error here is logged but does not
+	 * stop teardown — we still need to close the fds.
+	 */
+	if (xfer->compress && xfer->pi) {
+		if (compress_stream_finalize(xfer->compress,
+					     pxfer_loc_compress_write_cb,
+					     (void *)(intptr_t)img_raw_fd(xfer->pi)) < 0)
+			pr_err("page-xfer: compress_stream_finalize failed\n");
+		compress_stream_free(xfer->compress);
+		xfer->compress = NULL;
+	}
 	if (xfer->pi)
 		close_image(xfer->pi);
 	if (xfer->pmi)
@@ -376,6 +446,28 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	xfer->pi = open_pages_image(O_DUMP, xfer->pmi, &pages_id);
 	if (!xfer->pi)
 		goto err_pmi;
+
+	/*
+	 * The page_xfer struct lives on the caller's stack (cr-dump.c,
+	 * shmem.c, mem.c) and is not zero-initialized. Clear fields that
+	 * close_page_xfer branches on so stale stack data doesn't get
+	 * dereferenced when --compress is not in effect.
+	 */
+	xfer->compress = NULL;
+
+	/*
+	 * Create the zstd seekable compressor for this pages-*.img when
+	 * --compress is on. Only applies to the local write path; the S3
+	 * mode uses a separate parallel pipeline (see open_page_object_storage_xfer).
+	 */
+	if (opts.compress && !opts.object_storage_upload) {
+		xfer->compress = compress_stream_create(opts.compress_level);
+		if (!xfer->compress) {
+			pr_err("page-xfer: failed to init compressor for img_id=%lu\n",
+			       img_id);
+			goto err_pi;
+		}
+	}
 
 	/*
 	 * Open page-read for parent images (if it exists). It will
@@ -474,11 +566,197 @@ err_pmi:
 
 #define OBJECT_STORAGE_PART_SIZE (8 * 1024 * 1024) /* 8MB per multipart part */
 
+/*
+ * Deferred close list — enables parallel cross-file upload.
+ *
+ * For multi-process workloads (memcached, redis) CRIU closes several
+ * page_xfer instances in sequence. Pre-refactor, close_page_xfer
+ * blocked on upload_pool_wait for each file before moving on, so
+ * pages-1.img and pages-2.img serialized. Instead, we keep the
+ * upload_pool alive after the final submit and push it onto this list;
+ * TCP continues shipping the last in-flight parts while the next
+ * process's pipe-read + submit loop runs. At end of dump
+ * page_xfer_drain_deferred_uploads() walks this list, pumps each pool
+ * to collect responses, and issues the multipart_complete.
+ */
+struct deferred_close_entry {
+	struct upload_pool *pool;
+	char pages_key[512];
+	char upload_id[256];
+	struct deferred_close_entry *next;
+};
+static struct deferred_close_entry *g_deferred_closes = NULL;
+
+static void _deferred_push(struct upload_pool *pool,
+			   const char *pages_key,
+			   const char *upload_id)
+{
+	struct deferred_close_entry *e;
+	int failed = 0;
+	const char **etags = NULL;
+	int n_parts = 0;
+
+	e = xmalloc(sizeof(*e));
+	if (!e) {
+		/* Can't record; drain what we have now to not leak. */
+		pr_warn("deferred_push: xmalloc failed, resorting to synchronous drain\n");
+		if (upload_pool_wait(pool, &failed) == 0 &&
+		    upload_pool_get_etags(pool, &etags, &n_parts) == 0 &&
+		    n_parts > 0) {
+			object_storage_multipart_complete(pages_key, upload_id,
+							  n_parts, etags);
+		} else {
+			object_storage_multipart_abort(pages_key, upload_id);
+		}
+		upload_pool_destroy(pool);
+		return;
+	}
+	e->pool = pool;
+	snprintf(e->pages_key, sizeof(e->pages_key), "%s", pages_key);
+	snprintf(e->upload_id, sizeof(e->upload_id), "%s", upload_id);
+	e->next = g_deferred_closes;
+	g_deferred_closes = e;
+}
+
+int page_xfer_drain_deferred_uploads(void)
+{
+	int overall = 0;
+	struct deferred_close_entry *e;
+
+	while ((e = g_deferred_closes) != NULL) {
+		const char **etags = NULL;
+		int n_parts = 0;
+		int failed = 0;
+		int rc;
+
+		g_deferred_closes = e->next;
+
+		rc = upload_pool_wait(e->pool, &failed);
+		if (rc < 0) {
+			pr_err("drain_deferred: pool for %s failed at part %d\n",
+			       e->pages_key, failed);
+			object_storage_multipart_abort(e->pages_key, e->upload_id);
+			upload_pool_destroy(e->pool);
+			xfree(e);
+			overall = -1;
+			continue;
+		}
+
+		rc = upload_pool_get_etags(e->pool, &etags, &n_parts);
+		if (rc < 0 || !etags || n_parts == 0) {
+			pr_err("drain_deferred: empty etags for %s\n", e->pages_key);
+			object_storage_multipart_abort(e->pages_key, e->upload_id);
+			upload_pool_destroy(e->pool);
+			xfree(e);
+			overall = -1;
+			continue;
+		}
+
+		rc = object_storage_multipart_complete(e->pages_key,
+						       e->upload_id,
+						       n_parts, etags);
+		if (rc < 0) {
+			pr_err("drain_deferred: multipart complete failed for %s\n",
+			       e->pages_key);
+			overall = -1;
+		}
+		upload_pool_destroy(e->pool);
+		xfree(e);
+	}
+	return overall;
+}
+
+/*
+ * Lazily bring up the CURLM upload pool on first flush. We defer this until
+ * the first actual PUT because earlier in the dump the parasite is still
+ * running in the target process and some libcurl code paths can interact
+ * badly with the parasite RPC fd plumbing. By the time we flush a part,
+ * page data is already streaming in and it's safe to spin up the pool.
+ */
+static int _resolve_upload_workers(void)
+{
+	int nw;
+
+	/* Explicit --upload-workers N wins. 0 means "auto-detect". */
+	if (opts.upload_workers > 0)
+		return opts.upload_workers;
+
+	{
+		int nic = auto_nic_mbps();
+		int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+		/* S3 PUT: ~280 Mbps per libcurl slot in our measurements */
+		nw = auto_pool_workers(nic, ncpu, 64, 280);
+		opts.upload_workers = nw; /* cache so subsequent calls skip detect */
+		pr_info("upload_workers auto: %d (NIC %d Mbps, ncpu %d)\n",
+			nw, nic, ncpu);
+	}
+	return nw;
+}
+
+static int _ensure_upload_pool(struct page_xfer *xfer)
+{
+	struct upload_pool *pool;
+	int workers;
+
+	if (xfer->object_storage.upload_pool)
+		return 0;
+	workers = _resolve_upload_workers();
+	if (workers <= 1)
+		return 0;
+
+	pool = upload_pool_create(xfer->object_storage.pages_key,
+				  xfer->object_storage.upload_id,
+				  workers);
+	if (!pool) {
+		pr_warn("object_storage: upload_pool_create failed, "
+			"falling back to serial PUT\n");
+		return 0;
+	}
+	xfer->object_storage.upload_pool = pool;
+	pr_info("object_storage: parallel upload pool started (%d workers)\n",
+		workers);
+	return 0;
+}
+
 static int _flush_object_storage_part(struct page_xfer *xfer)
 {
 	char etag[256];
 	int ret;
+	int part_num;
 
+	part_num = ++xfer->object_storage.part_number;
+
+	if (_ensure_upload_pool(xfer) < 0)
+		return -1;
+
+	/*
+	 * Parallel path: hand the full 8MB buffer to the pool and allocate
+	 * a fresh one so the dump thread can keep filling it. The pool
+	 * takes ownership of the buffer and frees it when the PUT lands.
+	 */
+	if (xfer->object_storage.upload_pool) {
+		void *new_buf;
+
+		new_buf = xmalloc(xfer->object_storage.part_buf_cap);
+		if (!new_buf)
+			return -1;
+
+		ret = upload_pool_submit(xfer->object_storage.upload_pool,
+					 part_num,
+					 xfer->object_storage.part_buf,
+					 xfer->object_storage.part_buf_used);
+		if (ret < 0) {
+			pr_err("object_storage: upload_pool_submit part %d failed\n",
+			       part_num);
+			xfree(new_buf);
+			return -1;
+		}
+		xfer->object_storage.part_buf = new_buf;
+		xfer->object_storage.part_buf_used = 0;
+		return 0;
+	}
+
+	/* Serial fallback (opts.upload_workers <= 1 or pool create failed) */
 	if (xfer->object_storage.etags_count >= xfer->object_storage.etags_cap) {
 		int new_cap = xfer->object_storage.etags_cap * 2;
 		char **new_etags = xrealloc(xfer->object_storage.etags, new_cap * sizeof(char *));
@@ -488,15 +766,14 @@ static int _flush_object_storage_part(struct page_xfer *xfer)
 		xfer->object_storage.etags_cap = new_cap;
 	}
 
-	xfer->object_storage.part_number++;
 	ret = object_storage_multipart_upload_part(
 		xfer->object_storage.pages_key, xfer->object_storage.upload_id,
-		xfer->object_storage.part_number,
+		part_num,
 		xfer->object_storage.part_buf, xfer->object_storage.part_buf_used,
 		etag, sizeof(etag));
 	if (ret < 0) {
 		pr_err("object_storage: multipart upload part %d failed\n",
-		       xfer->object_storage.part_number);
+		       part_num);
 		return -1;
 	}
 	xfer->object_storage.etags[xfer->object_storage.etags_count] = xstrdup(etag);
@@ -510,6 +787,83 @@ static int write_pages_object_storage(struct page_xfer *xfer, int p, unsigned lo
 	unsigned long remaining;
 	ssize_t nread;
 	int ret;
+
+	/*
+	 * --compress path: drain this full IOV into a staging buffer and
+	 * hand it to the parallel compress pipeline as a single zstd frame.
+	 * compress_pipeline_submit() returns immediately after queueing;
+	 * compress and S3 upload run in background threads.
+	 *
+	 * The pipeline itself is created lazily on first write to avoid
+	 * launching worker threads while CRIU is still running parasite
+	 * RPCs in the target process.
+	 */
+	if (opts.compress && !xfer->object_storage.compress_pipe) {
+		int nc = opts.compress_workers;
+		/*
+		 * Both compressed and raw paths share the same CURLM
+		 * upload_pool, sized by opts.upload_workers (auto-detected
+		 * from NIC bandwidth if user didn't pass --upload-workers).
+		 */
+		int nu = _resolve_upload_workers();
+		if (nc <= 0) {
+			/*
+			 * Auto-tune: leave 1 CPU for the main dump thread
+			 * (parasite RPC + pipe reads), use the rest for
+			 * compress workers capped at 8. Previous formula was
+			 * ncpu/4 which underutilized m5.xlarge / m5.2xlarge
+			 * (1-2 workers instead of 3-7). Cap at 8 because
+			 * writer_drain is single-threaded and saturates with
+			 * ~4-8 compress workers feeding it.
+			 */
+			int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+			if (ncpu <= 1)
+				nc = 1;
+			else if (ncpu >= 9)
+				nc = 8;
+			else
+				nc = ncpu - 1;
+		} else {
+			int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+			if (nc > ncpu)
+				pr_warn("compress-workers=%d exceeds CPU count %d; "
+					"main-thread starvation possible\n", nc, ncpu);
+		}
+		if (nu <= 0)
+			nu = 8;
+		xfer->object_storage.compress_pipe = compress_pipeline_create(
+			xfer->object_storage.pages_key,
+			xfer->object_storage.upload_id,
+			opts.compress_level, nc, nu);
+		if (!xfer->object_storage.compress_pipe) {
+			pr_err("object_storage(compress): pipeline init failed\n");
+			return -1;
+		}
+		pr_info("object_storage(compress): pipeline started "
+			"(%d compress, %d upload workers, level %d)\n",
+			nc, nu, opts.compress_level);
+	}
+
+	if (xfer->object_storage.compress_pipe) {
+		void *buf;
+		unsigned long got = 0;
+
+		buf = xmalloc(len);
+		if (!buf)
+			return -1;
+		while (got < len) {
+			ssize_t n = read(p, (char *)buf + got, len - got);
+			if (n <= 0) {
+				pr_err("object_storage(compress): pipe read failed\n");
+				xfree(buf);
+				return -1;
+			}
+			got += (unsigned long)n;
+		}
+		/* ownership transfer: pipeline frees buf (success or fail). */
+		return compress_pipeline_submit(xfer->object_storage.compress_pipe,
+						buf, len);
+	}
 
 	/*
 	 * Read pages from pipe directly into buffer for both local write
@@ -551,7 +905,7 @@ static int write_pages_object_storage(struct page_xfer *xfer, int p, unsigned lo
 		remaining -= nread;
 
 		/* Flush part when buffer is full */
-		if (xfer->object_storage.part_buf_used >= OBJECT_STORAGE_PART_SIZE) {
+		if (xfer->object_storage.part_buf_used >= xfer->object_storage.part_buf_cap) {
 			ret = _flush_object_storage_part(xfer);
 			if (ret < 0)
 				return ret;
@@ -573,7 +927,102 @@ static void close_page_xfer_object_storage(struct page_xfer *xfer)
 	int i;
 
 	if (xfer->object_storage.active) {
-		/* Flush remaining part buffer */
+		/*
+		 * --compress path: drain the parallel pipeline. Compress
+		 * workers finish their remaining frames, writer appends the
+		 * seek table to the last part, upload workers land all parts.
+		 * Etags come back owned by us.
+		 */
+		if (xfer->object_storage.compress_pipe) {
+			char **etags = NULL;
+			int n_parts = 0;
+			int rc;
+
+			rc = compress_pipeline_finalize(
+					xfer->object_storage.compress_pipe,
+					&etags, &n_parts);
+			compress_pipeline_destroy(xfer->object_storage.compress_pipe);
+			xfer->object_storage.compress_pipe = NULL;
+
+			if (rc < 0 || !etags || n_parts == 0) {
+				pr_err("object_storage(compress): pipeline failed; aborting upload\n");
+				object_storage_multipart_abort(
+					xfer->object_storage.pages_key,
+					xfer->object_storage.upload_id);
+				if (etags) {
+					for (i = 0; i < n_parts; i++)
+						xfree(etags[i]);
+					xfree(etags);
+				}
+				goto cleanup;
+			}
+
+			rc = object_storage_multipart_complete(
+				xfer->object_storage.pages_key,
+				xfer->object_storage.upload_id,
+				n_parts, (const char **)etags);
+			if (rc < 0)
+				pr_err("object_storage(compress): multipart complete failed for %s\n",
+				       xfer->object_storage.pages_key);
+
+			for (i = 0; i < n_parts; i++)
+				xfree(etags[i]);
+			xfree(etags);
+
+			goto upload_pagemap;
+		}
+
+		/*
+		 * Parallel upload path: submit the final (possibly partial) part
+		 * via the pool, then block until all in-flight uploads land and
+		 * issue multipart complete with the ordered etag array owned by
+		 * the pool.
+		 */
+		if (xfer->object_storage.upload_pool) {
+			struct upload_pool *pool = xfer->object_storage.upload_pool;
+			int rc;
+
+			if (xfer->object_storage.part_buf_used > 0 ||
+			    xfer->object_storage.part_number == 0) {
+				int final_pn = ++xfer->object_storage.part_number;
+				void *new_buf = xmalloc(1);  /* placeholder so free path works */
+
+				rc = upload_pool_submit(pool, final_pn,
+							xfer->object_storage.part_buf,
+							xfer->object_storage.part_buf_used);
+				if (rc < 0) {
+					pr_err("object_storage: final part submit failed\n");
+					object_storage_multipart_abort(
+						xfer->object_storage.pages_key,
+						xfer->object_storage.upload_id);
+					xfree(new_buf);
+					goto cleanup;
+				}
+				/* buf ownership moved to pool */
+				xfer->object_storage.part_buf = new_buf;
+				xfer->object_storage.part_buf_used = 0;
+			}
+
+			/*
+			 * DEFER upload_pool_wait + multipart_complete until the
+			 * end of all dumps (page_xfer_drain_deferred_uploads).
+			 * The kernel TCP stack keeps shipping this pool's last
+			 * parts autonomously while the next process's pipe-
+			 * reading + pool submits proceed on the same thread.
+			 * By the time the drain runs, most responses have
+			 * already landed in the socket RCV buffer — we just
+			 * pump curl_multi_perform to collect them and issue
+			 * the multipart_complete. Net effect: proc 1's upload
+			 * tail overlaps with proc 2's dump body, halving the
+			 * wall time for multi-process workloads (mc/redis).
+			 */
+			_deferred_push(pool, xfer->object_storage.pages_key,
+				       xfer->object_storage.upload_id);
+			xfer->object_storage.upload_pool = NULL;
+			goto upload_pagemap;
+		}
+
+		/* Flush remaining part buffer (serial fallback) */
 		if (xfer->object_storage.part_buf_used > 0 || xfer->object_storage.part_number == 0) {
 			char etag[256];
 			int ret;
@@ -615,6 +1064,8 @@ static void close_page_xfer_object_storage(struct page_xfer *xfer)
 			if (ret < 0)
 				pr_err("object_storage: multipart complete failed for %s\n", xfer->object_storage.pages_key);
 		}
+
+upload_pagemap:
 
 		/*
 		 * Upload pagemap: close local files first to flush buffered writes,
@@ -725,9 +1176,17 @@ static int open_page_object_storage_xfer(struct page_xfer *xfer, int fd_type, un
 		xfer->pi = NULL;
 	}
 
-	/* Allocate part buffer */
-	xfer->object_storage.part_buf_cap = OBJECT_STORAGE_PART_SIZE;
-	xfer->object_storage.part_buf = xmalloc(OBJECT_STORAGE_PART_SIZE);
+	/*
+	 * Part size is configurable via --upload-part-mb (S3 multipart
+	 * part size). Default 8 MB matches S3's own examples; larger
+	 * (32 MB) can reduce per-request overhead for big dumps.
+	 */
+	{
+		size_t part_sz = (size_t)(opts.upload_part_mb > 0 ?
+					  opts.upload_part_mb : 8) * 1024UL * 1024UL;
+		xfer->object_storage.part_buf_cap = part_sz;
+		xfer->object_storage.part_buf = xmalloc(part_sz);
+	}
 	if (!xfer->object_storage.part_buf)
 		return -1;
 	xfer->object_storage.part_buf_used = 0;
@@ -755,6 +1214,15 @@ static int open_page_object_storage_xfer(struct page_xfer *xfer, int fd_type, un
 	}
 
 	xfer->object_storage.active = 1;
+
+	/*
+	 * Pipeline creation is deferred to the first write_pages call —
+	 * spawning compress worker threads here (while CRIU is still
+	 * negotiating with the parasite via a separate control pipe) makes
+	 * the parasite RPC hang with "Trimmed message received". By the
+	 * time write_pages is invoked, the parasite->main page stream is
+	 * already flowing and worker thread creation is safe.
+	 */
 
 	/* Override write/close functions with S3 wrappers */
 	xfer->write_pagemap = write_pagemap_object_storage;

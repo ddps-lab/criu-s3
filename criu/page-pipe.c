@@ -255,13 +255,22 @@ void page_pipe_reinit(struct page_pipe *pp)
 static inline int try_add_page_to(struct page_pipe *pp, struct page_pipe_buf *ppb, unsigned long addr,
 				  unsigned int flags)
 {
+	bool split = pp->split_next_iov;
+
 	if (ppb->flags != flags)
 		return 1;
 
 	if (ppb_resize_pipe(ppb) == 1)
 		return 1;
 
-	if (ppb->nr_segs && iov_grow_page(&ppb->iov[ppb->nr_segs - 1], addr))
+	/*
+	 * split_next_iov forces a fresh iov even when addr is VA-contiguous
+	 * with the previous one. generate_iovs() sets it at every VMA
+	 * boundary so compressed dumps emit one zstd frame per VMA per
+	 * pagemap entry — matching the restore-side lazy-IOV granularity.
+	 */
+	if (!split && ppb->nr_segs &&
+	    iov_grow_page(&ppb->iov[ppb->nr_segs - 1], addr))
 		goto out;
 
 	pr_debug("Add iov to page pipe (%u iovs, %u/%u total)\n", ppb->nr_segs, pp->free_iov, pp->nr_iovs);
@@ -269,6 +278,7 @@ static inline int try_add_page_to(struct page_pipe *pp, struct page_pipe_buf *pp
 	pp->free_iov++;
 	BUG_ON(pp->free_iov > pp->nr_iovs);
 out:
+	pp->split_next_iov = false;
 	ppb->pages_in++;
 	return 0;
 }
@@ -277,6 +287,11 @@ static inline int try_add_page(struct page_pipe *pp, unsigned long addr, unsigne
 {
 	BUG_ON(list_empty(&pp->bufs));
 	return try_add_page_to(pp, list_entry(pp->bufs.prev, struct page_pipe_buf, l), addr, flags);
+}
+
+void page_pipe_split_iov(struct page_pipe *pp)
+{
+	pp->split_next_iov = true;
 }
 
 int page_pipe_add_page(struct page_pipe *pp, unsigned long addr, unsigned int flags)

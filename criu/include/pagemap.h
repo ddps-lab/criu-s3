@@ -1,9 +1,13 @@
 #ifndef __CR_PAGE_READ_H__
 #define __CR_PAGE_READ_H__
 
+#include <stdbool.h>
+
 #include "common/list.h"
 #include "images/pagemap.pb-c.h"
 #include "page.h"
+
+struct decompress_ctx;	/* compression.h */
 
 /*
  * page_read -- engine, that reads pages from image file(s)
@@ -138,6 +142,21 @@ struct page_read {
 		size_t buf_offset;
 	} *eager_ranges;
 	int nr_eager_ranges;
+
+	/*
+	 * zstd seekable decompression (auto-detected from trailing magic).
+	 *
+	 * When compressed_mode is set, pi_off tracks uncompressed offsets as
+	 * before, but the bytes in pages-N.img are a concatenation of
+	 * independently-decompressable zstd frames (one per original pagemap
+	 * entry) plus a trailing seek-table skippable frame. The decompress
+	 * context owns the seek table and performs lazy Range-style reads
+	 * through a caller-provided read callback (local: pread fd, S3:
+	 * object_storage_fetch_range).
+	 */
+	bool compressed_mode;
+	struct decompress_ctx *decompress;
+	void *decompress_cookie;	/* xfree'd by close_page_read */
 };
 
 /* flags for ->read_pages */

@@ -1,0 +1,151 @@
+# CRIU cloud-instance NIC bandwidth table
+# Format: provider,type,nic_mbps
+#
+# NIC_MBPS CONVENTION (important — same rule as aws-c-s3 CRT):
+# - Small/burstable AWS instances (m5.large-m5.4xlarge, c5.*small, etc.)
+#   advertise "Up to X Gbps" peak with a much lower baseline (e.g.,
+#   m5.xlarge = baseline 1.25 Gbps, burst 10 Gbps). We store the BURST
+#   PEAK because most CRIU dumps complete in a single burst window
+#   (a 10 GB dump at 10 Gbps = 8s, within the burst credit budget).
+# - Mid/large instances (m5.8xlarge+, *.12xlarge+) have no burst mode;
+#   the advertised value IS the sustained rate.
+#
+# If sustained >>> burst credit (long-running multi-TB dump), the OS
+# auto-throttles to baseline — correctness is preserved, throughput
+# just drops. Users who want to target baseline explicitly can pass
+# CRIU_NIC_MBPS=<baseline_Mbps>.
+#
+# Values cross-referenced from AWS EC2 instance types documentation
+# (https://docs.aws.amazon.com/ec2/latest/instancetypes/).
+#
+# Consumed by scripts/gen_nic_table.py at build time → include/nic_table_gen.h.
+# auto_nic.c uses this table after detecting instance type via IMDSv2.
+#
+# Azure and GCP rows are placeholders — see corresponding query_* stubs
+# in auto_nic.c for population instructions.
+
+# ================ AWS m5 (general purpose, 2018+, Intel) ================
+aws,m5.large,10000
+aws,m5.xlarge,10000
+aws,m5.2xlarge,10000
+aws,m5.4xlarge,10000
+aws,m5.8xlarge,10000
+aws,m5.12xlarge,12000
+aws,m5.16xlarge,20000
+aws,m5.24xlarge,25000
+aws,m5.metal,25000
+
+# ================ AWS m5n (enhanced networking) ================
+aws,m5n.large,25000
+aws,m5n.xlarge,25000
+aws,m5n.2xlarge,25000
+aws,m5n.4xlarge,25000
+aws,m5n.8xlarge,25000
+aws,m5n.12xlarge,50000
+aws,m5n.16xlarge,75000
+aws,m5n.24xlarge,100000
+aws,m5n.metal,100000
+
+# ================ AWS m6i (3rd gen Intel, 2022) ================
+aws,m6i.large,12500
+aws,m6i.xlarge,12500
+aws,m6i.2xlarge,12500
+aws,m6i.4xlarge,12500
+aws,m6i.8xlarge,12500
+aws,m6i.12xlarge,18750
+aws,m6i.16xlarge,25000
+aws,m6i.24xlarge,37500
+aws,m6i.32xlarge,50000
+aws,m6i.metal,50000
+
+# ================ AWS m7i (4th gen Intel Sapphire Rapids, 2023) ================
+aws,m7i.large,12500
+aws,m7i.xlarge,12500
+aws,m7i.2xlarge,12500
+aws,m7i.4xlarge,12500
+aws,m7i.8xlarge,12500
+aws,m7i.12xlarge,18750
+aws,m7i.16xlarge,25000
+aws,m7i.24xlarge,37500
+aws,m7i.48xlarge,50000
+
+# ================ AWS c5 (compute-optimized, 2017+) ================
+aws,c5.large,10000
+aws,c5.xlarge,10000
+aws,c5.2xlarge,10000
+aws,c5.4xlarge,10000
+aws,c5.9xlarge,10000
+aws,c5.12xlarge,12000
+aws,c5.18xlarge,25000
+aws,c5.24xlarge,25000
+aws,c5.metal,25000
+
+# ================ AWS c5n (compute + enhanced networking) ================
+aws,c5n.large,25000
+aws,c5n.xlarge,25000
+aws,c5n.2xlarge,25000
+aws,c5n.4xlarge,25000
+aws,c5n.9xlarge,50000
+aws,c5n.18xlarge,100000
+aws,c5n.metal,100000
+
+# ================ AWS c6i (2022) ================
+aws,c6i.large,12500
+aws,c6i.xlarge,12500
+aws,c6i.2xlarge,12500
+aws,c6i.4xlarge,12500
+aws,c6i.8xlarge,12500
+aws,c6i.12xlarge,18750
+aws,c6i.16xlarge,25000
+aws,c6i.24xlarge,37500
+aws,c6i.32xlarge,50000
+aws,c6i.metal,50000
+
+# ================ AWS r5 (memory-optimized, Intel) ================
+aws,r5.large,10000
+aws,r5.xlarge,10000
+aws,r5.2xlarge,10000
+aws,r5.4xlarge,10000
+aws,r5.8xlarge,10000
+aws,r5.12xlarge,12000
+aws,r5.16xlarge,20000
+aws,r5.24xlarge,25000
+aws,r5.metal,25000
+
+# ================ AWS r5n (memory + enhanced networking) ================
+aws,r5n.large,25000
+aws,r5n.xlarge,25000
+aws,r5n.2xlarge,25000
+aws,r5n.4xlarge,25000
+aws,r5n.8xlarge,25000
+aws,r5n.12xlarge,50000
+aws,r5n.16xlarge,75000
+aws,r5n.24xlarge,100000
+aws,r5n.metal,100000
+
+# ================ AWS t3 / t3a (burstable, limited sustained) ================
+# Burstable instances have low baseline; use conservative baseline values.
+aws,t3.nano,5000
+aws,t3.micro,5000
+aws,t3.small,5000
+aws,t3.medium,5000
+aws,t3.large,5000
+aws,t3.xlarge,5000
+aws,t3.2xlarge,5000
+aws,t3a.nano,5000
+aws,t3a.micro,5000
+aws,t3a.small,5000
+aws,t3a.medium,5000
+aws,t3a.large,5000
+aws,t3a.xlarge,5000
+aws,t3a.2xlarge,5000
+
+# ================ Azure (placeholder) ================
+# TODO: populate from https://learn.microsoft.com/azure/virtual-machines/sizes
+# azure,Standard_D2_v3,1000
+# azure,Standard_D8_v3,4000
+
+# ================ GCP (placeholder) ================
+# TODO: populate from https://cloud.google.com/compute/docs/network-bandwidth
+# gcp,n2-standard-4,10000
+# gcp,n2-standard-16,32000

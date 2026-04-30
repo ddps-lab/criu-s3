@@ -3,6 +3,9 @@
 #include <unistd.h>
 #include <linux/falloc.h>
 #include <sys/uio.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/mman.h>
 #include <limits.h>
 #include <string.h>
 #include <pthread.h>
@@ -22,6 +25,7 @@
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
 #include "object-storage.h"
+#include "compression.h"
 
 #ifndef SEEK_DATA
 #define SEEK_DATA 3
@@ -235,11 +239,357 @@ static int read_parent_page(struct page_read *pr, unsigned long vaddr, int nr, v
 	return 0;
 }
 
+/*
+ * Callback cookie for S3 pages-*.img compressed reads.
+ *
+ * The zstd seekable format puts its seek table (one entry per frame) at
+ * the end of the file. ZSTD_seekable's customFile init walks that table
+ * with many small reads; if every read were a live Range GET, init alone
+ * would cost hundreds of 30-ms RTTs.
+ *
+ * Fix: pre-fetch the tail of the object (large enough to cover any
+ * realistic seek table) into tail_buf once at probe time. s3_decomp_read_cb
+ * serves any read that falls inside [tail_start, tail_start + tail_len)
+ * from memory — so every ZSTD_seekable init hits memory — while reads of
+ * actual compressed frame bytes (anywhere earlier in the file) fall
+ * through to object_storage_fetch_range_short. One Range GET per frame on
+ * decompress, zero RTTs on init.
+ */
+struct s3_decomp_cookie {
+	char object_key[PATH_MAX];
+	unsigned long total_size;
+	void *tail_buf;		/* last tail_len bytes of the object */
+	unsigned long tail_start;
+	size_t tail_len;
+};
+
+/*
+ * ZSTD seekable format footer (last 9 bytes of the file):
+ *   [num_frames:4B LE] [descriptor:1B] [seekable_magic:4B 0x8F92EAB1]
+ * Seek table layout (end of file, preceded by frame bodies):
+ *   [skippable_frame_header:8B] [seek_table_entries:N*sz] [footer:9B]
+ * where sz = 12 if descriptor bit7 (checksum) is set, else 8.
+ */
+#define ZSTD_SEEK_FOOTER_LEN		9
+#define ZSTD_SKIPPABLE_HDR_LEN		8
+#define ZSTD_SEEK_ENTRY_LEN_BASE	8
+#define ZSTD_SEEK_ENTRY_LEN_CS		12
+
+/* Safety ceiling in case the footer reports a corrupt num_frames. */
+#define S3_COMP_TAIL_MAX (16UL << 20)
+
+static inline uint32_t read_le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/*
+ * Determine the exact byte range the seek table occupies at the end of
+ * a seekable-format pages-*.img. Returns the number of bytes to cache
+ * (measured from the end of the file) on success, 0 on any parse error.
+ * Reads only the 9-byte footer from S3.
+ */
+static size_t s3_seek_table_size(const char *object_key, unsigned long total_size)
+{
+	uint8_t footer[ZSTD_SEEK_FOOTER_LEN];
+	unsigned long got = 0;
+	uint32_t num_frames;
+	uint8_t descriptor, entry_size;
+	size_t needed;
+
+	if (total_size < ZSTD_SEEK_FOOTER_LEN + ZSTD_SKIPPABLE_HDR_LEN)
+		return 0;
+
+	if (object_storage_fetch_range_short(object_key,
+					     total_size - ZSTD_SEEK_FOOTER_LEN,
+					     ZSTD_SEEK_FOOTER_LEN,
+					     footer, &got,
+					     OBJSTOR_SRC_FAULT) != 0 ||
+	    got != ZSTD_SEEK_FOOTER_LEN)
+		return 0;
+
+	num_frames = read_le32(footer);
+	descriptor = footer[4];
+	entry_size = (descriptor & 0x80) ? ZSTD_SEEK_ENTRY_LEN_CS
+					 : ZSTD_SEEK_ENTRY_LEN_BASE;
+
+	needed = ZSTD_SKIPPABLE_HDR_LEN + (size_t)num_frames * entry_size + ZSTD_SEEK_FOOTER_LEN;
+	if (needed > S3_COMP_TAIL_MAX || needed > total_size)
+		return 0;
+	return needed;
+}
+
+static int s3_decomp_read_cb(void *cookie, off_t offset, size_t length, void *out)
+{
+	struct s3_decomp_cookie *c = cookie;
+	unsigned long got = 0;
+	unsigned long uoff = (unsigned long)offset;
+	int rc;
+
+	/*
+	 * Tail cache hit: entire requested range sits inside the pre-fetched
+	 * tail. Memory serve, no network.
+	 */
+	if (c->tail_buf && c->tail_len > 0 &&
+	    uoff >= c->tail_start &&
+	    uoff + length <= c->tail_start + c->tail_len) {
+		memcpy(out, (char *)c->tail_buf + (uoff - c->tail_start), length);
+		return 0;
+	}
+
+	/*
+	 * Miss (i.e. a compressed frame body somewhere earlier in the file).
+	 * Range GET once; short reads past EOF get zero-padded because the
+	 * seekable decoder may overshoot the last frame.
+	 */
+	rc = object_storage_fetch_range_short(c->object_key, uoff,
+					      (unsigned long)length, out, &got,
+					      OBJSTOR_SRC_FAULT);
+	if (rc != 0)
+		return -1;
+	if (got != length)
+		memset((char *)out + got, 0, length - got);
+	return 0;
+}
+
+/*
+ * Detect zstd seekable format on a pages-*.img stored in object storage
+ * and, if present, wire up pr->decompress as the source of truth for
+ * every future fetch. The object key must already be constructed; the
+ * caller passes in an upper bound for the file size (or 0 to probe for
+ * it via a speculative range fetch past a reasonably-sized tail).
+ */
+static int init_s3_compression(struct page_read *pr, const char *object_key)
+{
+	uint8_t tail[4];
+	unsigned long tail_got = 0;
+	unsigned long size = 0;
+	struct s3_decomp_cookie *cookie;
+	int rc;
+
+	/*
+	 * One HEAD request to learn the total object size, then a single
+	 * Range GET for the trailing 4 magic bytes. Replaces the previous
+	 * O(log N) geometric Range-GET probe.
+	 */
+	rc = object_storage_head_object(object_key, &size);
+	if (rc == -ENOENT)
+		return 0;
+	if (rc != 0)
+		return 0;
+	if (size < 4)
+		return 0;
+
+	if (object_storage_fetch_range_short(object_key, (off_t)size - 4, 4,
+					     tail, &tail_got,
+					     OBJSTOR_SRC_FAULT) != 0)
+		return 0;
+	if (tail_got != 4 || decompress_probe(tail, 4) != 1)
+		return 0;
+
+	cookie = xzalloc(sizeof(*cookie));
+	if (!cookie)
+		return -1;
+	snprintf(cookie->object_key, sizeof(cookie->object_key), "%s", object_key);
+	cookie->total_size = size;
+
+	/*
+	 * Cache exactly the seek-table bytes at EOF — enough for
+	 * decompress_create_lazy() to extract the frame directory on the
+	 * init pass. Frame bodies are never read through the tail cache;
+	 * decompress_range() fetches each frame via the callback directly.
+	 */
+	cookie->tail_len = s3_seek_table_size(object_key, size);
+	if (cookie->tail_len == 0) {
+		pr_err("init_s3_compression: seek-table footer parse failed\n");
+		xfree(cookie);
+		return -1;
+	}
+	cookie->tail_start = size - cookie->tail_len;
+	cookie->tail_buf = xmalloc(cookie->tail_len);
+	if (!cookie->tail_buf) {
+		pr_err("init_s3_compression: tail xmalloc(%zu) failed\n", cookie->tail_len);
+		xfree(cookie);
+		return -1;
+	}
+	{
+		unsigned long got = 0;
+		if (object_storage_fetch_range_short(object_key,
+						     cookie->tail_start,
+						     cookie->tail_len,
+						     cookie->tail_buf, &got,
+						     OBJSTOR_SRC_FAULT) != 0 ||
+		    got != cookie->tail_len) {
+			pr_err("init_s3_compression: tail fetch failed (got=%lu/%zu)\n",
+			       got, cookie->tail_len);
+			xfree(cookie->tail_buf);
+			xfree(cookie);
+			return -1;
+		}
+	}
+
+	pr_info("page-read: detected compressed S3 pages-*.img %s (total=%lu bytes, cached tail=%zu)\n",
+		object_key, cookie->total_size, cookie->tail_len);
+
+	pr->decompress = decompress_create_lazy(NULL, 0,
+						(off_t)cookie->total_size,
+						s3_decomp_read_cb, cookie);
+	if (!pr->decompress) {
+		xfree(cookie->tail_buf);
+		xfree(cookie);
+		return -1;
+	}
+	pr->compressed_mode = true;
+	pr->decompress_cookie = cookie;
+	/* Eager prefetch / ra_buf are bypassed in compressed mode — the
+	 * decompressor manages its own read-ahead via the seekable API. */
+
+	return 0;
+}
+
+/*
+ * Retained for reference: local-mode compression was folded into
+ * open_pages_image_at() in image.c, so this helper is no longer called
+ * on the normal path. Left in place as dead code for the moment so
+ * git-blame / diffs stay sensible.
+ */
+static __attribute__((unused))
+int init_local_compression(struct page_read *pr)
+{
+	int src_fd, mfd;
+	struct stat st;
+	uint8_t tail[4];
+	ssize_t n;
+	void *src_buf = NULL;
+	void *dst_buf = NULL;
+	struct decompress_ctx *dctx = NULL;
+	off_t off;
+	unsigned int n_frames, i;
+	unsigned long long total_raw;
+
+	src_fd = img_raw_fd(pr->pi);
+	if (src_fd < 0)
+		return 0;
+	if (fstat(src_fd, &st) < 0) {
+		pr_perror("init_local_compression: fstat");
+		return -1;
+	}
+	if (st.st_size < 4)
+		return 0;
+
+	n = pread(src_fd, tail, 4, st.st_size - 4);
+	if (n != 4) {
+		pr_perror("init_local_compression: pread tail");
+		return -1;
+	}
+	if (decompress_probe(tail, sizeof(tail)) != 1)
+		return 0;
+
+	pr_info("page-read: detected zstd seekable pages-*.img (%lld bytes compressed)\n",
+		(long long)st.st_size);
+
+	/*
+	 * Map the compressed file read-only instead of slurping via read().
+	 * The seekable decoder only needs random-access bytes; MAP_PRIVATE
+	 * lets the kernel demand-page from the backing file and never
+	 * counts the bytes against CRIU's RSS (unlike a heap slurp).
+	 */
+	src_buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, src_fd, 0);
+	if (src_buf == MAP_FAILED) {
+		pr_perror("init_local_compression: mmap compressed");
+		src_buf = NULL;
+		return -1;
+	}
+	(void)off;
+	(void)n;
+
+	dctx = decompress_create_from_buffer(src_buf, st.st_size);
+	if (!dctx)
+		goto err;
+
+	n_frames = decompress_num_frames(dctx);
+	total_raw = decompress_total_raw_size(dctx);
+	(void)i;
+	(void)dst_buf;
+
+	pr_info("page-read: decompressing %u frames -> %llu raw bytes into memfd\n",
+		n_frames, total_raw);
+
+	/*
+	 * Memory strategy: allocate the uncompressed size as a memfd, mmap
+	 * it shared, then decompress directly into the mapping. This
+	 * avoids doubling memory vs. the xmalloc-then-write approach —
+	 * we pay exactly one raw-sized allocation which the kernel
+	 * accounts as tmpfs, not heap.
+	 */
+	mfd = syscall(SYS_memfd_create, "criu-decompressed-pages", 0);
+	if (mfd < 0) {
+		pr_perror("init_local_compression: memfd_create");
+		goto err;
+	}
+	if (ftruncate(mfd, total_raw) < 0) {
+		pr_perror("init_local_compression: ftruncate memfd");
+		close(mfd);
+		goto err;
+	}
+	{
+		void *map = mmap(NULL, total_raw, PROT_READ | PROT_WRITE,
+				 MAP_SHARED, mfd, 0);
+		if (map == MAP_FAILED) {
+			pr_perror("init_local_compression: mmap memfd");
+			close(mfd);
+			goto err;
+		}
+		if (decompress_range(dctx, 0, total_raw, map) < 0) {
+			pr_err("init_local_compression: decompress_range failed\n");
+			munmap(map, total_raw);
+			close(mfd);
+			goto err;
+		}
+		munmap(map, total_raw);
+	}
+	if (lseek(mfd, 0, SEEK_SET) < 0) {
+		pr_perror("init_local_compression: lseek memfd");
+		close(mfd);
+		goto err;
+	}
+
+	/* Close the original compressed fd and put the memfd in its place. */
+	close(pr->pi->_x.fd);
+	pr->pi->_x.fd = mfd;
+
+	decompress_free(dctx);
+	munmap(src_buf, st.st_size);
+
+	return 0;
+
+err:
+	if (dctx)
+		decompress_free(dctx);
+	if (src_buf)
+		munmap(src_buf, st.st_size);
+	if (dst_buf)
+		xfree(dst_buf);
+	return -1;
+}
+
 static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned long len, void *buf)
 {
 	int fd;
 	ssize_t ret;
 	size_t curr = 0;
+
+	/* Compressed pages-*.img: skip fd read, decompress from the
+	 * in-memory seekable stream. pi_off is an uncompressed offset. */
+	if (pr->compressed_mode) {
+		if (decompress_range(pr->decompress, pr->pi_off, len, buf) < 0) {
+			pr_err("read_local_page: decompress_range(off=%" PRIx64 ", len=%lu) failed\n",
+			       (uint64_t)pr->pi_off, len);
+			return -1;
+		}
+		return 0;
+	}
 
 	fd = img_raw_fd(pr->pi);
 	if (fd < 0) {
@@ -265,7 +615,13 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 			break;
 	}
 
-	if (opts.auto_dedup && !pr->disable_dedup) {
+	/*
+	 * auto-dedup works by punching holes into pages-*.img at the
+	 * *raw* byte offset of the read. That doesn't exist on a
+	 * compressed pages-*.img — the bytes at pi_off are zstd frame
+	 * data, not raw pages. Skip the hole-punch when compressed.
+	 */
+	if (opts.auto_dedup && !pr->disable_dedup && !pr->compressed_mode) {
 		ret = punch_hole(pr, pr->pi_off, len, false);
 		if (ret == -1)
 			return -1;
@@ -499,9 +855,24 @@ struct eager_ss {
 	pthread_mutex_t lock;
 };
 
+/*
+ * Per-thread context for an eager-prefetch worker. ss is shared; dctx is
+ * owned by this worker and non-NULL only for compressed-mode page_reads.
+ *
+ * ZSTD_seekable state (held inside decompress_ctx) is not thread-safe, so
+ * each worker decompresses through its own instance rather than serializing
+ * on pr->decompress. The shared cookie is safe to point all of them at
+ * because the read-callback only reads immutable fields.
+ */
+struct eager_worker_ctx {
+	struct eager_ss *ss;
+	struct decompress_ctx *dctx;	/* NULL for raw mode */
+};
+
 static void *eager_drain_worker(void *arg)
 {
-	struct eager_ss *ss = (struct eager_ss *)arg;
+	struct eager_worker_ctx *wctx = (struct eager_worker_ctx *)arg;
+	struct eager_ss *ss = wctx->ss;
 	int idx;
 
 	while (1) {
@@ -513,12 +884,30 @@ static void *eager_drain_worker(void *arg)
 		idx = ss->next++;
 		pthread_mutex_unlock(&ss->lock);
 
-		ss->args[idx].rc = object_storage_fetch_range(
-			ss->args[idx].object_key,
-			ss->args[idx].file_offset,
-			ss->args[idx].len,
-			ss->args[idx].dst,
-			OBJSTOR_SRC_PREFETCH);
+		if (wctx->dctx) {
+			/*
+			 * Compressed mode: file_offset/len are *uncompressed*
+			 * values (from the pagemap). decompress_range() turns
+			 * that into compressed-byte Range GETs internally via
+			 * the seekable decoder and writes the plain pages into
+			 * dst — downstream consumers (eager_buf_lookup etc.)
+			 * see uncompressed bytes just like the raw path.
+			 */
+			if (decompress_range(wctx->dctx,
+					     ss->args[idx].file_offset,
+					     ss->args[idx].len,
+					     ss->args[idx].dst) == 0)
+				ss->args[idx].rc = 0;
+			else
+				ss->args[idx].rc = -1;
+		} else {
+			ss->args[idx].rc = object_storage_fetch_range(
+				ss->args[idx].object_key,
+				ss->args[idx].file_offset,
+				ss->args[idx].len,
+				ss->args[idx].dst,
+				OBJSTOR_SRC_PREFETCH);
+		}
 	}
 	return NULL;
 }
@@ -709,14 +1098,60 @@ static int prefetch_eager_ranges(struct page_read *pr)
 
 	{
 		struct eager_ss ss;
+		struct eager_worker_ctx *wctxs = NULL;
+
 		ss.args = args;
 		ss.total = nr_ranges;
 		ss.next = 0;
 		pthread_mutex_init(&ss.lock, NULL);
 
+		/*
+		 * Each worker needs its own struct eager_worker_ctx so it can
+		 * carry a private decompress_ctx in compressed mode. For raw
+		 * mode the dctx field stays NULL and the worker just calls
+		 * object_storage_fetch_range as before.
+		 */
+		wctxs = xzalloc(nw * sizeof(*wctxs));
+		if (!wctxs) {
+			pr_warn("eager prefetch: alloc worker ctx failed\n");
+			pthread_mutex_destroy(&ss.lock);
+			xfree(tids);
+			xfree(args);
+			xfree(pr->eager_buf);
+			pr->eager_buf = NULL;
+			pr->eager_buf_cap = 0;
+			xfree(pr->eager_ranges);
+			pr->eager_ranges = NULL;
+			pr->nr_eager_ranges = 0;
+			return 0;
+		}
+
+		for (i = 0; i < nw; i++) {
+			wctxs[i].ss = &ss;
+			wctxs[i].dctx = NULL;
+			if (pr->compressed_mode && pr->decompress_cookie) {
+				struct s3_decomp_cookie *c = pr->decompress_cookie;
+				/*
+				 * Per-worker ZSTD_seekable initialized via the
+				 * tail-cached customFile. Init reads the seek
+				 * table entirely from cookie->tail_buf (zero
+				 * network). Decompress of a frame issues one
+				 * Range GET for that frame's compressed bytes.
+				 */
+				wctxs[i].dctx = decompress_create_lazy(
+					NULL, 0,
+					(off_t)c->total_size,
+					s3_decomp_read_cb, c);
+				if (!wctxs[i].dctx) {
+					pr_warn("eager prefetch: per-worker decompress_ctx init failed (worker %d)\n", i);
+					/* best-effort: fall back to serial decompress via pr->decompress */
+				}
+			}
+		}
+
 		created = 0;
 		for (i = 0; i < nw; i++) {
-			if (pthread_create(&tids[i], NULL, eager_drain_worker, &ss) != 0) {
+			if (pthread_create(&tids[i], NULL, eager_drain_worker, &wctxs[i]) != 0) {
 				pr_warn("eager prefetch: pthread_create %d failed\n", i);
 				break;
 			}
@@ -727,18 +1162,31 @@ static int prefetch_eager_ranges(struct page_read *pr)
 			/* Drain on main thread as last-resort fallback */
 			int idx;
 			for (idx = 0; idx < nr_ranges; idx++) {
-				args[idx].rc = object_storage_fetch_range(
-					args[idx].object_key,
-					args[idx].file_offset,
-					args[idx].len,
-					args[idx].dst,
-					OBJSTOR_SRC_PREFETCH);
+				if (pr->compressed_mode && pr->decompress) {
+					args[idx].rc = decompress_range(pr->decompress,
+									args[idx].file_offset,
+									args[idx].len,
+									args[idx].dst) == 0 ? 0 : -1;
+				} else {
+					args[idx].rc = object_storage_fetch_range(
+						args[idx].object_key,
+						args[idx].file_offset,
+						args[idx].len,
+						args[idx].dst,
+						OBJSTOR_SRC_PREFETCH);
+				}
 			}
 		} else {
 			for (i = 0; i < created; i++)
 				pthread_join(tids[i], NULL);
 		}
 
+		/* Tear down per-worker decompress contexts. */
+		for (i = 0; i < nw; i++) {
+			if (wctxs[i].dctx)
+				decompress_free(wctxs[i].dctx);
+		}
+		xfree(wctxs);
 		pthread_mutex_destroy(&ss.lock);
 	}
 
@@ -944,6 +1392,29 @@ static int maybe_read_page_object_storage(struct page_read *pr, unsigned long va
 	}
 
 direct_fetch:
+	/*
+	 * Compressed path: pi_off is an uncompressed offset, so ask the
+	 * seekable decoder to produce the raw bytes for us. It will issue
+	 * its own compressed Range GETs via the s3_decomp_read_cb wired up
+	 * in init_s3_compression().
+	 */
+	if (pr->compressed_mode && pr->decompress) {
+		ret = decompress_range(pr->decompress, pr->pi_off, len, buf);
+		if (ret == 0) {
+			if (pr->io_complete) {
+				ret = pr->io_complete(pr, vaddr, nr);
+				if (ret < 0)
+					pr_err("Object Storage(compressed): io_complete failed for vaddr %lx\n",
+					       vaddr);
+			}
+		} else {
+			pr_err("Object Storage(compressed): decompress_range(off=%lu len=%lu) failed\n",
+			       pr->pi_off, len);
+		}
+		pr->pi_off += len;
+		return ret;
+	}
+
 	/* Fetch data from object storage (fault-driven path: lazy-pages
 	 * daemon is reactively pulling pages for an outstanding UFFD fault). */
 	ret = object_storage_fetch_range(object_key, pr->pi_off, len, buf, OBJSTOR_SRC_FAULT);
@@ -1128,6 +1599,23 @@ static void close_page_read(struct page_read *pr)
 
 	if (pr->pmes)
 		free_pagemaps(pr);
+
+	/*
+	 * Free the zstd seekable decompressor first (it holds a pointer
+	 * into ra_buf when compressed_mode is set).
+	 */
+	if (pr->decompress) {
+		decompress_free(pr->decompress);
+		pr->decompress = NULL;
+		pr->compressed_mode = false;
+	}
+	if (pr->decompress_cookie) {
+		struct s3_decomp_cookie *c = pr->decompress_cookie;
+		if (c->tail_buf)
+			xfree(c->tail_buf);
+		xfree(c);
+		pr->decompress_cookie = NULL;
+	}
 
 	/* Phase 6: object-storage read-ahead buffer (per-page_read) */
 	if (pr->ra_buf) {
@@ -1452,6 +1940,25 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->bunch.iov_base = NULL;
 	pr->pmes = NULL;
 	pr->pieok = false;
+	/*
+	 * Compression / read-ahead / eager-prefetch state. struct page_read
+	 * lives on the caller's stack (e.g. restore_priv_vma_content's local
+	 * pr) and is not zero-initialized. init_s3_compression() only writes
+	 * these fields on a positive probe, so we must zero them here to
+	 * prevent close_page_read() from calling free()/munmap() on stale
+	 * stack bytes when the probe misses (the raw-image path).
+	 */
+	pr->compressed_mode = false;
+	pr->decompress = NULL;
+	pr->decompress_cookie = NULL;
+	pr->ra_buf = NULL;
+	pr->ra_start = 0;
+	pr->ra_len = 0;
+	pr->ra_cap = 0;
+	pr->eager_buf = NULL;
+	pr->eager_buf_cap = 0;
+	pr->eager_ranges = NULL;
+	pr->nr_eager_ranges = 0;
 	pr->disable_dedup = false;
 	pr->ra_buf = NULL;
 	pr->ra_start = 0;
@@ -1516,10 +2023,33 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		pr->maybe_read_page = maybe_read_page_img_streamer;
 	} else if (opts.enable_object_storage) {
 		/* Object Storage: fetch pages from S3/MinIO/compatible storage */
+		char probe_key[PATH_MAX];
+		char probe_image_name[64];
+		const char *probe_prefix;
+
 		pr_info("Assigning maybe_read_page_object_storage (lazy_pages: %d, enable_object_storage: %d)\n",
 		        opts.lazy_pages, opts.enable_object_storage);
 		pr->maybe_read_page = maybe_read_page_object_storage;
 		pr->pieok = false;
+
+		/*
+		 * Probe the pages-*.img tail for the zstd seekable magic; if
+		 * present, wire up pr->decompress so every maybe_read_page
+		 * call runs through decompress_range instead of a raw range
+		 * fetch.
+		 */
+		snprintf(probe_image_name, sizeof(probe_image_name),
+			 "pages-%u.img", pr->pages_img_id);
+		probe_prefix = pr->object_storage_prefix ? pr->object_storage_prefix
+							 : opts.object_storage_object_prefix;
+		if (probe_prefix && strlen(probe_prefix) > 0)
+			snprintf(probe_key, sizeof(probe_key), "%s%s",
+				 probe_prefix, probe_image_name);
+		else
+			snprintf(probe_key, sizeof(probe_key), "%s",
+				 probe_image_name);
+		if (init_s3_compression(pr, probe_key) < 0)
+			return -1;
 
 		/*
 		 * Phase 6: per-page_read read-ahead buffer.
@@ -1541,12 +2071,22 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		 * the per-call fast path falls through to the existing
 		 * single-fetch code unchanged.
 		 */
-		pr->ra_cap = 16UL << 20; /* 16 MB */
-		pr->ra_buf = xmalloc(pr->ra_cap);
-		if (!pr->ra_buf) {
-			pr_warn("page_read[%u]: read-ahead buffer alloc failed; "
-				"falling back to per-call S3 fetches\n", pr->id);
+		/*
+		 * Compressed images route reads through decompress_range(),
+		 * which uses the seekable decoder's own internal caching. No
+		 * point allocating a 16 MB raw-byte read-ahead window on top.
+		 */
+		if (pr->compressed_mode) {
 			pr->ra_cap = 0;
+			pr->ra_buf = NULL;
+		} else {
+			pr->ra_cap = 16UL << 20; /* 16 MB */
+			pr->ra_buf = xmalloc(pr->ra_cap);
+			if (!pr->ra_buf) {
+				pr_warn("page_read[%u]: read-ahead buffer alloc failed; "
+					"falling back to per-call S3 fetches\n", pr->id);
+				pr->ra_cap = 0;
+			}
 		}
 		pr->ra_start = 0;
 		pr->ra_len = 0;
@@ -1562,6 +2102,15 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		pr_info("Assigning maybe_read_page_local (lazy_pages: %d, enable_object_storage: %d)\n",
 		        opts.lazy_pages, opts.enable_object_storage);
 		pr->maybe_read_page = maybe_read_page_local;
+
+		/*
+		 * Compression is handled transparently inside
+		 * open_pages_image_at() — if the pages image was zstd-seekable
+		 * that function already swapped pr->pi->_x.fd to a memfd of
+		 * raw decompressed bytes. Every downstream reader (parasite
+		 * preadv, dedup, prepare_vma_ios) sees the memfd directly.
+		 */
+
 		if (!pr->parent && !opts.lazy_pages)
 			pr->pieok = true;
 		else

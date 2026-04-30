@@ -9,11 +9,16 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 #include <fcntl.h>
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
+#include <openssl/ssl.h>
 
 #include "common/config.h"
 #include "common/compiler.h"
@@ -49,6 +54,7 @@ struct curl_handle_entry {
 struct curl_thread_handle {
 	pthread_t thread_id;
 	CURL *handle;
+	struct curl_slist *resolve_list;  /* CURLOPT_RESOLVE entry pinning host->ip */
 	time_t last_used;
 	int request_count;
 	struct curl_thread_handle *next;
@@ -87,6 +93,24 @@ static struct curl_thread_handle *g_thread_handles = NULL;
 static int g_curl_initialized_in_this_process = 0;
 static int g_is_lazy_pages_context = 0;
 
+/*
+ * Global S3 edge-IP pool — resolved once on first thread-local handle
+ * creation and reused across every restore worker thread. Each worker
+ * is pinned to a different IP via CURLOPT_RESOLVE so prefetch reads
+ * spread across multiple S3 frontend partitions instead of collapsing
+ * onto whichever IP the glibc resolver picked first. Without this,
+ * prefetch workers each call getaddrinfo independently but glibc's
+ * default ordering is deterministic, so all of them end up using the
+ * same IP and hitting a single per-edge rate cap.
+ */
+#define MAX_RESOLVED_IPS 16
+static pthread_mutex_t g_s3_ips_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char g_s3_ips[MAX_RESOLVED_IPS][64];
+static int g_s3_n_ips = 0;
+static char g_s3_host[512] = "";
+static int g_s3_port = 443;
+static int g_s3_next_slot = 0;
+
 /* AWS S3 Express One Zone Session Credentials */
 static char g_session_access_key[256];
 static char g_session_secret_key[256];
@@ -112,6 +136,17 @@ static int _parse_xml_tag(const char *xml, const char *tag, char *buffer, size_t
 
 /* Compute SHA256 and return as lowercase hex string */
 __attribute__((used))
+/*
+ * Compute the value of x-amz-content-sha256 for a request body. When
+ * opts.sign_payload is off (the default), fill `output` with the literal
+ * "UNSIGNED-PAYLOAD" string — SigV4 spec permits this and S3 accepts it,
+ * trading the per-request body scan for TLS-only in-transit integrity.
+ * aws-cli v2 (CRT) and most AWS SDKs default to UNSIGNED-PAYLOAD for
+ * the same performance reason. output buffer must be at least 65 bytes
+ * either way (64 hex chars + NUL vs 16-char literal + NUL).
+ */
+static void _payload_hash(const void *data, size_t len, char *output);
+
 static void _sha256_hex(const char *str, size_t len, char *output)
 {
 	EVP_MD_CTX *mdctx;
@@ -131,6 +166,19 @@ static void _sha256_hex(const char *str, size_t len, char *output)
 		sprintf(output + (i * 2), "%02x", hash[i]);
 	}
 	output[md_len * 2] = '\0';
+}
+
+static void _payload_hash(const void *data, size_t len, char *output)
+{
+	if (opts.sign_payload) {
+		_sha256_hex((const char *)data, len, output);
+	} else {
+		/* SigV4 permits the literal string "UNSIGNED-PAYLOAD" in both
+		 * the canonical x-amz-content-sha256 header and the canonical
+		 * request hash input. See AWS SigV4 docs section "Unsigned
+		 * payload option". */
+		memcpy(output, "UNSIGNED-PAYLOAD", 17);  /* includes NUL */
+	}
 }
 
 /* Compute HMAC-SHA256 and return raw bytes */
@@ -353,6 +401,17 @@ static int _build_sigv4_headers(const char *access_key, const char *secret_key,
 	}
 
 	*headers = curl_slist_append(*headers, auth_header);
+
+	/*
+	 * Strip libcurl's default "Expect: 100-continue" header. For bodies
+	 * over 1 KB libcurl sends Expect: 100-continue and waits a full RTT
+	 * for the 100 Continue response before sending the body — wasted
+	 * latency on every part upload. Region-local S3 RTT is ~1-2 ms but
+	 * with 100+ parts per dump this adds up. AWS CRT and aws-cli both
+	 * disable this for the same reason. Empty Expect: tells curl to
+	 * remove its auto-added header.
+	 */
+	*headers = curl_slist_append(*headers, "Expect:");
 
 	return 0;
 }
@@ -640,6 +699,21 @@ static curl_socket_t curl_opensocket_cb(void *clientp,
 	return relocate_internal_fd(s);
 }
 
+/* Forward declaration — implementation sits in the upload_pool section below. */
+static int _upload_sockopt_cb(void *clientp, curl_socket_t sockfd,
+			      curlsocktype purpose);
+static CURLcode _upload_ssl_ctx_cb(CURL *curl, void *sslctx, void *parm);
+
+/* Shared URL-construction result, defined here (before first use) and
+ * populated by _construct_object_url below. */
+struct object_url_info {
+	char url[2048];
+	char auth_host[512];
+	char canonical_uri[2048];
+	char full_object_path[1024];
+};
+static int _construct_object_url(const char *object_key, struct object_url_info *info);
+
 static void set_fixed_curl_options(CURL *handle)
 {
 	curl_easy_setopt(handle, CURLOPT_HTTPGET, 1L);
@@ -660,6 +734,34 @@ static void set_fixed_curl_options(CURL *handle)
 
 	/* SSL verification */
 	curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, 2L);
+
+	/*
+	 * Larger download read buffer: default 16 KB means 512 read
+	 * callbacks per 8 MB Range GET. 512 KB drops to 16 callbacks and
+	 * lets the kernel TCP receive buffer fill with fewer userspace
+	 * hops. Complements SO_RCVBUF tuning below.
+	 */
+	curl_easy_setopt(handle, CURLOPT_BUFFERSIZE, 512L * 1024L);
+
+	/* TCP_NODELAY: disable Nagle for small request bursts. */
+	curl_easy_setopt(handle, CURLOPT_TCP_NODELAY, 1L);
+
+	/*
+	 * Bigger SO_RCVBUF (2 MB) so BDP between EC2 and S3 is fully
+	 * utilized by Range GETs. Matches the upload_pool SOCKOPT
+	 * callback — shared between upload (emphasizes SO_SNDBUF) and
+	 * download (emphasizes SO_RCVBUF) since both are raised.
+	 */
+	curl_easy_setopt(handle, CURLOPT_SOCKOPTFUNCTION, _upload_sockopt_cb);
+	curl_easy_setopt(handle, CURLOPT_SOCKOPTDATA, NULL);
+
+	/*
+	 * Enable Kernel TLS — kernel offloads AES-GCM record enc/dec.
+	 * Useful on restore Range GET path too since decryption would
+	 * otherwise run on the per-worker thread. Falls back to userspace
+	 * OpenSSL if the kernel refuses the TLS ULP attach.
+	 */
+	curl_easy_setopt(handle, CURLOPT_SSL_CTX_FUNCTION, _upload_ssl_ctx_cb);
 
 	/* Move curl sockets to high fd range to avoid conflicts with restore */
 	curl_easy_setopt(handle, CURLOPT_OPENSOCKETFUNCTION, curl_opensocket_cb);
@@ -798,6 +900,7 @@ static void curl_thread_handle_destructor(void *handle)
 	pthread_t thread_id = pthread_self();
 
 	if (curl_handle) {
+		struct curl_slist *resolve_list = NULL;
 		/* Remove from global thread handle list */
 		pthread_mutex_lock(&g_thread_handles_mutex);
 		pp = &g_thread_handles;
@@ -805,6 +908,7 @@ static void curl_thread_handle_destructor(void *handle)
 			entry = *pp;
 			if (pthread_equal(entry->thread_id, thread_id)) {
 				*pp = entry->next;
+				resolve_list = entry->resolve_list;
 				pr_debug("Thread %lu: Cleaning up thread-local CURL handle (requests: %d)\n",
 					 (unsigned long)thread_id, entry->request_count);
 				free(entry);
@@ -815,6 +919,8 @@ static void curl_thread_handle_destructor(void *handle)
 		pthread_mutex_unlock(&g_thread_handles_mutex);
 
 		curl_easy_cleanup(curl_handle);
+		if (resolve_list)
+			curl_slist_free_all(resolve_list);
 	}
 }
 
@@ -822,6 +928,107 @@ static void curl_thread_handle_destructor(void *handle)
 static void init_curl_thread_key(void)
 {
 	pthread_key_create(&g_curl_thread_key, curl_thread_handle_destructor);
+}
+
+/*
+ * Resolve the S3 host once per process and populate g_s3_ips[]. Safe to
+ * call repeatedly; no-op after the first successful resolution. Uses
+ * the currently configured endpoint URL + bucket to derive the auth host
+ * the same way real PUT/GET requests do.
+ */
+static void _resolve_s3_edge_ips_once(void)
+{
+	struct object_url_info tmp;
+	struct addrinfo hints, *res = NULL, *ai;
+	char port_str[8];
+	char ipbuf[64];
+	int port = 443;
+	int rc, i, distinct = 0;
+
+	pthread_mutex_lock(&g_s3_ips_mutex);
+	if (g_s3_n_ips > 0) {
+		pthread_mutex_unlock(&g_s3_ips_mutex);
+		return;
+	}
+	pthread_mutex_unlock(&g_s3_ips_mutex);
+
+	/* Re-construct URL info to get auth_host + scheme. Key choice is
+	 * arbitrary: the auth host is the same for every key in a session. */
+	if (_construct_object_url("probe", &tmp) != 0)
+		return;
+	if (strncmp(tmp.url, "http://", 7) == 0)
+		port = 80;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	snprintf(port_str, sizeof(port_str), "%d", port);
+
+	rc = getaddrinfo(tmp.auth_host, port_str, &hints, &res);
+	if (rc != 0 || !res) {
+		pr_warn("restore IP pool: getaddrinfo(%s) failed: %s\n",
+			tmp.auth_host, gai_strerror(rc));
+		return;
+	}
+
+	pthread_mutex_lock(&g_s3_ips_mutex);
+	if (g_s3_n_ips == 0) {
+		for (ai = res; ai && distinct < MAX_RESOLVED_IPS; ai = ai->ai_next) {
+			const struct sockaddr_in *sin = (const struct sockaddr_in *)ai->ai_addr;
+			if (!inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf)))
+				continue;
+			for (i = 0; i < distinct; i++) {
+				if (strcmp(g_s3_ips[i], ipbuf) == 0)
+					break;
+			}
+			if (i < distinct)
+				continue;
+			snprintf(g_s3_ips[distinct], sizeof(g_s3_ips[distinct]),
+				 "%s", ipbuf);
+			distinct++;
+		}
+		if (distinct > 0) {
+			snprintf(g_s3_host, sizeof(g_s3_host), "%s", tmp.auth_host);
+			g_s3_port = port;
+			g_s3_n_ips = distinct;
+			pr_info("restore IP pool: resolved %d distinct IPs for %s\n",
+				distinct, tmp.auth_host);
+		}
+	}
+	pthread_mutex_unlock(&g_s3_ips_mutex);
+	freeaddrinfo(res);
+}
+
+/*
+ * Attach a CURLOPT_RESOLVE entry pinning this handle to one of the
+ * resolved S3 edge IPs (round-robin across calls). Returns the
+ * curl_slist (caller frees on handle teardown) or NULL if no pool
+ * available / host unknown. Not fatal to ignore — without the pin,
+ * libcurl uses its own DNS cache and perf degrades to single-edge.
+ */
+static struct curl_slist *_pin_handle_to_s3_edge(CURL *handle)
+{
+	struct curl_slist *list = NULL;
+	char entry[640];
+	const char *chosen_ip = NULL;
+
+	_resolve_s3_edge_ips_once();
+
+	pthread_mutex_lock(&g_s3_ips_mutex);
+	if (g_s3_n_ips > 0 && g_s3_host[0]) {
+		int slot = g_s3_next_slot++ % g_s3_n_ips;
+		chosen_ip = g_s3_ips[slot];
+		snprintf(entry, sizeof(entry), "%s:%d:%s",
+			 g_s3_host, g_s3_port, chosen_ip);
+	}
+	pthread_mutex_unlock(&g_s3_ips_mutex);
+
+	if (chosen_ip) {
+		list = curl_slist_append(NULL, entry);
+		if (list)
+			curl_easy_setopt(handle, CURLOPT_RESOLVE, list);
+	}
+	return list;
 }
 
 /* Get or create thread-local CURL handle */
@@ -862,24 +1069,38 @@ static CURL *get_thread_curl_handle(void)
 	/* Set fixed options for the handle */
 	set_fixed_curl_options(handle);
 
-	/* Store in thread-local storage */
-	pthread_setspecific(g_curl_thread_key, handle);
+	/*
+	 * Pin this thread's handle to one of the resolved S3 edge IPs so
+	 * concurrent workers spread across S3 partitions. Without this,
+	 * every worker resolves the same host via glibc getaddrinfo in
+	 * the same order and ends up on the same IP.
+	 */
+	{
+		struct curl_slist *resolve_list = _pin_handle_to_s3_edge(handle);
 
-	/* Add to global thread handle list for tracking */
-	entry = malloc(sizeof(struct curl_thread_handle));
-	if (entry) {
-		entry->thread_id = thread_id;
-		entry->handle = handle;
-		entry->last_used = time(NULL);
-		entry->request_count = 0;
+		/* Store in thread-local storage */
+		pthread_setspecific(g_curl_thread_key, handle);
 
-		pthread_mutex_lock(&g_thread_handles_mutex);
-		entry->next = g_thread_handles;
-		g_thread_handles = entry;
-		pthread_mutex_unlock(&g_thread_handles_mutex);
+		/* Add to global thread handle list for tracking */
+		entry = malloc(sizeof(struct curl_thread_handle));
+		if (entry) {
+			entry->thread_id = thread_id;
+			entry->handle = handle;
+			entry->resolve_list = resolve_list;
+			entry->last_used = time(NULL);
+			entry->request_count = 0;
 
-		pr_info("Thread TID=%d (pthread_id=%lu): Created new thread-local CURL handle\n", get_thread_id(),
-			(unsigned long)thread_id);
+			pthread_mutex_lock(&g_thread_handles_mutex);
+			entry->next = g_thread_handles;
+			g_thread_handles = entry;
+			pthread_mutex_unlock(&g_thread_handles_mutex);
+
+			pr_info("Thread TID=%d (pthread_id=%lu): Created new thread-local CURL handle\n",
+				get_thread_id(), (unsigned long)thread_id);
+		} else if (resolve_list) {
+			/* Couldn't track entry; free slist ourselves now. */
+			curl_slist_free_all(resolve_list);
+		}
 	}
 
 	return handle;
@@ -1204,14 +1425,8 @@ void object_storage_cleanup(void)
  *
  * Constructs S3 URL, auth host, and canonical URI from object key and options.
  * Shared by fetch_range, put_object, and multipart operations.
+ * (struct object_url_info is forward-declared near the top of the file.)
  */
-struct object_url_info {
-	char url[2048];
-	char auth_host[512];
-	char canonical_uri[2048];
-	char full_object_path[1024];
-};
-
 static int _construct_object_url(const char *object_key, struct object_url_info *info)
 {
 	char normalized_prefix[512];
@@ -1418,8 +1633,8 @@ int object_storage_put_object(const char *object_key, const void *data, unsigned
 	if (_construct_object_url(object_key, &url_info) != 0)
 		return -1;
 
-	/* Compute SHA256 of the body */
-	_sha256_hex((const char *)data, length, content_sha256);
+	/* Compute body hash (or UNSIGNED-PAYLOAD marker). */
+	_payload_hash(data, length, content_sha256);
 
 	/* Get curl handle */
 	curl_handle = _get_curl_handle();
@@ -1588,7 +1803,7 @@ int object_storage_multipart_upload_part(const char *object_key, const char *upl
 	snprintf(query_string, sizeof(query_string), "partNumber=%d&uploadId=%s",
 		 part_num, upload_id);
 
-	_sha256_hex((const char *)data, length, content_sha256);
+	_payload_hash(data, length, content_sha256);
 
 	curl_handle = _get_curl_handle();
 	if (!curl_handle)
@@ -1663,6 +1878,983 @@ int object_storage_multipart_upload_part(const char *object_key, const char *upl
 	return 0;
 }
 
+/* ============================================================
+ * Parallel multipart upload pool (CURLM single-thread N in-flight)
+ *
+ * The serial object_storage_multipart_upload_part() above does one
+ * synchronous PUT per part (~45 MB/s on m5.8xlarge at 8 MB parts). This
+ * pool keeps N handles in flight via a single CURLM, reaching aws-s3-cp-
+ * class throughput (~400 MB/s) without introducing any pthreads (which
+ * previously destabilised the parasite RPC socket). The dump thread calls
+ * upload_pool_submit() per part, which blocks only when max_in_flight is
+ * hit; otherwise it returns immediately and the dump continues while the
+ * PUT runs in the background via curl_multi.
+ *
+ * Memory: N × (8 MB part buffer + curl handle + headers) ≈ 33 MB for
+ * N=4. No full-dump buffering — streaming is preserved.
+ * ============================================================
+ */
+
+#include "../include/upload_pool.h"
+
+/*
+ * Scatter-gather read context for upload_pool. A slot's body can be
+ * either one contiguous heap buffer (legacy `data`/`len` fields + the
+ * shared struct UploadContext) or a vector of heap-owned chunks that
+ * libcurl reads through without the pool having to memcpy them into a
+ * single buffer. The compressed dump path uses the vector form so the
+ * per-frame compressed output produced by the compress workers is fed
+ * directly into libcurl — no intermediate part_buf memcpy.
+ *
+ * struct upload_sg_chunk is defined in upload_pool.h so callers can
+ * build the chunk array directly; the pool takes ownership of both
+ * the array and each chunk's heap data pointer.
+ */
+
+struct upload_sg_ctx {
+	const struct upload_sg_chunk *chunks;
+	int n_chunks;
+	int cur_chunk;
+	size_t cur_off;    /* offset inside chunks[cur_chunk] */
+	size_t total_len;  /* sum of chunk lens */
+	size_t total_read; /* bytes already fed to libcurl */
+};
+
+struct upload_pool_slot {
+	CURL *handle;
+	int part_num;               /* 1-based */
+	void *data;                 /* contiguous body — owned by pool (xfree on reset) */
+	size_t len;                 /* contiguous body length */
+	struct upload_sg_chunk *sg_chunks;  /* scatter-gather body (owned); NULL if using contiguous */
+	int sg_n_chunks;
+	struct UploadContext ctx;        /* used when sg_chunks == NULL */
+	struct upload_sg_ctx sg_ctx;     /* used when sg_chunks != NULL */
+	struct MemoryStruct response;
+	struct MemoryStruct header;
+	struct curl_slist *headers;
+	struct curl_slist *resolve_list; /* CURLOPT_RESOLVE entry pinning host->ip */
+	int in_flight;              /* 1 = added to multi, 0 = free */
+	char *full_url;             /* heap-allocated per request */
+};
+
+static size_t _upload_sg_read_callback(char *ptr, size_t size, size_t nmemb, void *userdata)
+{
+	struct upload_sg_ctx *ctx = (struct upload_sg_ctx *)userdata;
+	size_t want = size * nmemb;
+	size_t written = 0;
+
+	while (want > 0 && ctx->cur_chunk < ctx->n_chunks) {
+		const struct upload_sg_chunk *c = &ctx->chunks[ctx->cur_chunk];
+		size_t remaining = c->len - ctx->cur_off;
+		size_t n = want < remaining ? want : remaining;
+		if (n == 0) {
+			ctx->cur_chunk++;
+			ctx->cur_off = 0;
+			continue;
+		}
+		memcpy(ptr + written, (const char *)c->data + ctx->cur_off, n);
+		ctx->cur_off += n;
+		ctx->total_read += n;
+		written += n;
+		want -= n;
+		if (ctx->cur_off >= c->len) {
+			ctx->cur_chunk++;
+			ctx->cur_off = 0;
+		}
+	}
+	return written;
+}
+
+struct upload_pool {
+	CURLM *multi;
+	/*
+	 * Event-driven pumping (libcurl socket_action model).
+	 * - epfd: epoll fd we register libcurl's managed sockets against.
+	 * - curl_timeout_ms: last timeout requested by libcurl's TIMERFUNCTION
+	 *   callback; -1 = no active timer, 0 = fire immediately.
+	 * - still_running: #handles libcurl reports as not-yet-finished (stored
+	 *   here because socket_action() sets it via out-param).
+	 *
+	 * Replaces the earlier curl_multi_perform + curl_multi_poll loop which
+	 * is O(N) per iteration. Evented scales to hundreds of concurrent
+	 * PUTs with O(1) per-event cost, matching CRT's architecture.
+	 */
+	int epfd;
+	long curl_timeout_ms;
+	int still_running;
+
+	char *key;                  /* strdup'd */
+	char *upload_id;            /* strdup'd */
+	int max_slots;
+	struct upload_pool_slot *slots;
+
+	/*
+	 * Pre-resolved S3 edge IPs. S3 DNS returns ~8 different A records
+	 * per lookup and rotates them; libcurl's per-handle DNS cache would
+	 * otherwise pin every slot to whichever IP won the first resolve.
+	 * We spread slots across discovered IPs to engage multiple S3 front-
+	 * end partitions and raise aggregate throughput beyond per-edge
+	 * bandwidth limits. Empty if resolution failed; slots then fall
+	 * back to libcurl's default DNS path.
+	 */
+	char *host;                 /* e.g. bucket.s3.us-west-2.amazonaws.com */
+	int port;                   /* 443 or 80 */
+	char (*ips)[64];            /* each slot's pinned IP, len=max_slots */
+	int n_ips;                  /* number of distinct IPs discovered */
+
+	/* Ordered ETag array indexed by part_num-1. Grown as parts land. */
+	char **etags;
+	int etags_cap;
+	int n_parts;                /* max part_num seen */
+	int failed_part_num;        /* 0 = no failure */
+};
+
+/*
+ * (a) TCP buffer tuning. libcurl defaults SO_SNDBUF to ~208 KB on Linux,
+ * which caps throughput over long-haul TCP BDPs. Bump to 4 MB so we can
+ * keep the pipe full across higher RTT (AZ↔S3 is ~1-2 ms, PUT with 8 MB
+ * parts needs >1 MB window to saturate). Also bump SO_RCVBUF (less
+ * important for PUT but helps headers).
+ */
+static int _upload_sockopt_cb(void *clientp, curl_socket_t sockfd,
+			      curlsocktype purpose)
+{
+	int sndbuf = 4 * 1024 * 1024;
+	int rcvbuf = 2 * 1024 * 1024;
+	(void)clientp;
+	(void)purpose;
+	setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+	setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+	return CURL_SOCKOPT_OK;
+}
+
+/*
+ * Kernel TLS (kTLS) enablement via OpenSSL's SSL_OP_ENABLE_KTLS.
+ *
+ * Once the TLS handshake finishes, OpenSSL asks the kernel to attach
+ * the TLS_ULP to the socket and offloads record encryption/decryption
+ * there. For large-object multipart PUT (our workload) this eliminates
+ * per-record AES-GCM + HMAC work in the userspace OpenSSL thread, which
+ * is otherwise serialized across all concurrent slots sharing the
+ * event-driven main thread.
+ *
+ * Requirements (all met on modern cloud hosts):
+ *   - OpenSSL 3.0+ built with kTLS support
+ *   - Linux kernel 4.17+ (we use 6.x)
+ *   - TLS ULP kernel module available (/lib/modules/.../net/tls/tls.ko)
+ *   - Cipher suite with kernel kTLS support (AES-GCM-*, ChaCha20-Poly1305)
+ *
+ * Falls back gracefully: if the kernel refuses the ULP attach, OpenSSL
+ * keeps doing record processing in userspace — no runtime error, just
+ * no speedup. Safe to enable unconditionally.
+ */
+static CURLcode _upload_ssl_ctx_cb(CURL *curl, void *sslctx, void *parm)
+{
+	SSL_CTX *ctx = sslctx;
+	(void)curl;
+	(void)parm;
+	SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
+	return CURLE_OK;
+}
+
+/*
+ * (b) Resolve the S3 endpoint host to a list of edge IPs so each slot
+ * can be pinned to a different IP via CURLOPT_RESOLVE. This defeats
+ * libcurl's connection reuse collapsing all slots onto the first-
+ * resolved IP. S3 applies per-prefix-per-IP rate shaping, so spreading
+ * across IPs lets us exceed the single-edge bandwidth cap.
+ *
+ * Returns 0 on success. On failure pool->n_ips stays 0 and slots fall
+ * back to default DNS (correctness preserved, perf loss only).
+ */
+static int _pool_resolve_ips(struct upload_pool *p, const char *host, int port)
+{
+	struct addrinfo hints, *res = NULL, *ai;
+	char port_str[8];
+	char ipbuf[64];
+	int rc, i, n;
+	int distinct;
+
+	p->n_ips = 0;
+	if (!host || !host[0])
+		return -1;
+
+	p->host = xstrdup(host);
+	p->port = port;
+	p->ips = xzalloc(p->max_slots * sizeof(*p->ips));
+	if (!p->host || !p->ips)
+		return -1;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	snprintf(port_str, sizeof(port_str), "%d", port);
+
+	rc = getaddrinfo(host, port_str, &hints, &res);
+	if (rc != 0 || !res) {
+		pr_warn("upload_pool: getaddrinfo(%s) failed: %s\n",
+			host, gai_strerror(rc));
+		return -1;
+	}
+
+	/* Collect up to max_slots distinct IPv4 IPs. */
+	distinct = 0;
+	for (ai = res; ai && distinct < p->max_slots; ai = ai->ai_next) {
+		const struct sockaddr_in *sin = (const struct sockaddr_in *)ai->ai_addr;
+		if (!inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf)))
+			continue;
+		/* Dedup against already-collected IPs */
+		for (i = 0; i < distinct; i++) {
+			if (strcmp(p->ips[i], ipbuf) == 0)
+				break;
+		}
+		if (i < distinct)
+			continue;
+		snprintf(p->ips[distinct], sizeof(p->ips[distinct]), "%s", ipbuf);
+		distinct++;
+	}
+	freeaddrinfo(res);
+
+	if (distinct == 0) {
+		pr_warn("upload_pool: no IPs resolved for %s\n", host);
+		return -1;
+	}
+
+	/*
+	 * If we got fewer distinct IPs than slots (common — S3 typically
+	 * returns 8), cycle through them. Each slot still stays pinned to
+	 * one IP but multiple slots may share it; with 8 IPs and 8 slots
+	 * this is 1:1 already.
+	 */
+	n = distinct;
+	for (i = distinct; i < p->max_slots; i++) {
+		char tmp[64];
+		memcpy(tmp, p->ips[i % n], sizeof(tmp));
+		memcpy(p->ips[i], tmp, sizeof(tmp));
+	}
+	p->n_ips = distinct;
+	pr_info("upload_pool: resolved %d distinct IPs for %s (slots=%d)\n",
+		distinct, host, p->max_slots);
+	return 0;
+}
+
+/* Grow etag array to at least `need` entries (values init to NULL). */
+static int _etags_reserve(struct upload_pool *p, int need)
+{
+	char **nt;
+	int cap;
+	if (need <= p->etags_cap)
+		return 0;
+	cap = p->etags_cap ? p->etags_cap : 32;
+	while (cap < need)
+		cap *= 2;
+	nt = xrealloc(p->etags, cap * sizeof(*nt));
+	if (!nt)
+		return -1;
+	memset(nt + p->etags_cap, 0, (cap - p->etags_cap) * sizeof(*nt));
+	p->etags = nt;
+	p->etags_cap = cap;
+	return 0;
+}
+
+/* Extract "ETag: ..." value into out. Returns 0 on success. */
+static int _parse_etag_header(const char *hdr_buf, char *out, size_t out_len)
+{
+	const char *p = strcasestr(hdr_buf, "ETag:");
+	size_t i;
+	if (!p)
+		return -1;
+	p += 5;
+	while (*p == ' ' || *p == '\t')
+		p++;
+	for (i = 0; p[i] && p[i] != '\r' && p[i] != '\n' && i < out_len - 1; i++)
+		out[i] = p[i];
+	out[i] = '\0';
+	return 0;
+}
+
+/* Release slot resources (headers, buffers, data, url). Does not touch
+ * the curl handle itself (reused across calls). */
+static void _slot_reset(struct upload_pool_slot *s)
+{
+	if (s->resolve_list) {
+		curl_slist_free_all(s->resolve_list);
+		s->resolve_list = NULL;
+	}
+	if (s->headers) {
+		curl_slist_free_all(s->headers);
+		s->headers = NULL;
+	}
+	free(s->response.memory); s->response.memory = NULL;
+	s->response.size = 0; s->response.capacity = 0;
+	free(s->header.memory); s->header.memory = NULL;
+	s->header.size = 0; s->header.capacity = 0;
+	free(s->full_url); s->full_url = NULL;
+	if (s->data) {
+		free(s->data);
+		s->data = NULL;
+	}
+	s->len = 0;
+	if (s->sg_chunks) {
+		int i;
+		for (i = 0; i < s->sg_n_chunks; i++) {
+			if (s->sg_chunks[i].data)
+				free(s->sg_chunks[i].data);
+		}
+		free(s->sg_chunks);
+		s->sg_chunks = NULL;
+		s->sg_n_chunks = 0;
+	}
+	s->part_num = 0;
+	s->in_flight = 0;
+}
+
+/*
+ * Common handle setup — either feed a contiguous `data` buffer (chunks==NULL)
+ * or a scatter-gather list of chunks (chunks != NULL, total_len is the sum of
+ * chunk lens). For the SG path the slot takes ownership of the chunks array
+ * AND each chunk's `data` pointer (xfree()d via _slot_reset). For the
+ * contiguous path, slot->data = data (xfree()d via _slot_reset).
+ */
+static int _slot_prepare_put_common(struct upload_pool *p,
+				    struct upload_pool_slot *s,
+				    int part_num,
+				    void *data, size_t len,
+				    struct upload_sg_chunk *chunks,
+				    int n_chunks, size_t total_len)
+{
+	struct object_url_info url_info;
+	char query_string[512];
+	char content_sha256[65];
+	char *url;
+	size_t body_len;
+
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+	if (_construct_object_url(p->key, &url_info) != 0)
+		return -1;
+
+	url = xmalloc(2400);
+	if (!url)
+		return -1;
+	snprintf(url, 2400, "%s?partNumber=%d&uploadId=%s",
+		 url_info.url, part_num, p->upload_id);
+	snprintf(query_string, sizeof(query_string),
+		 "partNumber=%d&uploadId=%s", part_num, p->upload_id);
+
+	if (chunks) {
+		/*
+		 * UNSIGNED-PAYLOAD default makes SigV4 independent of body
+		 * bytes; if opts.sign_payload is on, we'd need to SHA256
+		 * across the entire chunk list (linear scan) to reconstruct
+		 * the canonical hash. We emit a warning and fall back to
+		 * UNSIGNED for this single request — callers doing scatter-
+		 * gather are in the performance path and explicit sign is
+		 * incompatible with the zero-memcpy goal.
+		 */
+		if (opts.sign_payload)
+			pr_warn("sign-payload + scatter-gather: forcing UNSIGNED-PAYLOAD for part %d\n",
+				part_num);
+		memcpy(content_sha256, "UNSIGNED-PAYLOAD", 17);
+		body_len = total_len;
+	} else {
+		_payload_hash(data, len, content_sha256);
+		body_len = len;
+	}
+
+	s->part_num = part_num;
+	if (chunks) {
+		s->data = NULL;
+		s->len = 0;
+		s->sg_chunks = chunks;
+		s->sg_n_chunks = n_chunks;
+		s->sg_ctx.chunks = chunks;
+		s->sg_ctx.n_chunks = n_chunks;
+		s->sg_ctx.cur_chunk = 0;
+		s->sg_ctx.cur_off = 0;
+		s->sg_ctx.total_len = total_len;
+		s->sg_ctx.total_read = 0;
+	} else {
+		s->data = data;
+		s->len = len;
+		s->sg_chunks = NULL;
+		s->sg_n_chunks = 0;
+		s->ctx.data = data;
+		s->ctx.size = len;
+		s->ctx.offset = 0;
+	}
+
+	s->response.memory = xmalloc(1);
+	s->response.size = 0;
+	s->response.capacity = 0;
+	s->header.memory = xmalloc(1);
+	s->header.size = 0;
+	s->header.capacity = 0;
+	s->full_url = url;
+
+	if (!s->handle) {
+		s->handle = curl_easy_init();
+		if (!s->handle)
+			goto fail;
+	} else {
+		curl_easy_reset(s->handle);
+	}
+
+	curl_easy_setopt(s->handle, CURLOPT_URL, s->full_url);
+	curl_easy_setopt(s->handle, CURLOPT_UPLOAD, 1L);
+	if (chunks) {
+		curl_easy_setopt(s->handle, CURLOPT_READFUNCTION, _upload_sg_read_callback);
+		curl_easy_setopt(s->handle, CURLOPT_READDATA, &s->sg_ctx);
+	} else {
+		curl_easy_setopt(s->handle, CURLOPT_READFUNCTION, _upload_read_callback);
+		curl_easy_setopt(s->handle, CURLOPT_READDATA, &s->ctx);
+	}
+	curl_easy_setopt(s->handle, CURLOPT_INFILESIZE_LARGE, (curl_off_t)body_len);
+	curl_easy_setopt(s->handle, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(s->handle, CURLOPT_WRITEDATA, &s->response);
+	curl_easy_setopt(s->handle, CURLOPT_HEADERFUNCTION, write_callback);
+	curl_easy_setopt(s->handle, CURLOPT_HEADERDATA, &s->header);
+	curl_easy_setopt(s->handle, CURLOPT_TCP_KEEPALIVE, 1L);
+	curl_easy_setopt(s->handle, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(s->handle, CURLOPT_PRIVATE, s);
+
+	/*
+	 * Larger upload read buffer: default 64 KB causes 128 read
+	 * callbacks per 8 MB part. 1 MB drops this to 8 callbacks and
+	 * lets libcurl pipe bigger chunks into the kernel socket buffer
+	 * in one go. AWS CRT uses ~1 MB for the same reason.
+	 */
+	curl_easy_setopt(s->handle, CURLOPT_UPLOAD_BUFFERSIZE,
+			 1024L * 1024L);
+
+	/*
+	 * TCP_NODELAY: disable Nagle. libcurl turns it on by default since
+	 * 7.50 but being explicit guards against build-time defaults.
+	 */
+	curl_easy_setopt(s->handle, CURLOPT_TCP_NODELAY, 1L);
+
+	/* (a) Bigger TCP buffers for long-haul EC2↔S3 BDP. */
+	curl_easy_setopt(s->handle, CURLOPT_SOCKOPTFUNCTION, _upload_sockopt_cb);
+	curl_easy_setopt(s->handle, CURLOPT_SOCKOPTDATA, NULL);
+
+	/* Enable Kernel TLS for AES-GCM offload of record encryption. */
+	curl_easy_setopt(s->handle, CURLOPT_SSL_CTX_FUNCTION,
+			 _upload_ssl_ctx_cb);
+
+	/*
+	 * (b) Pin this slot to its assigned S3 edge IP so the pool spreads
+	 * load across multiple edges. Without this, libcurl's per-handle
+	 * DNS cache locks each handle to whichever IP it first resolved,
+	 * typically the same one across all handles since glibc's resolver
+	 * isn't guaranteed to rotate.
+	 */
+	if (p->n_ips > 0 && p->host) {
+		int idx = (int)(s - p->slots);
+		char resolve_entry[192];
+		if (idx >= 0 && idx < p->max_slots && p->ips[idx][0]) {
+			snprintf(resolve_entry, sizeof(resolve_entry),
+				 "%s:%d:%s", p->host, p->port, p->ips[idx]);
+			s->resolve_list = curl_slist_append(NULL, resolve_entry);
+			if (s->resolve_list)
+				curl_easy_setopt(s->handle, CURLOPT_RESOLVE,
+						 s->resolve_list);
+		}
+	}
+
+	if (_build_auth_headers("PUT", url_info.auth_host, url_info.canonical_uri,
+				query_string, content_sha256, NULL,
+				(long)body_len,
+				&s->headers) != 0)
+		goto fail;
+	if (s->headers)
+		curl_easy_setopt(s->handle, CURLOPT_HTTPHEADER, s->headers);
+
+	return 0;
+fail:
+	_slot_reset(s);
+	return -1;
+}
+
+/* Contiguous-body variant (legacy path). */
+static int _slot_prepare_put(struct upload_pool *p, struct upload_pool_slot *s,
+			     int part_num, void *data, size_t len)
+{
+	return _slot_prepare_put_common(p, s, part_num, data, len, NULL, 0, 0);
+}
+
+/* Scatter-gather body variant. Slot takes ownership of chunks + chunks[i].data. */
+static int _slot_prepare_put_sg(struct upload_pool *p, struct upload_pool_slot *s,
+				int part_num,
+				struct upload_sg_chunk *chunks,
+				int n_chunks, size_t total_len)
+{
+	return _slot_prepare_put_common(p, s, part_num, NULL, 0,
+					chunks, n_chunks, total_len);
+}
+
+/* Process any completed transfers. Returns number of slots freed. */
+static int _pool_drain_completions(struct upload_pool *p)
+{
+	int msgs_left = 0;
+	int freed = 0;
+	CURLMsg *msg;
+	struct upload_pool_slot *s;
+	long http_code;
+	CURLcode res;
+	char etag[256];
+
+	while ((msg = curl_multi_info_read(p->multi, &msgs_left)) != NULL) {
+		if (msg->msg != CURLMSG_DONE)
+			continue;
+
+		s = NULL;
+		curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &s);
+		if (!s) {
+			pr_err("upload_pool: CURLINFO_PRIVATE unset on complete\n");
+			continue;
+		}
+
+		http_code = 0;
+		curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE, &http_code);
+		res = msg->data.result;
+
+		curl_multi_remove_handle(p->multi, msg->easy_handle);
+
+		if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+			pr_err("upload_pool: part %d failed curl=%s http=%ld\n",
+			       s->part_num, curl_easy_strerror(res), http_code);
+			p->failed_part_num = s->part_num;
+		} else if (_parse_etag_header(s->header.memory, etag, sizeof(etag)) != 0) {
+			pr_err("upload_pool: part %d missing ETag\n", s->part_num);
+			p->failed_part_num = s->part_num;
+		} else if (_etags_reserve(p, s->part_num) != 0) {
+			p->failed_part_num = s->part_num;
+		} else {
+			free(p->etags[s->part_num - 1]);
+			p->etags[s->part_num - 1] = xstrdup(etag);
+			if (s->part_num > p->n_parts)
+				p->n_parts = s->part_num;
+		}
+
+		_slot_reset(s);
+		freed++;
+	}
+	return freed;
+}
+
+/* -------- Evented pumping (libcurl socket_action model) -------- */
+
+/*
+ * libcurl calls this whenever the set of sockets it cares about
+ * changes. We mirror that into our epoll fd. sockp (the per-socket
+ * user pointer settable via curl_multi_assign) is used as a tri-state
+ * "tracked/untracked" marker so we know when to ADD vs MOD vs DEL.
+ */
+static int _pool_socket_cb(CURL *easy, curl_socket_t s, int what,
+			   void *userp, void *sockp)
+{
+	struct upload_pool *p = userp;
+	struct epoll_event ev;
+	int op;
+	(void)easy;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.data.fd = s;
+
+	if (what == CURL_POLL_REMOVE) {
+		if (sockp) {
+			epoll_ctl(p->epfd, EPOLL_CTL_DEL, s, NULL);
+			curl_multi_assign(p->multi, s, NULL);
+		}
+		return 0;
+	}
+
+	if (what == CURL_POLL_IN)     ev.events = EPOLLIN;
+	if (what == CURL_POLL_OUT)    ev.events = EPOLLOUT;
+	if (what == CURL_POLL_INOUT)  ev.events = EPOLLIN | EPOLLOUT;
+
+	op = sockp ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+	if (epoll_ctl(p->epfd, op, s, &ev) < 0 && errno == EEXIST)
+		epoll_ctl(p->epfd, EPOLL_CTL_MOD, s, &ev);
+	if (!sockp)
+		curl_multi_assign(p->multi, s, p);  /* non-NULL = tracked */
+	return 0;
+}
+
+static int _pool_timer_cb(CURLM *multi, long timeout_ms, void *userp)
+{
+	struct upload_pool *p = userp;
+	(void)multi;
+	p->curl_timeout_ms = timeout_ms;
+	return 0;
+}
+
+/*
+ * One epoll_wait pass + corresponding curl_multi_socket_action calls.
+ * max_wait_ms is bounded below by curl's timer request and above by the
+ * caller's patience. Returns the running-handle count (stored into
+ * pool->still_running as well) or -1 on fatal epoll error.
+ */
+static int _pool_pump_events(struct upload_pool *p, int max_wait_ms)
+{
+	struct epoll_event events[64];
+	int nevents;
+	int i;
+	long wait_ms;
+
+	/*
+	 * Pick the shorter of curl's requested timer and the caller's max.
+	 * -1 in curl_timeout_ms means "no timer" → respect caller's cap.
+	 * 0 means "fire now" → don't block.
+	 */
+	wait_ms = (p->curl_timeout_ms < 0) ? max_wait_ms
+		: (p->curl_timeout_ms < max_wait_ms ? p->curl_timeout_ms
+						    : max_wait_ms);
+	if (wait_ms < 0)
+		wait_ms = 0;
+
+	nevents = epoll_wait(p->epfd, events, 64, (int)wait_ms);
+	if (nevents < 0) {
+		if (errno == EINTR)
+			return p->still_running;
+		pr_perror("upload_pool: epoll_wait");
+		return -1;
+	}
+
+	if (nevents == 0) {
+		/* Timer expired — let libcurl advance timer-driven state. */
+		curl_multi_socket_action(p->multi, CURL_SOCKET_TIMEOUT, 0,
+					 &p->still_running);
+	} else {
+		for (i = 0; i < nevents; i++) {
+			int evmask = 0;
+			if (events[i].events & EPOLLIN)
+				evmask |= CURL_CSELECT_IN;
+			if (events[i].events & EPOLLOUT)
+				evmask |= CURL_CSELECT_OUT;
+			if (events[i].events & (EPOLLERR | EPOLLHUP))
+				evmask |= CURL_CSELECT_ERR;
+			curl_multi_socket_action(p->multi, events[i].data.fd,
+						 evmask, &p->still_running);
+		}
+	}
+
+	_pool_drain_completions(p);
+	return p->still_running;
+}
+
+/*
+ * Pump events until at least one upload slot is free. Replaces the old
+ * curl_multi_perform + curl_multi_poll loop with an evented variant
+ * backed by epoll. O(1) per-event cost vs O(N) per iteration before.
+ */
+static int _pool_wait_any_slot(struct upload_pool *p)
+{
+	int found_free;
+	int i;
+
+	for (;;) {
+		found_free = 0;
+		for (i = 0; i < p->max_slots; i++) {
+			if (!p->slots[i].in_flight) {
+				found_free = 1;
+				break;
+			}
+		}
+		if (found_free)
+			return 0;
+
+		if (_pool_pump_events(p, 200) < 0)
+			return -1;
+		if (p->failed_part_num)
+			return -1;
+	}
+}
+
+struct upload_pool *upload_pool_create(const char *object_key,
+				       const char *upload_id,
+				       int max_in_flight)
+{
+	struct upload_pool *p;
+
+	if (max_in_flight < 1)
+		max_in_flight = 1;
+	/*
+	 * Evented backend supports up to ~255 connections (same as CRT's
+	 * default cap). Raising our legacy cap from 32 to 256 now that
+	 * curl_multi_perform's O(N) scan is replaced by epoll-driven
+	 * socket_action (O(1) per ready fd).
+	 */
+	if (max_in_flight > 256)
+		max_in_flight = 256;
+
+	p = xzalloc(sizeof(*p));
+	if (!p)
+		return NULL;
+
+	p->epfd = epoll_create1(EPOLL_CLOEXEC);
+	if (p->epfd < 0) {
+		pr_perror("upload_pool: epoll_create1");
+		free(p);
+		return NULL;
+	}
+	p->curl_timeout_ms = -1;
+	p->still_running = 0;
+
+	p->multi = curl_multi_init();
+	if (!p->multi) {
+		close(p->epfd);
+		free(p);
+		return NULL;
+	}
+
+	/* Register evented callbacks. Must happen before first add_handle. */
+	curl_multi_setopt(p->multi, CURLMOPT_SOCKETFUNCTION, _pool_socket_cb);
+	curl_multi_setopt(p->multi, CURLMOPT_SOCKETDATA, p);
+	curl_multi_setopt(p->multi, CURLMOPT_TIMERFUNCTION, _pool_timer_cb);
+	curl_multi_setopt(p->multi, CURLMOPT_TIMERDATA, p);
+
+	p->key = xstrdup(object_key);
+	p->upload_id = xstrdup(upload_id);
+	p->max_slots = max_in_flight;
+	p->slots = xzalloc(max_in_flight * sizeof(*p->slots));
+	if (!p->key || !p->upload_id || !p->slots) {
+		curl_multi_cleanup(p->multi);
+		close(p->epfd);
+		free(p->key);
+		free(p->upload_id);
+		free(p->slots);
+		free(p);
+		return NULL;
+	}
+
+	/*
+	 * (b) Pre-resolve S3 endpoint IPs so slots can pin to different
+	 * edges. Compute the auth_host the same way a per-request URL would
+	 * (virtual-hosted vs path-style, express_one_zone). Failure is
+	 * non-fatal; slots fall back to default DNS with only (a) gains.
+	 */
+	{
+		struct object_url_info tmp;
+		const char *scheme_end;
+		int port = 443;
+		/* Re-construct URL info for this key just to get auth_host + scheme. */
+		if (_construct_object_url(object_key, &tmp) == 0) {
+			/* Scheme: check full URL for http:// vs https:// */
+			scheme_end = tmp.url;
+			if (strncmp(scheme_end, "http://", 7) == 0)
+				port = 80;
+			else
+				port = 443;
+			(void)_pool_resolve_ips(p, tmp.auth_host, port);
+		}
+	}
+
+	pr_info("upload_pool: created key=%s max_in_flight=%d\n",
+		object_key, max_in_flight);
+	return p;
+}
+
+int upload_pool_submit(struct upload_pool *pool, int part_num,
+		       void *data, size_t len)
+{
+	struct upload_pool_slot *s = NULL;
+	int i;
+
+	if (!pool || !data || len == 0 || part_num < 1)
+		return -1;
+	if (pool->failed_part_num)
+		return -1;
+
+	/* Drive any pending completions non-blockingly before picking a slot. */
+	if (_pool_pump_events(pool, 0) < 0)
+		return -1;
+	if (pool->failed_part_num)
+		return -1;
+
+	/* Find a free slot; if all busy, wait. */
+	for (i = 0; i < pool->max_slots; i++) {
+		if (!pool->slots[i].in_flight) {
+			s = &pool->slots[i];
+			break;
+		}
+	}
+	if (!s) {
+		if (_pool_wait_any_slot(pool) != 0)
+			return -1;
+		for (i = 0; i < pool->max_slots; i++) {
+			if (!pool->slots[i].in_flight) {
+				s = &pool->slots[i];
+				break;
+			}
+		}
+		if (!s)
+			return -1;
+	}
+
+	if (_slot_prepare_put(pool, s, part_num, data, len) != 0)
+		return -1;
+
+	if (curl_multi_add_handle(pool->multi, s->handle) != CURLM_OK) {
+		_slot_reset(s);
+		return -1;
+	}
+	s->in_flight = 1;
+	/* Kick the event loop so the new handle starts transferring ASAP. */
+	curl_multi_socket_action(pool->multi, CURL_SOCKET_TIMEOUT, 0,
+				 &pool->still_running);
+	return 0;
+}
+
+int upload_pool_submit_sg(struct upload_pool *pool, int part_num,
+			  struct upload_sg_chunk *chunks, int n_chunks,
+			  size_t total_len)
+{
+	struct upload_pool_slot *s = NULL;
+	int i;
+
+	if (!pool || !chunks || n_chunks <= 0 || total_len == 0 || part_num < 1) {
+		/* Free chunks on invalid args so caller's ownership-transfer
+		 * semantics are honored unconditionally. */
+		if (chunks) {
+			for (i = 0; i < n_chunks; i++) {
+				if (chunks[i].data)
+					free(chunks[i].data);
+			}
+			free(chunks);
+		}
+		return -1;
+	}
+	if (pool->failed_part_num) {
+		for (i = 0; i < n_chunks; i++) {
+			if (chunks[i].data)
+				free(chunks[i].data);
+		}
+		free(chunks);
+		return -1;
+	}
+
+	if (_pool_pump_events(pool, 0) < 0 || pool->failed_part_num) {
+		for (i = 0; i < n_chunks; i++) {
+			if (chunks[i].data)
+				free(chunks[i].data);
+		}
+		free(chunks);
+		return -1;
+	}
+
+	for (i = 0; i < pool->max_slots; i++) {
+		if (!pool->slots[i].in_flight) {
+			s = &pool->slots[i];
+			break;
+		}
+	}
+	if (!s) {
+		if (_pool_wait_any_slot(pool) != 0) {
+			for (i = 0; i < n_chunks; i++) {
+				if (chunks[i].data)
+					free(chunks[i].data);
+			}
+			free(chunks);
+			return -1;
+		}
+		for (i = 0; i < pool->max_slots; i++) {
+			if (!pool->slots[i].in_flight) {
+				s = &pool->slots[i];
+				break;
+			}
+		}
+		if (!s) {
+			for (i = 0; i < n_chunks; i++) {
+				if (chunks[i].data)
+					free(chunks[i].data);
+			}
+			free(chunks);
+			return -1;
+		}
+	}
+
+	if (_slot_prepare_put_sg(pool, s, part_num, chunks, n_chunks,
+				 total_len) != 0)
+		return -1;  /* _slot_reset inside common path frees chunks */
+
+	if (curl_multi_add_handle(pool->multi, s->handle) != CURLM_OK) {
+		_slot_reset(s);
+		return -1;
+	}
+	s->in_flight = 1;
+	curl_multi_socket_action(pool->multi, CURL_SOCKET_TIMEOUT, 0,
+				 &pool->still_running);
+	return 0;
+}
+
+int upload_pool_wait(struct upload_pool *pool, int *failed_part_num)
+{
+	int i;
+
+	if (!pool)
+		return -1;
+
+	/* Kick the event loop in case nothing is pumping (e.g., submit
+	 * was followed immediately by wait with no intervening I/O). */
+	curl_multi_socket_action(pool->multi, CURL_SOCKET_TIMEOUT, 0,
+				 &pool->still_running);
+	_pool_drain_completions(pool);
+
+	while (pool->still_running > 0 && !pool->failed_part_num) {
+		if (_pool_pump_events(pool, 500) < 0)
+			break;
+	}
+
+	/* Defensive: ensure every slot cleaned. */
+	for (i = 0; i < pool->max_slots; i++)
+		if (pool->slots[i].in_flight)
+			_slot_reset(&pool->slots[i]);
+
+	if (pool->failed_part_num) {
+		if (failed_part_num)
+			*failed_part_num = pool->failed_part_num;
+		return -1;
+	}
+	return 0;
+}
+
+int upload_pool_get_etags(struct upload_pool *pool,
+			  const char ***etags_out, int *n_parts_out)
+{
+	if (!pool || !etags_out || !n_parts_out)
+		return -1;
+	*etags_out = (const char **)pool->etags;
+	*n_parts_out = pool->n_parts;
+	return 0;
+}
+
+void upload_pool_destroy(struct upload_pool *pool)
+{
+	int i;
+	if (!pool)
+		return;
+	for (i = 0; i < pool->max_slots; i++) {
+		if (pool->slots[i].handle)
+			curl_easy_cleanup(pool->slots[i].handle);
+		_slot_reset(&pool->slots[i]);
+	}
+	for (i = 0; i < pool->etags_cap; i++)
+		free(pool->etags[i]);
+	free(pool->etags);
+	free(pool->slots);
+	curl_multi_cleanup(pool->multi);
+	if (pool->epfd >= 0)
+		close(pool->epfd);
+	free(pool->key);
+	free(pool->upload_id);
+	free(pool->host);
+	free(pool->ips);
+	free(pool);
+}
+
 int object_storage_multipart_complete(const char *object_key, const char *upload_id,
 				      int n_parts, const char **etags)
 {
@@ -1710,7 +2902,7 @@ int object_storage_multipart_complete(const char *object_key, const char *upload
 			    "</CompleteMultipartUpload>");
 	xml_len = xml_pos;
 
-	_sha256_hex(xml_body, xml_len, content_sha256);
+	_payload_hash(xml_body, xml_len, content_sha256);
 
 	curl_handle = _get_curl_handle();
 	if (!curl_handle) {
@@ -1904,6 +3096,84 @@ int object_storage_get_object(const char *object_key, void **out_data, unsigned 
 	pr_debug("GET %s: %lu bytes (HTTP %ld)\n", object_key, (unsigned long)chunk.size, http_code);
 	*out_data = chunk.memory;
 	*out_length = chunk.size;
+	return 0;
+}
+
+/*
+ * =================================================================================
+ * HEAD Object — fetch only the Content-Length, no body.
+ *
+ * Replaces the geometric Range-GET probe that restore-side compression
+ * detection used to discover the compressed pages-*.img length. One
+ * round-trip instead of O(log N). S3 and MinIO both answer HEAD cheaply.
+ * =================================================================================
+ */
+int object_storage_head_object(const char *object_key, unsigned long *out_length)
+{
+	struct object_url_info url_info;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	curl_off_t content_length = -1;
+	struct curl_slist *headers = NULL;
+
+	if (!object_key || !out_length) {
+		pr_err("head_object: NULL parameter\n");
+		return -1;
+	}
+
+	*out_length = 0;
+
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	curl_handle = _get_curl_handle();
+	if (!curl_handle)
+		return -1;
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, url_info.url);
+	curl_easy_setopt(curl_handle, CURLOPT_NOBODY, 1L);
+	/* No write callback — HEAD doesn't return a body. Range/GET handlers
+	 * still leaked into reused handles elsewhere, so clear them. */
+	curl_easy_setopt(curl_handle, CURLOPT_RANGE, NULL);
+
+	if (_build_auth_headers("HEAD", url_info.auth_host, url_info.canonical_uri,
+				NULL, EMPTY_PAYLOAD_HASH, NULL, -1, &headers) != 0)
+		return -1;
+	if (headers)
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	res = curl_easy_perform(curl_handle);
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+	curl_easy_getinfo(curl_handle, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_length);
+
+	/* Reset transient options so the reused handle doesn't stay NOBODY. */
+	curl_easy_setopt(curl_handle, CURLOPT_NOBODY, 0L);
+
+	if (headers)
+		curl_slist_free_all(headers);
+
+	if (res != CURLE_OK) {
+		pr_err("HEAD %s failed: %s\n", object_key, curl_easy_strerror(res));
+		return -1;
+	}
+	if (http_code == 404)
+		return -ENOENT;
+	if (http_code < 200 || http_code >= 300) {
+		pr_err("HEAD %s failed with HTTP %ld\n", object_key, http_code);
+		return -1;
+	}
+	if (content_length < 0) {
+		pr_err("HEAD %s: server returned no Content-Length\n", object_key);
+		return -1;
+	}
+	*out_length = (unsigned long)content_length;
+	pr_debug("HEAD %s: %lu bytes (HTTP %ld)\n", object_key, *out_length, http_code);
 	return 0;
 }
 
@@ -2212,8 +3482,35 @@ err:
  * =================================================================================
  */
 
+/*
+ * Like object_storage_fetch_range, but returns the number of bytes actually
+ * received (which can be less than `length` when the range ends past EOF)
+ * and does not treat a short read as an error. Intended for probing file
+ * tails (seek-table detection) and for decompressor-driven reads that
+ * naturally clamp at EOF.
+ */
+int object_storage_fetch_range_short(const char *object_key, unsigned long offset,
+				     unsigned long length, void *buffer,
+				     unsigned long *out_got, const char *source);
+
 int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer,
 			       const char *source)
+{
+	unsigned long got = 0;
+	int rc = object_storage_fetch_range_short(object_key, offset, length,
+						  buffer, &got, source);
+	if (rc != 0)
+		return rc;
+	if (got != length) {
+		pr_warn("Object Storage fetch: short read (Expected %lu, Got %lu) — "
+			"likely past EOF, keeping handle warm\n", length, got);
+		return -1;
+	}
+	return 0;
+}
+
+int object_storage_fetch_range_short(const char *object_key, unsigned long offset, unsigned long length, void *buffer,
+				     unsigned long *out_got, const char *source)
 {
 	CURL *curl_handle;
 	CURLcode res;
@@ -2591,13 +3888,15 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 	 * read reuses the warm TLS session; the caller is expected to
 	 * retry with a smaller length if it actually needed more data.
 	 */
-	if (chunk.size != length) {
-		pr_warn("Object Storage fetch: short read (Expected %lu, Got %zu) — "
-			"likely past EOF, keeping handle warm\n", length, chunk.size);
-		free(error_response.memory);
-		ret = -1;
-		goto cleanup;
-	}
+	/*
+	 * Short read = requested range extended past EOF. S3 responds with
+	 * HTTP 206 and only the available bytes. Return success; the caller
+	 * can check *out_got (via the _short variant) to see the actual
+	 * byte count. The public fetch_range wrapper above turns it back
+	 * into -1 for callers that require an exact match.
+	 */
+	if (out_got)
+		*out_got = chunk.size;
 
 	/* Calculate fetch duration and log completion */
 	clock_gettime(CLOCK_MONOTONIC, &fetch_end);

@@ -20,6 +20,7 @@
 #include <dirent.h>
 
 #include "obstor_xfer.h"
+#include "auto_nic.h"
 #include "log.h"
 #include "xmalloc.h"
 #include "object-storage.h"
@@ -31,6 +32,7 @@
 #include "util.h"
 #include "page-xfer.h"
 #include "page.h"
+#include "compression.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "prefetch: "
@@ -143,6 +145,310 @@ static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 static struct prefetch_stats stats;
 static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* ----------------------------------------------------------------------- *
+ * Per-pages_img_id compressed-mode cache.
+ *
+ * When the S3 pages-*.img was dumped with --compress, workers need to
+ * route fetches through decompress_range() rather than issuing raw Range
+ * GETs for `batch.base_offset .. base_offset + total_bytes`. Two tiers:
+ *
+ *  1) xfer_compress_entry — shared, one per pages_img_id. After the
+ *     initial probe it holds only immutable metadata (object_key,
+ *     total_size, is_compressed flag, shared read-only cookie). All
+ *     workers read from it without locking post-probe.
+ *
+ *  2) worker_dctx — thread-local decompress_ctx cache keyed by
+ *     pages_img_id. Each worker lazily constructs its own ZSTD_seekable
+ *     instance so that decompress_range() runs without cross-worker
+ *     serialization. ZSTD_seekable's DCtx + cursor state isn't
+ *     thread-safe, so the fix is per-thread instances rather than a
+ *     big shared mutex.
+ *
+ * The shared probe_lock is held only for the duration of the initial
+ * S3-size probe; once e->probed==true, late arrivals observe is_compressed
+ * without taking the lock.
+ * ----------------------------------------------------------------------- */
+
+struct xfer_compress_entry {
+	unsigned int pages_img_id;
+	bool probed;			/* true after probe attempt */
+	bool is_compressed;		/* probe result: seekable magic found */
+	char object_key[PATH_MAX];
+	unsigned long total_size;	/* file length in bytes (post-probe) */
+	void *cookie;			/* xfer_decomp_cookie, shared read-only */
+	pthread_mutex_t probe_lock;	/* held only during initial probe */
+	struct xfer_compress_entry *next;
+};
+
+static struct xfer_compress_entry *xfer_compress_list;
+static pthread_mutex_t xfer_compress_list_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Per-worker decompress_ctx cache — each worker owns one linked list and
+ * never shares its decompress_ctx instances with other workers. */
+struct worker_dctx_entry {
+	unsigned int pages_img_id;
+	struct decompress_ctx *d;
+	struct worker_dctx_entry *next;
+};
+
+static struct worker_dctx_entry **worker_dctx_heads;	/* [num_workers] */
+static int worker_dctx_nheads;
+
+/* Cookie identical in shape to s3_decomp_cookie in pagemap.c but scoped
+ * to this module to keep compilation units independent.
+ *
+ * tail_buf caches only the zstd-seekable seek-table region at EOF
+ * (exact size, not a fixed window). ZSTD_seekable's init walks the
+ * table and serves every read from tail_buf (zero network). Decompress
+ * of a frame body issues one Range GET per frame; no state is shared
+ * across workers beyond this read-only tail.
+ */
+#define XFER_ZSTD_FOOTER_LEN 9
+#define XFER_ZSTD_SKIP_HDR_LEN 8
+#define XFER_ZSTD_ENTRY_LEN_BASE 8
+#define XFER_ZSTD_ENTRY_LEN_CS 12
+#define XFER_COMP_TAIL_MAX (16UL << 20)
+
+struct xfer_decomp_cookie {
+	char object_key[PATH_MAX];
+	unsigned long total_size;
+	void *tail_buf;
+	unsigned long tail_start;
+	size_t tail_len;
+};
+
+static inline uint32_t xfer_read_le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Parse the 9-byte footer of a seekable-format object to derive the
+ * exact byte count the seek table occupies. Returns 0 on parse error. */
+static size_t xfer_seek_table_size(const char *object_key, unsigned long total_size)
+{
+	uint8_t footer[XFER_ZSTD_FOOTER_LEN];
+	unsigned long got = 0;
+	uint32_t num_frames;
+	uint8_t descriptor, entry_size;
+	size_t needed;
+
+	if (total_size < XFER_ZSTD_FOOTER_LEN + XFER_ZSTD_SKIP_HDR_LEN)
+		return 0;
+	if (object_storage_fetch_range_short(object_key,
+					     total_size - XFER_ZSTD_FOOTER_LEN,
+					     XFER_ZSTD_FOOTER_LEN,
+					     footer, &got,
+					     OBJSTOR_SRC_PREFETCH) != 0 ||
+	    got != XFER_ZSTD_FOOTER_LEN)
+		return 0;
+
+	num_frames = xfer_read_le32(footer);
+	descriptor = footer[4];
+	entry_size = (descriptor & 0x80) ? XFER_ZSTD_ENTRY_LEN_CS
+					 : XFER_ZSTD_ENTRY_LEN_BASE;
+
+	needed = XFER_ZSTD_SKIP_HDR_LEN + (size_t)num_frames * entry_size + XFER_ZSTD_FOOTER_LEN;
+	if (needed > XFER_COMP_TAIL_MAX || needed > total_size)
+		return 0;
+	return needed;
+}
+
+static int xfer_decomp_read_cb(void *cookie, off_t offset, size_t length,
+			       void *out)
+{
+	struct xfer_decomp_cookie *c = cookie;
+	unsigned long got = 0;
+	unsigned long uoff = (unsigned long)offset;
+	int rc;
+
+	/* Tail cache hit: seek-table & trailing frame reads from memory. */
+	if (c->tail_buf && c->tail_len > 0 &&
+	    uoff >= c->tail_start &&
+	    uoff + length <= c->tail_start + c->tail_len) {
+		memcpy(out, (char *)c->tail_buf + (uoff - c->tail_start), length);
+		return 0;
+	}
+
+	/* Miss — actual frame body. One Range GET. */
+	rc = object_storage_fetch_range_short(c->object_key, uoff,
+					      (unsigned long)length, out, &got,
+					      OBJSTOR_SRC_PREFETCH);
+	if (rc != 0)
+		return -1;
+	if (got != length)
+		memset((char *)out + got, 0, length - got);
+	return 0;
+}
+
+/*
+ * Look up (and lazily probe) the shared metadata entry for a given
+ * pages_img_id. Returns the entry with e->probed==true on success.
+ * is_compressed reflects the probe outcome; false means the image is raw
+ * and callers should take the direct-fetch path.
+ */
+static struct xfer_compress_entry *
+xfer_obtain_compress_entry(unsigned int pages_img_id, const char *object_key)
+{
+	struct xfer_compress_entry *e;
+
+	pthread_mutex_lock(&xfer_compress_list_lock);
+	for (e = xfer_compress_list; e; e = e->next) {
+		if (e->pages_img_id == pages_img_id) {
+			pthread_mutex_unlock(&xfer_compress_list_lock);
+			/*
+			 * Another worker may still be in the probe critical
+			 * section. Block on probe_lock so we only return
+			 * once probed / is_compressed are final.
+			 */
+			pthread_mutex_lock(&e->probe_lock);
+			pthread_mutex_unlock(&e->probe_lock);
+			return e;
+		}
+	}
+
+	/* Not seen before — create an un-probed placeholder. */
+	e = xzalloc(sizeof(*e));
+	if (!e) {
+		pthread_mutex_unlock(&xfer_compress_list_lock);
+		return NULL;
+	}
+	e->pages_img_id = pages_img_id;
+	snprintf(e->object_key, sizeof(e->object_key), "%s", object_key);
+	pthread_mutex_init(&e->probe_lock, NULL);
+	/* Hold probe_lock before publishing so late lookups block until
+	 * the probe completes. */
+	pthread_mutex_lock(&e->probe_lock);
+	e->next = xfer_compress_list;
+	xfer_compress_list = e;
+	pthread_mutex_unlock(&xfer_compress_list_lock);
+
+	/*
+	 * Probe the image for zstd seekable magic. On success record
+	 * total_size + is_compressed + shared cookie and let each worker
+	 * build its own decompress_ctx on demand. On failure leave
+	 * is_compressed=false so the raw-fetch branch is taken.
+	 *
+	 * HEAD gives the total length in one request; a 4-byte trailing
+	 * Range GET then confirms the seekable magic. O(1) RTTs instead of
+	 * the O(log N) geometric probe we used before.
+	 */
+	{
+		uint8_t tail[4];
+		unsigned long tail_got = 0;
+		unsigned long size = 0;
+		int rc;
+
+		rc = object_storage_head_object(object_key, &size);
+		if (rc != 0 || size < 4) {
+			e->probed = true;
+			goto done;
+		}
+
+		if (object_storage_fetch_range_short(object_key,
+						     (off_t)size - 4, 4,
+						     tail, &tail_got,
+						     OBJSTOR_SRC_PREFETCH) != 0 ||
+		    tail_got != 4 ||
+		    decompress_probe(tail, 4) != 1) {
+			e->probed = true;
+			goto done;
+		}
+
+		{
+			struct xfer_decomp_cookie *c = xzalloc(sizeof(*c));
+			unsigned long got = 0;
+			if (!c) {
+				e->probed = true;
+				goto done;
+			}
+			snprintf(c->object_key, sizeof(c->object_key), "%s",
+				 object_key);
+			c->total_size = size;
+
+			/*
+			 * Cache exactly the seek-table bytes. decompress_create_lazy()
+			 * parses the frame table from this during init and never
+			 * reads through the tail cache again — frame bodies go
+			 * straight through the read callback to S3 on demand.
+			 */
+			c->tail_len = xfer_seek_table_size(object_key, size);
+			if (c->tail_len == 0) {
+				pr_err("obstor_xfer: seek-table footer parse failed\n");
+				xfree(c);
+				e->probed = true;
+				goto done;
+			}
+			c->tail_start = size - c->tail_len;
+			c->tail_buf = xmalloc(c->tail_len);
+			if (!c->tail_buf) {
+				pr_err("obstor_xfer: tail xmalloc(%zu) failed\n", c->tail_len);
+				xfree(c);
+				e->probed = true;
+				goto done;
+			}
+			if (object_storage_fetch_range_short(object_key,
+							     c->tail_start,
+							     c->tail_len,
+							     c->tail_buf, &got,
+							     OBJSTOR_SRC_PREFETCH) != 0 ||
+			    got != c->tail_len) {
+				pr_err("obstor_xfer: tail fetch failed (got=%lu/%zu)\n",
+				       got, c->tail_len);
+				xfree(c->tail_buf);
+				xfree(c);
+				e->probed = true;
+				goto done;
+			}
+
+			e->cookie = c;
+			e->total_size = size;
+			e->is_compressed = true;
+			pr_info("obstor_xfer: detected compressed pages-%u (total=%lu bytes, cached tail=%zu)\n",
+				pages_img_id, size, c->tail_len);
+		}
+		e->probed = true;
+	}
+done:
+	pthread_mutex_unlock(&e->probe_lock);
+	return e;
+}
+
+/*
+ * Return this worker's private decompress_ctx for the given entry,
+ * constructing one on first use. NULL means the worker should fall back
+ * to a raw fetch (either entry is not compressed, or ZSTD init failed).
+ *
+ * The caller must have verified e->is_compressed before calling.
+ */
+static struct decompress_ctx *
+worker_get_decompress(int worker_id, struct xfer_compress_entry *e)
+{
+	struct worker_dctx_entry *w;
+
+	if (worker_id < 0 || worker_id >= worker_dctx_nheads)
+		return NULL;
+
+	for (w = worker_dctx_heads[worker_id]; w; w = w->next) {
+		if (w->pages_img_id == e->pages_img_id)
+			return w->d;
+	}
+
+	w = xzalloc(sizeof(*w));
+	if (!w)
+		return NULL;
+	w->pages_img_id = e->pages_img_id;
+	w->d = decompress_create_lazy(NULL, 0, (off_t)e->total_size,
+				      xfer_decomp_read_cb, e->cookie);
+	if (!w->d) {
+		xfree(w);
+		return NULL;
+	}
+	w->next = worker_dctx_heads[worker_id];
+	worker_dctx_heads[worker_id] = w;
+	return w->d;
+}
+
 /* global_lpi and global_pages_img_id removed — now stored per-IOV in iov_meta */
 
 /* ========== Controller Infrastructure ========== */
@@ -158,7 +464,6 @@ struct controller_stats {
 	unsigned long queue_removes;
 	unsigned long priority_promotions;
 	unsigned long obsolete_prevented;  /* Removed before worker fetched */
-	unsigned long proximity_removed;   /* Removed due to proximity to fault */
 	unsigned long hot_vma_faults;      /* Faults on hot VMA pages */
 	unsigned long cold_vma_faults;     /* Faults on non-hot VMA pages */
 	unsigned long hot_vma_prefetched;  /* Hot VMA IOVs prefetched before fault */
@@ -167,8 +472,6 @@ static struct controller_stats controller_stats;
 static pthread_mutex_t controller_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Controller tuning */
-#define PROXIMITY_WINDOW 8           /* Forward IOVs to remove on fault */
-#define ENABLE_PROXIMITY_REMOVAL 1   /* Feature flag: set 0 to disable */
 #define PROMOTE_DISTANCE 32          /* Fixed: promote next N IOVs on fault */
 
 /* ========== IOV Metadata Functions ========== */
@@ -492,13 +795,6 @@ struct obstor_batch {
 	int head_priority;
 };
 
-static int priority_class(int p)
-{
-	if (p >= 70) return 2;
-	if (p >= 40) return 1;
-	return 0;
-}
-
 static int dequeue_batch(struct obstor_batch *b, unsigned long max_bytes)
 {
 	struct prefetch_request *head;
@@ -530,7 +826,16 @@ static int dequeue_batch(struct obstor_batch *b, unsigned long max_bytes)
 	/* Walk forward looking for adjacent requests in the hash table.
 	 * Uses iov_index ordering, which mirrors the original VMA walk
 	 * order from collect_iovs(); adjacent indices map to adjacent
-	 * file_offsets in the typical case. */
+	 * file_offsets in the typical case.
+	 *
+	 * We intentionally do NOT check priority_class here: priority only
+	 * determines which queue the head is dequeued from. Once we have a
+	 * head, any adjacent IOV (file_offset + vaddr strictly contiguous)
+	 * should be batched regardless of its own priority class — a mixed-
+	 * priority Range GET still installs all slices correctly. Excluding
+	 * on priority fragmented batches badly in workloads with lots of
+	 * PROMOTE events (e.g. compressed lazy-pages where every fault
+	 * promotes 32 neighbours → queue_low walk breaks every few IOVs). */
 	next_idx = head->iov_index + 1;
 	while (b->n_iovs < OBSTOR_BATCH_MAX_IOVS) {
 		struct prefetch_request *next;
@@ -542,8 +847,6 @@ static int dequeue_batch(struct obstor_batch *b, unsigned long max_bytes)
 		if (!next)
 			break;
 		if (next->pages_img_id != b->pages_img_id)
-			break;
-		if (priority_class(next->priority) != priority_class(b->head_priority))
 			break;
 
 		expected_offset = b->base_offset + b->total_bytes;
@@ -599,55 +902,18 @@ out:
 }
 
 /*
- * NIC speed -based default for prefetch_workers when --prefetch-workers is
- * not given (or set to 0). Walks /sys/class/net to find the highest-speed
- * non-loopback interface; assumes ~100 MB/s = 800 Mbps per worker stream;
- * caps at 32. Falls back to 8 if detection fails (virtual NIC reports -1,
- * etc).
+ * Fixed default for prefetch_workers when --prefetch-workers is not
+ * given (or passed as 0). Previously we tried to infer this from
+ * /sys/class/net/<iface>/speed, but on cloud providers (AWS ENA, GCP
+ * gVNIC, Azure hv_netvsc) that file is empty, so detection always fell
+ * through to this same conservative constant anyway. Worker-count
+ * policy now lives in the deployment layer (Kubernetes operator picks
+ * N per node instance type; experiment scripts pass --prefetch-workers
+ * explicitly). CRIU just ships a reasonable built-in default that
+ * behaves on commodity hardware and a 10 Gbps-class cloud NIC.
+ * See issues/phase6-worker-count-notes.md.
  */
-#define OBSTOR_DEFAULT_WORKERS_FALLBACK 8
-#define OBSTOR_DEFAULT_WORKERS_CAP 32
-
-static int detect_default_workers(void)
-{
-	DIR *d;
-	struct dirent *e;
-	int best = 0;
-
-	d = opendir("/sys/class/net");
-	if (!d)
-		return OBSTOR_DEFAULT_WORKERS_FALLBACK;
-
-	while ((e = readdir(d))) {
-		char path[PATH_MAX];
-		FILE *f;
-		int speed_mbps;
-
-		if (e->d_name[0] == '.')
-			continue;
-		if (!strcmp(e->d_name, "lo"))
-			continue;
-
-		snprintf(path, sizeof(path), "/sys/class/net/%s/speed", e->d_name);
-		f = fopen(path, "r");
-		if (!f)
-			continue;
-		if (fscanf(f, "%d", &speed_mbps) == 1 && speed_mbps > 0) {
-			/* per-worker ~800 Mbps */
-			int w = speed_mbps / 800;
-			if (w > best)
-				best = w;
-		}
-		fclose(f);
-	}
-	closedir(d);
-
-	if (best <= 0)
-		return OBSTOR_DEFAULT_WORKERS_FALLBACK;
-	if (best > OBSTOR_DEFAULT_WORKERS_CAP)
-		return OBSTOR_DEFAULT_WORKERS_CAP;
-	return best;
-}
+#define OBSTOR_DEFAULT_WORKERS 8
 
 /*
  * Per-IOV install for one batch element. Looks up the meta by exact
@@ -797,6 +1063,8 @@ static void *prefetch_worker(void *arg)
 		}
 
 		if (opts.enable_object_storage) {
+			struct xfer_compress_entry *ce;
+
 			snprintf(image_name, sizeof(image_name), "pages-%u.img", batch.pages_img_id);
 			if (opts.object_storage_object_prefix && strlen(opts.object_storage_object_prefix) > 0)
 				snprintf(object_key, sizeof(object_key), "%s%s",
@@ -807,13 +1075,41 @@ static void *prefetch_worker(void *arg)
 			pr_debug("obstor_xfer: Worker %d: Fetching %s offset=%lu size=%lu (n=%d)\n",
 				 worker_id, object_key, batch.base_offset, batch.total_bytes, n);
 
-			ret = object_storage_fetch_range(object_key, batch.base_offset,
-							 batch.total_bytes, data,
-							 OBJSTOR_SRC_PREFETCH);
-			if (ret != 0) {
-				PREFETCH_WORKER_ERROR_LOG(worker_id, head->iov_index, ret);
-				pr_err("obstor_xfer: Worker %d: batch fetch failed %s ret=%d\n",
-				       worker_id, object_key, ret);
+			ce = xfer_obtain_compress_entry(batch.pages_img_id, object_key);
+			if (ce && ce->is_compressed) {
+				/*
+				 * Compressed mode: batch.base_offset is an
+				 * uncompressed offset. Each worker holds its
+				 * own ZSTD_seekable, so decompress_range() runs
+				 * in parallel across workers with zero cross-
+				 * worker locking.
+				 */
+				struct decompress_ctx *d =
+					worker_get_decompress(worker_id, ce);
+				if (d) {
+					ret = decompress_range(d,
+							       (off_t)batch.base_offset,
+							       batch.total_bytes, data);
+				} else {
+					ret = -1;
+				}
+				if (ret != 0) {
+					PREFETCH_WORKER_ERROR_LOG(worker_id, head->iov_index, ret);
+					pr_err("obstor_xfer: Worker %d: compressed fetch failed "
+					       "%s off=%lu size=%lu ret=%d\n",
+					       worker_id, object_key,
+					       batch.base_offset, batch.total_bytes, ret);
+				}
+			} else {
+				ret = object_storage_fetch_range(object_key,
+								 batch.base_offset,
+								 batch.total_bytes, data,
+								 OBJSTOR_SRC_PREFETCH);
+				if (ret != 0) {
+					PREFETCH_WORKER_ERROR_LOG(worker_id, head->iov_index, ret);
+					pr_err("obstor_xfer: Worker %d: batch fetch failed %s ret=%d\n",
+					       worker_id, object_key, ret);
+				}
 			}
 		}
 
@@ -875,9 +1171,22 @@ int prefetch_init(int num_worker_threads)
 	int i;
 
 	if (num_worker_threads <= 0) {
-		num_worker_threads = detect_default_workers();
-		pr_info("obstor_xfer: auto-detected %d worker threads (NIC speed)\n",
-			num_worker_threads);
+		int nic_mbps = auto_nic_mbps();
+		int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+		/*
+		 * Restore: each pthread worker runs its own libcurl easy
+		 * handle (blocking curl_easy_perform on Range GETs).
+		 * Empirical per-worker throughput on libcurl Range GET is
+		 * ~480 Mbps — higher than S3 PUT per slot because GETs skip
+		 * SigV4 body hashing and libcurl read-callback overhead.
+		 */
+		num_worker_threads = auto_pool_workers(nic_mbps, ncpu,
+						       64, 480);
+		if (nic_mbps <= 0)
+			num_worker_threads = OBSTOR_DEFAULT_WORKERS;
+		pr_info("obstor_xfer: auto prefetch-workers=%d "
+			"(NIC %d Mbps, ncpu %d)\n",
+			num_worker_threads, nic_mbps, ncpu);
 	}
 
 	pr_info("Initializing prefetch system with %d workers (batch_bytes=%lu)\n",
@@ -895,6 +1204,18 @@ int prefetch_init(int num_worker_threads)
 		pr_err("Failed to allocate worker thread array\n");
 		return -ENOMEM;
 	}
+
+	/* Allocate per-worker decompress caches (zero-initialized). Each
+	 * worker builds its own ZSTD_seekable lazily on first compressed
+	 * fetch, and only ever touches worker_dctx_heads[worker_id]. */
+	worker_dctx_heads = xzalloc(num_workers * sizeof(*worker_dctx_heads));
+	if (!worker_dctx_heads) {
+		pr_err("Failed to allocate worker decompress caches\n");
+		xfree(worker_threads);
+		worker_threads = NULL;
+		return -ENOMEM;
+	}
+	worker_dctx_nheads = num_workers;
 
 	workers_running = true;
 
@@ -940,6 +1261,44 @@ void prefetch_cleanup(void)
 
 		xfree(worker_threads);
 		worker_threads = NULL;
+	}
+
+	/*
+	 * Tear down the compressed-mode caches. Workers are already joined,
+	 * so per-worker decompress_ctx instances can be destroyed first,
+	 * followed by the shared metadata + cookie.
+	 */
+	if (worker_dctx_heads) {
+		for (i = 0; i < worker_dctx_nheads; i++) {
+			struct worker_dctx_entry *w, *wnext;
+			for (w = worker_dctx_heads[i]; w; w = wnext) {
+				wnext = w->next;
+				if (w->d)
+					decompress_free(w->d);
+				xfree(w);
+			}
+			worker_dctx_heads[i] = NULL;
+		}
+		xfree(worker_dctx_heads);
+		worker_dctx_heads = NULL;
+		worker_dctx_nheads = 0;
+	}
+	{
+		struct xfer_compress_entry *e, *tmp;
+		pthread_mutex_lock(&xfer_compress_list_lock);
+		for (e = xfer_compress_list; e; e = tmp) {
+			tmp = e->next;
+			if (e->cookie) {
+				struct xfer_decomp_cookie *c = e->cookie;
+				if (c->tail_buf)
+					xfree(c->tail_buf);
+				xfree(c);
+			}
+			pthread_mutex_destroy(&e->probe_lock);
+			xfree(e);
+		}
+		xfer_compress_list = NULL;
+		pthread_mutex_unlock(&xfer_compress_list_lock);
 	}
 
 	/* Free remaining requests */
@@ -994,12 +1353,11 @@ void prefetch_cleanup(void)
 	pthread_mutex_unlock(&stats_lock);
 
 	pthread_mutex_lock(&controller_stats_lock);
-	pr_info("CONTROLLER faults=%lu removes=%lu promotes=%lu obsolete=%lu proximity=%lu hot_faults=%lu cold_faults=%lu hot_prefetched=%lu\n",
+	pr_info("CONTROLLER faults=%lu removes=%lu promotes=%lu obsolete=%lu hot_faults=%lu cold_faults=%lu hot_prefetched=%lu\n",
 		controller_stats.faults_processed,
 		controller_stats.queue_removes,
 		controller_stats.priority_promotions,
 		controller_stats.obsolete_prevented,
-		controller_stats.proximity_removed,
 		controller_stats.hot_vma_faults,
 		controller_stats.cold_vma_faults,
 		controller_stats.hot_vma_prefetched);
@@ -1355,44 +1713,17 @@ void prefetch_on_fault(void *lpi, int iov_index)
 		}
 	}
 
-#if ENABLE_PROXIMITY_REMOVAL
-	/* 2. Proximity removal: remove next PROXIMITY_WINDOW forward IOVs.
-	 *
-	 * CRITICAL: these IOVs are being evicted from the worker queue, but
-	 * their iov_meta entries are still in state IOV_QUEUED. If we don't
-	 * reset the state, `obstor_xfer_iov_is_pending()` will forever report
-	 * them as pending to the main-loop xfer_pages path, and the main loop
-	 * will spin on them (no worker will ever pick them up — the request
-	 * object is gone). Reset to IOV_NOT_REQUESTED so the main-loop sync
-	 * fallback path in xfer_pages can handle them.
+	/*
+	 * 2. Promote ahead IOVs: fixed window starting one index past the
+	 * faulted IOV. Previously we also evicted the next 8 IOVs from the
+	 * async queue under a spatial-locality assumption ("they'll fault
+	 * next too, let main-thread sync-fetch them"). Measured on mc4gb
+	 * ablation 2026-04-21: the assumption backfires for fault-heavy
+	 * paths — every eviction costs one async install and the workload
+	 * often ends up fetching the same IOV via a UFFD fault anyway. COMP
+	 * 5_full daemon drops 19.3s → 11.6s (−40%) once eviction is off.
 	 */
-	for (i = 1; i <= PROXIMITY_WINDOW; i++) {
-		int prox_idx = iov_index + i;
-		struct prefetch_request *prox_req;
-		if (prox_idx >= total_iovs)
-			break;
-		prox_req = hash_table_lookup(&request_hash_table, prox_idx);
-		if (prox_req) {
-			struct iov_meta *prox_meta;
-			list_del(&prox_req->list);
-			hash_table_remove(&request_hash_table, prox_idx);
-			xfree(prox_req);
-			queue_size--;
-			controller_stats.proximity_removed++;
-
-			/* Restore state-machine invariant:
-			 * state == QUEUED ⇒ request is in a queue. */
-			pthread_mutex_lock(&iov_meta_lock);
-			prox_meta = iov_index_map[prox_idx];
-			if (prox_meta && prox_meta->state == IOV_QUEUED)
-				prox_meta->state = IOV_NOT_REQUESTED;
-			pthread_mutex_unlock(&iov_meta_lock);
-		}
-	}
-#endif
-
-	/* 3. Promote ahead IOVs: fixed window */
-	for (i = PROXIMITY_WINDOW + 1; i <= PROXIMITY_WINDOW + PROMOTE_DISTANCE; i++) {
+	for (i = 1; i <= PROMOTE_DISTANCE; i++) {
 		int ahead_idx = iov_index + i;
 		struct prefetch_request *existing;
 		if (ahead_idx >= total_iovs)

@@ -58,7 +58,28 @@ struct page_xfer {
 		int etags_count;
 		int etags_cap;
 		int active;		/* 1 if S3 upload is in progress */
+
+		/*
+		 * When --compress is set and this is the S3 upload path, the
+		 * per-IOV frames and multipart parts flow through the
+		 * parallel pipeline in compress_pipeline.c instead of the
+		 * serial part_buf above. Exactly one of {part_buf path,
+		 * compress_pipe path} is active at a time.
+		 */
+		struct compress_pipeline *compress_pipe;
+
+		/*
+		 * Non-compressed S3 upload: optional CURLM-backed parallel
+		 * upload pool. When opts.upload_workers > 1 (default), parts
+		 * are submitted to this pool instead of being PUT synchronously
+		 * by the dump thread, raising effective upload throughput from
+		 * ~45 MB/s to aws-s3-cp class (~400 MB/s). See upload_pool.h.
+		 */
+		struct upload_pool *upload_pool;
 	} object_storage;
+
+	/* zstd seekable compression state (set when opts.compress) — local path */
+	struct compress_stream *compress;
 
 	struct page_read *parent;
 };
@@ -72,6 +93,19 @@ extern int connect_to_page_server_to_recv(int epfd);
 extern int disconnect_from_page_server(void);
 
 extern int check_parent_page_xfer(int fd_type, unsigned long id);
+
+/*
+ * Drain any upload_pool instances left pending after per-process page
+ * transfers. Each multi-process workload (memcached, redis) closes
+ * several page_xfer objects in sequence; the raw-path upload_pools now
+ * defer their final upload_pool_wait / multipart_complete so the next
+ * process's dump can overlap with the TCP-level tail of the previous
+ * uploads. This function blocks until every pending pool has all PUTs
+ * accepted and issues the multipart completes. Safe to call when no
+ * pools are pending (no-op). Returns 0 on success, -1 if any pool
+ * failed.
+ */
+extern int page_xfer_drain_deferred_uploads(void);
 
 /*
  * The post-copy migration makes it necessary to receive pages from

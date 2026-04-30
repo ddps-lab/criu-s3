@@ -448,6 +448,33 @@ void init_opts(void)
 	opts.prefetch_workers = 0;		/* 0 = auto-detect from NIC speed */
 	opts.prefetch_batch_bytes = 64UL * 1024 * 1024;  /* 64 MB default; 0 disables batching */
 
+	/* Initialize compression options (--compress: zstd seekable) */
+	opts.compress = false;
+	opts.compress_level = 1;
+	opts.compress_workers = 0;		/* 0 = auto: min(nproc/4, 8) */
+	/* compress_upload_workers removed — use opts.upload_workers for both
+	 * raw and compressed paths. --compress-upload-workers CLI kept as a
+	 * backward-compat alias that writes opts.upload_workers. */
+
+	/*
+	 * Non-compressed S3 parallel upload via CURLM. 0 here means "auto"
+	 * — page-xfer.c resolves the real value via auto_pool_workers()
+	 * based on detected NIC bandwidth. Users can still force a literal
+	 * count via --upload-workers N.
+	 */
+	opts.upload_workers = 0;
+	/*
+	 * 16 MB part size: measured peak on m5.8xlarge at 497 MB/s, +15%
+	 * over 8 MB (433 MB/s) and matches aws-cli CRT defaults. Larger
+	 * (32/64/128 MB) shows per-flush pause diminishing returns in our
+	 * bench. 10,000 parts × 16 MB = 160 GB object ceiling — plenty for
+	 * practical CRIU workloads (max observed ~16-64 GB RSS). For
+	 * truly giant dumps the user can override with --upload-part-mb.
+	 * See paper_data/dump-bench/parsed/combined-bench.tsv.
+	 */
+	opts.upload_part_mb = 16;
+	opts.sign_payload = false;  /* default UNSIGNED-PAYLOAD (AWS CRT / aws-cli v2 default) */
+
 	/* Initialize exclude ranges */
 	INIT_LIST_HEAD(&opts.exclude_ranges);
 	INIT_LIST_HEAD(&opts.no_parent_ranges);
@@ -742,6 +769,13 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "no-semi-sync-iov", no_argument, NULL, 1117 },
 		{ "no-hot-vma-seed", no_argument, NULL, 1118 },
 		{ "prefetch-batch-bytes", required_argument, 0, 1119 },
+		{ "compress", no_argument, NULL, 1120 },
+		{ "compress-level", required_argument, 0, 1121 },
+		{ "compress-workers", required_argument, 0, 1122 },
+		{ "compress-upload-workers", required_argument, 0, 1123 },
+		{ "upload-workers", required_argument, 0, 1124 },
+		{ "upload-part-mb", required_argument, 0, 1125 },
+		{ "sign-payload", no_argument, NULL, 1126 },
 		{},
 	};
 
@@ -1184,6 +1218,41 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		case 1119:
 			opts.prefetch_batch_bytes = strtoul(optarg, NULL, 10);
 			break;
+		case 1120:
+			opts.compress = true;
+			break;
+		case 1121:
+			opts.compress_level = atoi(optarg);
+			break;
+		case 1122:
+			opts.compress_workers = atoi(optarg);
+			break;
+		case 1123:
+			/* Legacy alias for --upload-workers. Kept so scripts
+			 * passing this flag keep working after unification. */
+			opts.upload_workers = atoi(optarg);
+			if (opts.upload_workers < 1)
+				opts.upload_workers = 1;
+			pr_warn("--compress-upload-workers is deprecated; "
+				"use --upload-workers (value applied to both "
+				"raw and compressed upload pools).\n");
+			break;
+		case 1124:
+			opts.upload_workers = atoi(optarg);
+			if (opts.upload_workers < 1)
+				opts.upload_workers = 1;
+			break;
+		case 1125:
+			opts.upload_part_mb = atoi(optarg);
+			/* S3 multipart rules: 5 MB min, 5 GB max. */
+			if (opts.upload_part_mb < 5)
+				opts.upload_part_mb = 5;
+			if (opts.upload_part_mb > 5000)
+				opts.upload_part_mb = 5000;
+			break;
+		case 1126:
+			opts.sign_payload = true;
+			break;
 		default:
 			return 2;
 		}
@@ -1225,6 +1294,23 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		pr_info("Async Prefetch Enabled\n");
 		pr_info("  Prefetch Workers: %d\n", opts.prefetch_workers);
 		pr_info("  Hot VMA Seed: %s\n", opts.hot_vma_seed ? "enabled" : "disabled");
+	}
+	if (opts.compress) {
+		/*
+		 * auto-dedup punches holes in raw pages-*.img, which is
+		 * meaningless on a seekable compressed image: the byte
+		 * ranges at pi_off are frame bodies, not page data. Reject
+		 * the combination here rather than silently produce a
+		 * broken dump.
+		 */
+		if (opts.auto_dedup) {
+			pr_err("--compress is incompatible with --auto-dedup\n");
+			return -1;
+		}
+		pr_info("Compression Enabled (zstd seekable)\n");
+		pr_info("  Level: %d\n", opts.compress_level);
+		pr_info("  Compress Workers: %d (0=auto)\n", opts.compress_workers);
+		pr_info("  Upload Workers: %d (shared with raw path)\n", opts.upload_workers);
 	}
 
 	return 0;

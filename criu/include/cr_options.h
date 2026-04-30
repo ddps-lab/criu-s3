@@ -275,6 +275,21 @@ struct cr_options {
 	int prefetch_workers;
 	unsigned long prefetch_batch_bytes; /* obstor_xfer worker batch coalescing limit (0 = disabled) */
 
+	/* zstd seekable compression of pages-*.img (--compress) */
+	bool compress;
+	int compress_level;		/* zstd level, default 1 */
+	int compress_workers;		/* 0 = auto: min(nproc/4, 8) */
+	/* compress_upload_workers removed — compressed and raw paths now
+	 * share the same CURLM upload_pool sized by opts.upload_workers.
+	 * --compress-upload-workers is kept as a legacy CLI alias in
+	 * config.c which sets opts.upload_workers directly. */
+
+	/* Non-compressed S3 upload: CURLM-backed parallel upload pool.
+	 * 1 = legacy serial PUT (backwards compat); >1 = parallel via CURLM. */
+	int upload_workers;		/* --upload-workers N (default 8) */
+	int upload_part_mb;		/* --upload-part-mb N, default 8 (S3 multipart part size) */
+	bool sign_payload;		/* --sign-payload: compute x-amz-content-sha256 of body (default UNSIGNED-PAYLOAD) */
+
 	/* Hot VMA exclude ranges for pre-dump */
 	struct list_head exclude_ranges;
 	/* No-parent ranges: dump normally but without parent reference */
