@@ -1588,7 +1588,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 		/* Fetch from object storage */
 		lp_info(lpi, ">>> Fetching %d pages from object storage <<<\n", nr_pages);
-		ret = uffd_handle_pages(lpi, fetch_start, nr_pages, PR_ASYNC | PR_ASAP);
+		ret = uffd_handle_pages(lpi, fetch_start, nr_pages, PR_ASYNC | PR_ASAP | PR_FAULT);
 
 		if (ret < 0) {
 			lp_err(lpi, "!!! Fetch FAILED for [0x%lx - 0x%lx] !!!\n",
@@ -1619,7 +1619,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	list_move(&iov->l, &lpi->reqs);
 	update_xfer_len(lpi, true);
 
-	ret = uffd_handle_pages(lpi, iov->img_start, 1, PR_ASYNC | PR_ASAP);
+	ret = uffd_handle_pages(lpi, iov->img_start, 1, PR_ASYNC | PR_ASAP | PR_FAULT);
 	if (ret < 0) {
 		lp_err(lpi, "Error during single page copy\n");
 		list_move(&iov->l, &lpi->iovs);

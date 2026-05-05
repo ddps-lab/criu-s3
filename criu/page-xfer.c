@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <time.h>
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-xfer: "
@@ -2353,6 +2354,11 @@ struct ps_async_read {
 	ps_async_read_complete complete;
 	void *priv;
 
+	/* page-server stall instrumentation: time from request enqueue
+	 * until the response is fully received. Logged in page_server_read. */
+	struct timespec start_ts;
+	bool from_fault;
+
 	struct list_head l;
 };
 
@@ -2365,16 +2371,19 @@ static inline void async_read_set_goal(struct ps_async_read *ar, int nr_pages)
 }
 
 static void init_ps_async_read(struct ps_async_read *ar, void *buf, int nr_pages, ps_async_read_complete complete,
-			       void *priv)
+			       void *priv, bool from_fault)
 {
 	ar->pages = buf;
 	ar->rb = 0;
 	ar->complete = complete;
 	ar->priv = priv;
+	ar->from_fault = from_fault;
+	clock_gettime(CLOCK_MONOTONIC, &ar->start_ts);
 	async_read_set_goal(ar, nr_pages);
 }
 
-static int page_server_start_async_read(void *buf, int nr_pages, ps_async_read_complete complete, void *priv)
+static int page_server_start_async_read(void *buf, int nr_pages, ps_async_read_complete complete, void *priv,
+					bool from_fault)
 {
 	struct ps_async_read *ar;
 
@@ -2382,7 +2391,7 @@ static int page_server_start_async_read(void *buf, int nr_pages, ps_async_read_c
 	if (ar == NULL)
 		return -1;
 
-	init_ps_async_read(ar, buf, nr_pages, complete, priv);
+	init_ps_async_read(ar, buf, nr_pages, complete, priv, from_fault);
 	list_add_tail(&ar->l, &async_reads);
 	return 0;
 }
@@ -2432,6 +2441,20 @@ static int page_server_read(struct ps_async_read *ar, int flags)
 	 * IO complete -- notify the caller and drop the request
 	 */
 	BUG_ON(ar->rb > ar->goal);
+
+	{
+		struct timespec end_ts;
+		double dur_ms;
+
+		clock_gettime(CLOCK_MONOTONIC, &end_ts);
+		dur_ms = (end_ts.tv_sec - ar->start_ts.tv_sec) * 1000.0 +
+			 (end_ts.tv_nsec - ar->start_ts.tv_nsec) / 1.0e6;
+		pr_info("pageserver: FETCH_DONE iov=0x%lx len=%lu dur_ms=%.2f src=%s\n",
+			(unsigned long)ar->pi.vaddr,
+			(unsigned long)((unsigned long)ar->pi.nr_pages * PAGE_SIZE),
+			dur_ms, ar->from_fault ? "fault" : "prefetch");
+	}
+
 	return ar->complete((int)ar->pi.dst_id, (unsigned long)ar->pi.vaddr, (int)ar->pi.nr_pages, ar->priv);
 }
 
@@ -2491,12 +2514,13 @@ int request_remote_pages(unsigned long img_id, unsigned long addr, int nr_pages)
 	return 0;
 }
 
-static int page_server_start_sync_read(void *buf, int nr, ps_async_read_complete complete, void *priv)
+static int page_server_start_sync_read(void *buf, int nr, ps_async_read_complete complete, void *priv,
+				       bool from_fault)
 {
 	struct ps_async_read ar;
 	int ret = 1;
 
-	init_ps_async_read(&ar, buf, nr, complete, priv);
+	init_ps_async_read(&ar, buf, nr, complete, priv, from_fault);
 	while (ret == 1)
 		ret = page_server_read(&ar, MSG_WAITALL);
 	return ret;
@@ -2504,8 +2528,10 @@ static int page_server_start_sync_read(void *buf, int nr, ps_async_read_complete
 
 int page_server_start_read(void *buf, int nr, ps_async_read_complete complete, void *priv, unsigned flags)
 {
+	bool from_fault = !!(flags & PR_FAULT);
+
 	if (flags & PR_ASYNC)
-		return page_server_start_async_read(buf, nr, complete, priv);
+		return page_server_start_async_read(buf, nr, complete, priv, from_fault);
 	else
-		return page_server_start_sync_read(buf, nr, complete, priv);
+		return page_server_start_sync_read(buf, nr, complete, priv, from_fault);
 }
