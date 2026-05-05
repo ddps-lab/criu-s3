@@ -1307,7 +1307,19 @@ static int maybe_read_page_object_storage(struct page_read *pr, unsigned long va
 	 * is created on the local filesystem; the buffer lives only as
 	 * long as this page_read.
 	 */
-	if (pr->ra_cap > 0) {
+	/*
+	 * Read-ahead is intended for cr-restore's eager pagemap walk,
+	 * which issues many small sequential reads against pages-N.img.
+	 * The lazy-pages daemon's UFFD fault path is the opposite: each
+	 * fault asks for one IOV (typically a few KB) at a non-monotonic
+	 * offset, so a 16 MB ra_buf refill becomes a 16 MB Range GET that
+	 * the fault thread waits on. Across-region per-stream throughput
+	 * (~0.7 MB/s observed) makes that wait dominate cr-restore wall
+	 * time when many threads each fault once during pie restore. Skip
+	 * ra_buf in the fault path and serve via the exact-size direct
+	 * fetch below.
+	 */
+	if (pr->ra_cap > 0 && !(flags & PR_FAULT)) {
 		off_t hit_lo = pr->pi_off;
 		off_t hit_hi = pr->pi_off + (off_t)len;
 
