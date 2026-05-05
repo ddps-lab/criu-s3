@@ -446,7 +446,13 @@ void init_opts(void)
 	/* Initialize Async Prefetch options */
 	opts.object_storage_parallel_xfer = false;
 	opts.prefetch_workers = 0;		/* 0 = auto-detect from NIC speed */
-	opts.prefetch_batch_bytes = 64UL * 1024 * 1024;  /* 64 MB default; 0 disables batching */
+	/*
+	 * Default coalesce limit: 0 = unlimited (only IOV adjacency stops the
+	 * batch). For cross-region S3 the per-request HTTP/TLS round-trip
+	 * dominates over per-byte transfer, so larger Range GETs amortize
+	 * better; stall doesn't matter because prefetch is background.
+	 */
+	opts.prefetch_batch_bytes = 0;
 
 	/* Initialize compression options (--compress: zstd seekable) */
 	opts.compress = false;

@@ -25,6 +25,7 @@
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
 #include "object-storage.h"
+#include "obstor_prefetch.h"
 #include "compression.h"
 
 #ifndef SEEK_DATA
@@ -1061,12 +1062,24 @@ static int prefetch_eager_ranges(struct page_read *pr)
 	else
 		snprintf(object_key, sizeof(object_key), "%s", image_name);
 
-	/* Worker count: same reasoning as obstor_prefetch — tiny number of
-	 * threads to avoid the libcurl/OpenSSL TLS-handshake serialization
-	 * pathology we hit before. 4 is the sweet spot on m5.8xlarge. */
-	nw = nr_ranges;
-	if (nw > 4)
-		nw = 4;
+	/*
+	 * Worker count for the eager-prefetch wave that runs INSIDE criu
+	 * restore (not the lazy-pages daemon). This is on the restore
+	 * critical path: cr-restore's pagemap walk blocks until eager_buf
+	 * is filled, so any parallelism here directly cuts restore wall
+	 * time. We use opts.prefetch_workers when given (so an experiment
+	 * can tune it from the CLI), otherwise OBSTOR_DEFAULT_WORKERS (32),
+	 * capped at nr_ranges since we can't parallelize beyond the number
+	 * of distinct ranges. Earlier comment about a "TLS-handshake
+	 * serialization pathology at high N" turned out to be transient
+	 * cold-start cost — once the first request per thread completes,
+	 * subsequent ones reuse the libcurl handle's TLS session and N=32
+	 * scales linearly on the cross-region path (calibration knee).
+	 */
+	{
+		int requested = opts.prefetch_workers > 0 ? opts.prefetch_workers : OBSTOR_DEFAULT_WORKERS;
+		nw = nr_ranges < requested ? nr_ranges : requested;
+	}
 
 	tids = xmalloc(nw * sizeof(pthread_t));
 	args = xmalloc(nr_ranges * sizeof(*args));

@@ -741,7 +741,13 @@ static void set_fixed_curl_options(CURL *handle)
 	 * lets the kernel TCP receive buffer fill with fewer userspace
 	 * hops. Complements SO_RCVBUF tuning below.
 	 */
-	curl_easy_setopt(handle, CURLOPT_BUFFERSIZE, 512L * 1024L);
+	/*
+	 * 16 MB receive hint (libcurl rounds to its internal max, currently
+	 * 16 MB for the easy interface). Larger than the 512 KB default to
+	 * let TCP receive window fully scale on high-BDP cross-region paths
+	 * (us-west-2 ↔ eu-west-3, ~134 ms RTT × ~1 Gbps → ~17 MB BDP).
+	 */
+	curl_easy_setopt(handle, CURLOPT_BUFFERSIZE, 16L * 1024L * 1024L);
 
 	/* TCP_NODELAY: disable Nagle for small request bursts. */
 	curl_easy_setopt(handle, CURLOPT_TCP_NODELAY, 1L);

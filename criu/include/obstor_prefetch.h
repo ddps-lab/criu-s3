@@ -5,6 +5,14 @@
 #include <stddef.h>
 
 /*
+ * Default worker count for object-storage parallel fetch — used by both
+ * the lazy-pages prefetch pool (criu/obstor_xfer.c) and the cr-restore
+ * eager prefetch wave (criu/pagemap.c::prefetch_eager_ranges). Bumped
+ * from 8 to 32 to match the cross-region S3 calibration knee.
+ */
+#define OBSTOR_DEFAULT_WORKERS 32
+
+/*
  * Metadata prefetch for object-storage lazy restore.
  *
  * At restore / lazy-pages daemon startup, enumerate all object keys under

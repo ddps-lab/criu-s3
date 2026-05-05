@@ -20,6 +20,7 @@
 #include <dirent.h>
 
 #include "obstor_xfer.h"
+#include "obstor_prefetch.h"
 #include "auto_nic.h"
 #include "log.h"
 #include "xmalloc.h"
@@ -913,7 +914,8 @@ out:
  * behaves on commodity hardware and a 10 Gbps-class cloud NIC.
  * See issues/phase6-worker-count-notes.md.
  */
-#define OBSTOR_DEFAULT_WORKERS 8
+/* OBSTOR_DEFAULT_WORKERS is defined in include/obstor_prefetch.h so the
+ * cr-restore eager-prefetch path (pagemap.c) can use the same default. */
 
 /*
  * Per-IOV install for one batch element. Looks up the meta by exact
