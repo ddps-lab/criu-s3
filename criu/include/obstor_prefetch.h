@@ -52,6 +52,16 @@ int obstor_prefetch_init(int num_workers);
 int obstor_prefetch_lookup(const char *path, const void **out_data, size_t *out_len);
 
 /*
+ * Look up the LIST-reported byte size for `path`. Available for every key
+ * the LIST wave saw, including pages-*.img (which we don't fetch into the
+ * data cache). Lets HEAD short-circuit avoid a per-pages round-trip.
+ *
+ * On hit: *out_size set to the size from <Size>, returns 0.
+ * On miss: returns -1.
+ */
+int obstor_prefetch_lookup_size(const char *path, unsigned long *out_size);
+
+/*
  * True iff a previous obstor_prefetch_init() successfully LISTed and
  * populated the cache. If true, a lookup miss means the file does not
  * exist in object storage — callers can skip any sync fallback GET.

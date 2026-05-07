@@ -25,6 +25,7 @@
 #include "log.h"
 #include "cr_options.h"
 #include "object-storage.h"
+#include "obstor_prefetch.h"
 #include "servicefd.h"
 #include "xmalloc.h"
 
@@ -3028,6 +3029,8 @@ int object_storage_get_object(const char *object_key, void **out_data, unsigned 
 	CURLcode res;
 	long http_code = 0;
 	struct curl_slist *headers = NULL;
+	const void *cache_data = NULL;
+	size_t cache_len = 0;
 
 	if (!object_key || !out_data || !out_length) {
 		pr_err("get_object: NULL parameter\n");
@@ -3036,6 +3039,33 @@ int object_storage_get_object(const char *object_key, void **out_data, unsigned 
 
 	*out_data = NULL;
 	*out_length = 0;
+
+	/*
+	 * Short-circuit via the metadata prefetch cache. obstor_prefetch_init
+	 * LISTed the active prefix (and its parent chain) and fetched every
+	 * non-pages key in parallel, so the cache mirrors the set of objects
+	 * that exist on S3 under this prefix. A miss on an authoritative cache
+	 * means the object truly doesn't exist — no point burning a 134ms
+	 * cross-region 404. Most visibly this kills the per-page_read GET of
+	 * "parent-prefix" on full dumps (called from open_page_xfer,
+	 * try_open_parent_at, get_parent_inventory).
+	 */
+	if (obstor_prefetch_lookup(object_key, &cache_data, &cache_len) == 0) {
+		void *copy = malloc(cache_len);
+		if (!copy)
+			return -1;
+		memcpy(copy, cache_data, cache_len);
+		*out_data = copy;
+		*out_length = cache_len;
+		pr_debug("GET %s: %lu bytes (prefetch cache hit)\n", object_key,
+			 (unsigned long)cache_len);
+		return 0;
+	}
+	if (obstor_prefetch_is_authoritative()) {
+		pr_debug("GET %s: skipped (prefetch cache authoritative miss)\n",
+			 object_key);
+		return -ENOENT;
+	}
 
 	if (opts.express_one_zone) {
 		if (ensure_valid_session() != 0)
@@ -3116,6 +3146,7 @@ int object_storage_head_object(const char *object_key, unsigned long *out_length
 	long http_code = 0;
 	curl_off_t content_length = -1;
 	struct curl_slist *headers = NULL;
+	unsigned long cached_size = 0;
 
 	if (!object_key || !out_length) {
 		pr_err("head_object: NULL parameter\n");
@@ -3123,6 +3154,25 @@ int object_storage_head_object(const char *object_key, unsigned long *out_length
 	}
 
 	*out_length = 0;
+
+	/*
+	 * Short-circuit via the prefetch size cache. obstor_prefetch_init
+	 * pulled <Size> out of the LIST response for every key in the active
+	 * prefix (including pages-*.img we don't download), so we can answer
+	 * HEAD directly without a cross-region round-trip. Authoritative miss
+	 * still returns -ENOENT so existence semantics match the real HEAD.
+	 */
+	if (obstor_prefetch_lookup_size(object_key, &cached_size) == 0) {
+		*out_length = cached_size;
+		pr_debug("HEAD %s: %lu bytes (prefetch size cache hit)\n",
+			 object_key, cached_size);
+		return 0;
+	}
+	if (obstor_prefetch_is_authoritative()) {
+		pr_debug("HEAD %s: skipped (prefetch cache authoritative miss)\n",
+			 object_key);
+		return -ENOENT;
+	}
 
 	if (opts.express_one_zone) {
 		if (ensure_valid_session() != 0)
@@ -3260,7 +3310,8 @@ static int _xml_extract_next(const char **cursor, const char *end, const char *t
  * Returns 0 on success, -1 on failure.
  */
 static int _list_objects_v2_once(const char *key_prefix, const char *continuation_in,
-				 char ***io_keys, size_t *io_n, size_t *io_cap,
+				 char ***io_keys, unsigned long **io_sizes,
+				 size_t *io_n, size_t *io_cap,
 				 char **continuation_out)
 {
 	struct object_url_info url_info_unused;
@@ -3278,7 +3329,6 @@ static int _list_objects_v2_once(const char *key_prefix, const char *continuatio
 	const char *endpoint_url, *hostname;
 	const char *cursor, *end_p;
 	char truncated_buf[16];
-	char key_buf[2048];
 	int ret = -1;
 
 	(void)url_info_unused;
@@ -3393,21 +3443,85 @@ static int _list_objects_v2_once(const char *key_prefix, const char *continuatio
 		goto out;
 	}
 
-	/* Parse XML: extract all <Key> and optional <NextContinuationToken>. */
+	/*
+	 * Parse XML by walking <Contents>...</Contents> blocks, extracting
+	 * <Key> and <Size> from each. Doing this per-block (rather than
+	 * separate sequential walks for Key and Size) keeps the pairing
+	 * unambiguous if S3 ever changes the relative order.
+	 */
 	cursor = (const char *)chunk.memory;
 	end_p = cursor + chunk.size;
-	while (_xml_extract_next(&cursor, end_p, "Key", key_buf, sizeof(key_buf)) == 0) {
+	for (;;) {
+		const char *contents_open;
+		const char *contents_close;
+		const char *kp, *kq;
+		const char *sp, *sq;
+		char key_buf[2048];
+		char size_buf[64];
+		unsigned long size_val = 0;
+		size_t key_len, size_len;
+
+		contents_open = strstr(cursor, "<Contents>");
+		if (!contents_open || contents_open >= end_p)
+			break;
+		contents_close = strstr(contents_open, "</Contents>");
+		if (!contents_close || contents_close >= end_p)
+			break;
+
+		kp = strstr(contents_open, "<Key>");
+		if (!kp || kp >= contents_close) {
+			cursor = contents_close + strlen("</Contents>");
+			continue;
+		}
+		kp += strlen("<Key>");
+		kq = strstr(kp, "</Key>");
+		if (!kq || kq >= contents_close) {
+			cursor = contents_close + strlen("</Contents>");
+			continue;
+		}
+		key_len = (size_t)(kq - kp);
+		if (key_len >= sizeof(key_buf))
+			key_len = sizeof(key_buf) - 1;
+		memcpy(key_buf, kp, key_len);
+		key_buf[key_len] = '\0';
+
+		sp = strstr(contents_open, "<Size>");
+		if (sp && sp < contents_close) {
+			sp += strlen("<Size>");
+			sq = strstr(sp, "</Size>");
+			if (sq && sq < contents_close) {
+				size_len = (size_t)(sq - sp);
+				if (size_len < sizeof(size_buf)) {
+					memcpy(size_buf, sp, size_len);
+					size_buf[size_len] = '\0';
+					size_val = strtoul(size_buf, NULL, 10);
+				}
+			}
+		}
+
 		if (*io_n == *io_cap) {
 			size_t new_cap = *io_cap ? (*io_cap) * 2 : 128;
 			char **nk = realloc(*io_keys, new_cap * sizeof(char *));
+			unsigned long *ns;
+
 			if (!nk) {
-				pr_err("list_objects: realloc failed\n");
+				pr_err("list_objects: realloc keys failed\n");
 				goto out;
 			}
 			*io_keys = nk;
+			ns = realloc(*io_sizes, new_cap * sizeof(unsigned long));
+			if (!ns) {
+				pr_err("list_objects: realloc sizes failed\n");
+				goto out;
+			}
+			*io_sizes = ns;
 			*io_cap = new_cap;
 		}
-		(*io_keys)[(*io_n)++] = xstrdup(key_buf);
+		(*io_keys)[*io_n] = xstrdup(key_buf);
+		(*io_sizes)[*io_n] = size_val;
+		(*io_n)++;
+
+		cursor = contents_close + strlen("</Contents>");
 	}
 
 	{
@@ -3428,13 +3542,17 @@ out:
 }
 
 /*
- * Enumerate all object keys under the given prefix.
- * On success: *out_keys points to an xmalloc'd array of xstrdup'd key strings,
- * *out_n is the count. Caller must xfree each key and the array.
+ * Enumerate all object keys under the given prefix, also returning their
+ * sizes (via the LIST <Size> field). On success: *out_keys is a parallel
+ * array of xstrdup'd key strings, *out_sizes is a realloc'd array of byte
+ * sizes, *out_n is the count. Caller must xfree each key, the keys array,
+ * and free() the sizes array. Pass out_sizes=NULL if sizes aren't needed.
  */
-int object_storage_list_objects(const char *key_prefix, char ***out_keys, size_t *out_n)
+int object_storage_list_objects(const char *key_prefix, char ***out_keys,
+				unsigned long **out_sizes, size_t *out_n)
 {
 	char **keys = NULL;
+	unsigned long *sizes = NULL;
 	size_t n = 0, cap = 0;
 	char *continuation = NULL;
 	int rounds = 0;
@@ -3442,11 +3560,14 @@ int object_storage_list_objects(const char *key_prefix, char ***out_keys, size_t
 	if (!out_keys || !out_n)
 		return -1;
 	*out_keys = NULL;
+	if (out_sizes)
+		*out_sizes = NULL;
 	*out_n = 0;
 
 	do {
 		char *next = NULL;
-		if (_list_objects_v2_once(key_prefix, continuation, &keys, &n, &cap, &next) != 0) {
+		if (_list_objects_v2_once(key_prefix, continuation, &keys, &sizes,
+					  &n, &cap, &next) != 0) {
 			if (continuation)
 				xfree(continuation);
 			goto err;
@@ -3462,11 +3583,17 @@ int object_storage_list_objects(const char *key_prefix, char ***out_keys, size_t
 	} while (continuation);
 
 	*out_keys = keys;
+	if (out_sizes)
+		*out_sizes = sizes;
+	else if (sizes)
+		free(sizes);
 	*out_n = n;
 	pr_info("LIST prefix='%s': %zu keys (%d page(s))\n", key_prefix ? key_prefix : "", n, rounds);
 	return 0;
 
 err:
+	if (sizes)
+		free(sizes);
 	if (keys) {
 		size_t i;
 		for (i = 0; i < n; i++)
