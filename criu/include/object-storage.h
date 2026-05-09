@@ -194,11 +194,14 @@ int object_storage_head_object(const char *object_key, unsigned long *out_length
  * Handles pagination; returned keys are all under the given prefix.
  *
  * On success: *out_keys is an xmalloc'd array of xstrdup'd key strings,
- * *out_n is the count. Caller must xfree each key and free() the array.
+ * *out_sizes (if non-NULL) is a parallel realloc'd array of byte sizes from
+ * the LIST <Size> field, *out_n is the count. Caller must xfree each key
+ * and free() both arrays. Pass out_sizes=NULL if sizes are not needed.
  *
  * Returns 0 on success, -1 on failure.
  */
-int object_storage_list_objects(const char *key_prefix, char ***out_keys, size_t *out_n);
+int object_storage_list_objects(const char *key_prefix, char ***out_keys,
+				unsigned long **out_sizes, size_t *out_n);
 
 /*
  * Re-initialize the object-storage client after a fork (e.g. the lazy-pages

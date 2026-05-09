@@ -20,8 +20,9 @@
 
 struct cache_entry {
 	char *path;
-	void *data;
-	size_t len;
+	void *data;          /* NULL when only size is known (e.g. pages-*.img) */
+	size_t len;          /* 0 when data is NULL */
+	unsigned long size;  /* object size on S3 from LIST <Size> */
 	struct cache_entry *next;
 };
 
@@ -54,15 +55,94 @@ static unsigned long _path_hash(const char *s)
 	return h;
 }
 
-static int _cache_insert(const char *path, void *data, size_t len)
+/*
+ * Record the LIST-reported object size for `path`. Inserts a new size-only
+ * entry (data=NULL) when none exists, or updates the size on an existing
+ * entry. Used at LIST time before any data has been fetched, so HEAD
+ * short-circuit can find the size even for keys we don't download (e.g.
+ * pages-*.img).
+ */
+static int _cache_record_size(const char *path, unsigned long size)
 {
-	struct cache_entry *e;
+	struct cache_entry *e, *cur;
 	unsigned long bkt;
+
+	bkt = _path_hash(path) % OBSTOR_PREFETCH_BUCKETS;
+
+	pthread_mutex_lock(&g_cache_lock);
+	for (cur = g_cache[bkt]; cur; cur = cur->next) {
+		if (strcmp(cur->path, path) == 0) {
+			cur->size = size;
+			pthread_mutex_unlock(&g_cache_lock);
+			return 0;
+		}
+	}
+	pthread_mutex_unlock(&g_cache_lock);
 
 	e = xmalloc(sizeof(*e));
 	if (!e)
 		return -1;
+	e->path = xstrdup(path);
+	if (!e->path) {
+		xfree(e);
+		return -1;
+	}
+	e->data = NULL;
+	e->len = 0;
+	e->size = size;
 
+	pthread_mutex_lock(&g_cache_lock);
+	/* Re-check under lock to avoid duplicate insert under concurrency. */
+	for (cur = g_cache[bkt]; cur; cur = cur->next) {
+		if (strcmp(cur->path, path) == 0) {
+			cur->size = size;
+			pthread_mutex_unlock(&g_cache_lock);
+			xfree(e->path);
+			xfree(e);
+			return 0;
+		}
+	}
+	e->next = g_cache[bkt];
+	g_cache[bkt] = e;
+	g_cache_entries++;
+	pthread_mutex_unlock(&g_cache_lock);
+
+	return 0;
+}
+
+/*
+ * Record fetched object bytes for `path`. Updates an existing entry in
+ * place (typically the size-only entry inserted at LIST time) or inserts a
+ * new entry if none exists. Takes ownership of `data` on success.
+ */
+static int _cache_record_data(const char *path, void *data, size_t len)
+{
+	struct cache_entry *e;
+	unsigned long bkt;
+
+	bkt = _path_hash(path) % OBSTOR_PREFETCH_BUCKETS;
+
+	pthread_mutex_lock(&g_cache_lock);
+	for (e = g_cache[bkt]; e; e = e->next) {
+		if (strcmp(e->path, path) == 0) {
+			if (e->data) {
+				g_cache_bytes -= e->len;
+				free(e->data);
+			}
+			e->data = data;
+			e->len = len;
+			if (e->size == 0)
+				e->size = len;
+			g_cache_bytes += len;
+			pthread_mutex_unlock(&g_cache_lock);
+			return 0;
+		}
+	}
+	pthread_mutex_unlock(&g_cache_lock);
+
+	e = xmalloc(sizeof(*e));
+	if (!e)
+		return -1;
 	e->path = xstrdup(path);
 	if (!e->path) {
 		xfree(e);
@@ -70,8 +150,7 @@ static int _cache_insert(const char *path, void *data, size_t len)
 	}
 	e->data = data;
 	e->len = len;
-
-	bkt = _path_hash(path) % OBSTOR_PREFETCH_BUCKETS;
+	e->size = len;
 
 	pthread_mutex_lock(&g_cache_lock);
 	e->next = g_cache[bkt];
@@ -119,22 +198,74 @@ int obstor_prefetch_lookup(const char *path, const void **out_data, size_t *out_
 		return -1;
 
 	/*
-	 * Build the full key the same way we did at insert time:
-	 * normalize(opts.object_storage_object_prefix) + path. Using just
-	 * `path` (e.g., "inventory.img") is ambiguous when pre-dump chains
-	 * swap the active prefix — parent and child snapshots share
-	 * basenames but live under different S3 prefixes.
+	 * Build the full key the same way we did at insert time. Mirror the
+	 * convention used by _construct_object_url() in object-storage.c:
+	 * any key containing '/' is already absolute (e.g., probe keys built
+	 * as "<prefix>/pages-N.img"), bare filenames need the active prefix
+	 * prepended. Without this, full-path callers (HEAD / range probes)
+	 * always miss because we'd double up the prefix.
 	 */
-	_normalize_prefix(opts.object_storage_object_prefix, normalized, sizeof(normalized));
-	snprintf(full_key, sizeof(full_key), "%s%s", normalized, path);
+	if (strchr(path, '/')) {
+		snprintf(full_key, sizeof(full_key), "%s", path);
+	} else {
+		_normalize_prefix(opts.object_storage_object_prefix, normalized,
+				  sizeof(normalized));
+		snprintf(full_key, sizeof(full_key), "%s%s", normalized, path);
+	}
 
 	bkt = _path_hash(full_key) % OBSTOR_PREFETCH_BUCKETS;
 
 	pthread_mutex_lock(&g_cache_lock);
 	for (e = g_cache[bkt]; e; e = e->next) {
 		if (strcmp(e->path, full_key) == 0) {
+			/* Size-only entry: data not in cache (e.g. pages-*.img
+			 * skipped at fetch wave). Treat as miss for data lookup
+			 * so caller falls back to a real GET. Authoritative
+			 * miss check below still covers the doesn't-exist case. */
+			if (!e->data) {
+				pthread_mutex_unlock(&g_cache_lock);
+				return -1;
+			}
 			*out_data = e->data;
 			*out_len = e->len;
+			pthread_mutex_unlock(&g_cache_lock);
+			return 0;
+		}
+	}
+	pthread_mutex_unlock(&g_cache_lock);
+	return -1;
+}
+
+int obstor_prefetch_lookup_size(const char *path, unsigned long *out_size)
+{
+	struct cache_entry *e;
+	unsigned long bkt;
+	char normalized[512];
+	char full_key[1024];
+
+	if (!g_prefetch_initialized || !path || !out_size)
+		return -1;
+
+	/*
+	 * Mirror _construct_object_url(): keys with '/' are already absolute
+	 * (e.g., "<prefix>/pages-N.img" passed by init_s3_compression and the
+	 * lazy-pages compression probe), bare names get the prefix prepended.
+	 * Cache keys are always stored in absolute form.
+	 */
+	if (strchr(path, '/')) {
+		snprintf(full_key, sizeof(full_key), "%s", path);
+	} else {
+		_normalize_prefix(opts.object_storage_object_prefix, normalized,
+				  sizeof(normalized));
+		snprintf(full_key, sizeof(full_key), "%s%s", normalized, path);
+	}
+
+	bkt = _path_hash(full_key) % OBSTOR_PREFETCH_BUCKETS;
+
+	pthread_mutex_lock(&g_cache_lock);
+	for (e = g_cache[bkt]; e; e = e->next) {
+		if (strcmp(e->path, full_key) == 0) {
+			*out_size = e->size;
 			pthread_mutex_unlock(&g_cache_lock);
 			return 0;
 		}
@@ -268,7 +399,7 @@ static void *_prefetch_worker(void *arg)
 		rc = object_storage_get_object(item->stripped, &data, &len);
 
 		if (rc == 0 && data && len > 0) {
-			if (_cache_insert(item->full_key, data, len) != 0) {
+			if (_cache_record_data(item->full_key, data, len) != 0) {
 				pr_warn("cache insert failed for %s\n", item->full_key);
 				free(data);
 			}
@@ -296,6 +427,7 @@ static void *_prefetch_worker(void *arg)
 static int _prefetch_current_prefix(int num_workers, char *parent_prefix_out, size_t parent_cap)
 {
 	char **keys = NULL;
+	unsigned long *sizes = NULL;
 	size_t nkeys = 0, i;
 	struct work_queue wq;
 	pthread_t *tids = NULL;
@@ -311,14 +443,32 @@ static int _prefetch_current_prefix(int num_workers, char *parent_prefix_out, si
 	current_prefix = opts.object_storage_object_prefix ? opts.object_storage_object_prefix : "";
 	_normalize_prefix(current_prefix, normalized, sizeof(normalized));
 
-	if (object_storage_list_objects(current_prefix, &keys, &nkeys) != 0) {
+	if (object_storage_list_objects(current_prefix, &keys, &sizes, &nkeys) != 0) {
 		pr_err("LIST failed for prefix '%s'\n", current_prefix);
 		return -1;
 	}
 	if (nkeys == 0) {
 		pr_info("LIST returned 0 keys for prefix '%s'\n", current_prefix);
 		free(keys);
+		if (sizes)
+			free(sizes);
 		return 0;
+	}
+
+	/*
+	 * Record (key → size) for every LISTed key, including pages-*.img
+	 * which we don't fetch into the cache. Lets HEAD short-circuit
+	 * resolve sizes from the LIST result instead of paying a per-pages
+	 * round-trip in the compression-detection probe.
+	 */
+	for (i = 0; i < nkeys; i++) {
+		const char *stripped = _strip_prefix(keys[i], current_prefix);
+		char full_key[1024];
+
+		if (!stripped || !stripped[0])
+			continue;
+		snprintf(full_key, sizeof(full_key), "%s%s", normalized, stripped);
+		_cache_record_size(full_key, sizes[i]);
 	}
 
 	wq.items = xmalloc(nkeys * sizeof(char *));
@@ -326,6 +476,7 @@ static int _prefetch_current_prefix(int num_workers, char *parent_prefix_out, si
 		for (i = 0; i < nkeys; i++)
 			xfree(keys[i]);
 		free(keys);
+		free(sizes);
 		return -1;
 	}
 	wq.n = 0;
@@ -360,6 +511,8 @@ static int _prefetch_current_prefix(int num_workers, char *parent_prefix_out, si
 		xfree(keys[i]);
 	}
 	free(keys);
+	if (sizes)
+		free(sizes);
 
 	pr_info("prefix '%s': enqueued %zu keys (skipped pages-*/subdirs)\n", current_prefix, wq.n);
 
