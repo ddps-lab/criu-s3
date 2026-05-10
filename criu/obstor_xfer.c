@@ -1417,12 +1417,12 @@ void prefetch_cleanup(void)
 }
 
 /*
- * Load hot VMA metadata from hot-vmas.json in images directory.
- * Marks IOVs overlapping with hot VMA ranges as is_hot=true.
+ * Load hot IOV metadata from hot-iovs.json in images directory.
+ * Marks IOVs overlapping with hot ranges as is_hot=true.
  * Tries local file first, then S3 fallback.
  * Returns number of hot IOVs found, or 0 if file not found.
  */
-static int load_hot_vma_metadata(void)
+static int load_hot_iov_metadata(void)
 {
 	char *data = NULL;
 	unsigned long data_len = 0;
@@ -1431,7 +1431,7 @@ static int load_hot_vma_metadata(void)
 	char *p;
 
 	/* Try local file first */
-	fd = openat(get_service_fd(IMG_FD_OFF), "hot-vmas.json", O_RDONLY);
+	fd = openat(get_service_fd(IMG_FD_OFF), "hot-iovs.json", O_RDONLY);
 	if (fd >= 0) {
 		off_t fsize = lseek(fd, 0, SEEK_END);
 		if (fsize > 0) {
@@ -1452,7 +1452,7 @@ static int load_hot_vma_metadata(void)
 	/* S3 fallback */
 	if (!data && opts.enable_object_storage) {
 		void *s3_data = NULL;
-		int ret = object_storage_get_object("hot-vmas.json", &s3_data, &data_len);
+		int ret = object_storage_get_object("hot-iovs.json", &s3_data, &data_len);
 		if (ret == 0 && s3_data && data_len > 0) {
 			data = xmalloc(data_len + 1);
 			if (data) {
@@ -1466,7 +1466,7 @@ static int load_hot_vma_metadata(void)
 	}
 
 	if (!data || data_len == 0) {
-		pr_info("No hot-vmas.json found, using sequential priority\n");
+		pr_info("No hot-iovs.json found, using sequential priority\n");
 		return 0;
 	}
 
@@ -1475,7 +1475,7 @@ static int load_hot_vma_metadata(void)
 	/* Simple parser: find "start": "0x..." and "end": "0x..." in excluded array */
 	p = strstr(data, "\"excluded\"");
 	if (!p) {
-		pr_warn("hot-vmas.json: no 'excluded' field\n");
+		pr_warn("hot-iovs.json: no 'excluded' field\n");
 		xfree(data);
 		return 0;
 	}
@@ -1503,7 +1503,7 @@ static int load_hot_vma_metadata(void)
 		if (start == 0 || end == 0 || end <= start)
 			continue;
 
-		pr_info("Hot VMA range: 0x%lx - 0x%lx (%lu MB)\n",
+		pr_info("Hot IOV range: 0x%lx - 0x%lx (%lu MB)\n",
 			start, end, (end - start) / (1024 * 1024));
 
 		/* Mark overlapping IOVs as hot */
@@ -1521,7 +1521,7 @@ static int load_hot_vma_metadata(void)
 	}
 
 	xfree(data);
-	pr_info("Marked %d IOVs as hot from hot-vmas.json\n", hot_count);
+	pr_info("Marked %d IOVs as hot from hot-iovs.json\n", hot_count);
 	return hot_count;
 }
 
@@ -1537,7 +1537,7 @@ int prefetch_prequeue_all_iovs(void *lpi, unsigned int pages_img_id)
 
 	/* Load hot VMA metadata and mark IOVs (if enabled) */
 	if (opts.hot_vma_seed)
-		load_hot_vma_metadata();
+		load_hot_iov_metadata();
 
 	pr_info("CONTROLLER: Pre-queueing all IOVs (total: %d)\n", total_iovs);
 

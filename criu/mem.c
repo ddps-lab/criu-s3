@@ -303,7 +303,7 @@ static void save_hot_vma_metadata(const char *imgs_dir)
 	FILE *f;
 	bool first;
 
-	snprintf(path, sizeof(path), "%s/hot-vmas.json", imgs_dir);
+	snprintf(path, sizeof(path), "%s/hot-iovs.json", imgs_dir);
 	f = fopen(path, "w");
 	if (!f) {
 		pr_perror("Can't create %s", path);
