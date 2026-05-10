@@ -60,7 +60,19 @@
 #include "cgroup.h"
 #include "cgroup-props.h"
 #include "file-lock.h"
+#include <pthread.h>
+
 #include "page-xfer.h"
+#include "object-storage.h"
+
+/* Background thread wrapper for object_storage_write_metadata_bundle so
+ * dump finalize can run bundle PUT and manifest PUT in parallel. */
+static void *_dump_finalize_bundle_thread(void *arg)
+{
+	(void)arg;
+	(void)object_storage_write_metadata_bundle();
+	return NULL;
+}
 #include "kerndat.h"
 #include "stats.h"
 #include "mem.h"
@@ -1906,6 +1918,26 @@ err:
 	else {
 		write_stats(DUMP_STATS);
 		pr_info("Pre-dumping finished successfully\n");
+		/*
+		 * Mirror the full-dump path: drain async uploads, then write
+		 * bundle + manifest in parallel. Each pre-dump level writes
+		 * its own manifest at its own prefix, and restore walks the
+		 * chain reading each level's manifest (or falling back to
+		 * LIST per level on legacy dumps).
+		 */
+		if (opts.enable_object_storage && opts.object_storage_upload) {
+			pthread_t bundle_tid;
+			int b_ok;
+			object_storage_drain_uploads();
+			b_ok = (pthread_create(&bundle_tid, NULL,
+					       _dump_finalize_bundle_thread,
+					       NULL) == 0);
+			(void)object_storage_write_manifest();
+			if (b_ok)
+				pthread_join(bundle_tid, NULL);
+			else
+				(void)object_storage_write_metadata_bundle();
+		}
 	}
 	return ret;
 }
@@ -2123,6 +2155,29 @@ static int cr_dump_finish(int ret)
 	} else {
 		write_stats(DUMP_STATS);
 		pr_info("Dumping finished successfully\n");
+		/*
+		 * Drain any pending async PUTs (image.c hands small uploads
+		 * off to a worker pool). This must happen before we LIST for
+		 * the manifest — otherwise the manifest might miss keys that
+		 * are still in flight.
+		 *
+		 * Then bundle small PUTs into metadata.tar and write the
+		 * manifest. Bundle PUT and manifest PUT are independent and
+		 * run in parallel.
+		 */
+		if (opts.enable_object_storage && opts.object_storage_upload) {
+			pthread_t bundle_tid;
+			int b_ok;
+			object_storage_drain_uploads();
+			b_ok = (pthread_create(&bundle_tid, NULL,
+					       _dump_finalize_bundle_thread,
+					       NULL) == 0);
+			(void)object_storage_write_manifest();
+			if (b_ok)
+				pthread_join(bundle_tid, NULL);
+			else
+				(void)object_storage_write_metadata_bundle();
+		}
 	}
 	return post_dump_ret ?: (ret != 0);
 }

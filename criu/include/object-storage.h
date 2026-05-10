@@ -168,6 +168,30 @@ int object_storage_fetch_range_short(const char *object_key, unsigned long offse
 int object_storage_put_object(const char *object_key, const void *data, unsigned long length);
 
 /*
+ * Async variant of put_object. Enqueues the upload to a small worker
+ * pool and returns immediately. Takes ownership of `data` (worker frees
+ * after the PUT completes), and copies the key.
+ *
+ * Saves cumulative dump-time round trips when many small image files
+ * are written back-to-back: ~30 × ~150 ms cross-region (sequential)
+ * collapses to (30 / N_workers) × 150 ms.
+ *
+ * Callers MUST invoke object_storage_drain_uploads() before relying on
+ * any uploaded bytes being visible on S3 (e.g., before write_manifest).
+ *
+ * Returns 0 on success (item enqueued), -1 on enqueue failure (caller
+ * must free `data`).
+ */
+int object_storage_put_object_async(const char *object_key, void *data,
+				    unsigned long length);
+
+/*
+ * Block until every queued async PUT has returned (or failed). Idempotent.
+ * Cheap when nothing is in flight.
+ */
+void object_storage_drain_uploads(void);
+
+/*
  * Fetch an entire object from object storage (for metadata files with unknown size)
  *
  * @param object_key: The key/path of the object
@@ -190,6 +214,26 @@ int object_storage_get_object(const char *object_key, void **out_data, unsigned 
 int object_storage_head_object(const char *object_key, unsigned long *out_length);
 
 /*
+ * Fetch the trailing tail of an object using HTTP "Range: bytes=-N"
+ * (negative range). One round trip returns both:
+ *   - up to max_tail bytes from the end of the object (in `buffer`),
+ *   - the object's total length parsed from Content-Range,
+ * which together replace the historical HEAD + multiple Range GET probe
+ * sequence used by compressed-image init. Saves 3 RTTs per pages-*.img
+ * on cross-region restores.
+ *
+ * On success: stores the actual byte count in *out_got (<= max_tail) and
+ * the object's full size in *out_total_size. If the object is smaller
+ * than max_tail, the entire object is returned and *out_got equals
+ * *out_total_size.
+ *
+ * Returns 0 on success, -ENOENT if not found, -1 on other failure.
+ */
+int object_storage_fetch_tail(const char *object_key, unsigned long max_tail,
+			      void *buffer, unsigned long *out_got,
+			      unsigned long *out_total_size, const char *source);
+
+/*
  * Enumerate object keys under a prefix using S3 ListObjectsV2.
  * Handles pagination; returned keys are all under the given prefix.
  *
@@ -202,6 +246,63 @@ int object_storage_head_object(const char *object_key, unsigned long *out_length
  */
 int object_storage_list_objects(const char *key_prefix, char ***out_keys,
 				unsigned long **out_sizes, size_t *out_n);
+
+/*
+ * Manifest helpers — replace the post-dump LIST round-trip on restore.
+ *
+ * Format (manifest_v1, plain text, "\n" line endings):
+ *   manifest_v1
+ *   <key_relative_to_prefix>\t<size_bytes>
+ *   ...
+ *
+ * Written by the dumper at the end of a successful object-storage dump
+ * to <prefix>/manifest.txt, then read by the restore-side prefetch
+ * before issuing any LIST. If the GET 404s the restore falls back to
+ * the legacy LIST path, so old dumps remain restorable.
+ */
+int object_storage_write_manifest(void);
+
+/*
+ * On success: *out_keys is xmalloc'd array of xstrdup'd full keys (with
+ * caller's prefix prepended, matching object_storage_list_objects), and
+ * *out_sizes is realloc'd parallel array of byte sizes; *out_n is the
+ * count. Returns 0 on success, -ENOENT if no manifest at <prefix>/manifest.txt,
+ * -1 on parse / network failure.
+ */
+int object_storage_read_manifest(const char *key_prefix, char ***out_keys,
+				 unsigned long **out_sizes, size_t *out_n);
+
+/*
+ * Metadata bundle — collapse 30-ish small metadata file GETs at restore
+ * into one. Format (bundle_v1, plain text header + raw bodies):
+ *   "OBSTOR_BUNDLE_v1\n"
+ *   per entry:  "<key>\t<size>\n" then <size> bytes of body
+ *   ...
+ *
+ * Bundle accumulation happens in object_storage_put_object: every small
+ * (<1 MB) PUT is mirrored into an in-memory list in addition to its
+ * normal upload. object_storage_write_metadata_bundle() then PUTs the
+ * concatenated bundle as <prefix>/metadata.tar at end of dump.
+ *
+ * Restore side: object_storage_read_metadata_bundle() fetches the bundle
+ * and yields the parallel (key, data) view. -ENOENT when no bundle
+ * exists; restore falls back to per-key fetch.
+ */
+int object_storage_write_metadata_bundle(void);
+
+struct objstor_bundle_entry {
+	char *key;
+	void *data;
+	unsigned long length;
+};
+
+/*
+ * On success: *out_entries is malloc'd array of objstor_bundle_entry
+ * (caller frees each .key, .data, then the array itself); *out_n is the
+ * count. Keys are stored relative to the prefix (no prefix prepended).
+ */
+int object_storage_read_metadata_bundle(struct objstor_bundle_entry **out_entries,
+					size_t *out_n);
 
 /*
  * Re-initialize the object-storage client after a fork (e.g. the lazy-pages

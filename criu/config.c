@@ -446,7 +446,7 @@ void init_opts(void)
 	/* Initialize Async Prefetch options */
 	opts.object_storage_parallel_xfer = false;
 	opts.prefetch_workers = 0;		/* 0 = auto-detect from NIC speed */
-	opts.prefetch_batch_bytes = 64UL * 1024 * 1024;  /* 64 MB default; 0 disables batching */
+	opts.prefetch_batch_bytes = 64UL * 1024 * 1024;  /* 64 MB default; matches paper IOV-aligned frame. Internally fetched via multipart-parallel for cross-region throughput. 0 disables batching */
 
 	/* Initialize compression options (--compress: zstd seekable) */
 	opts.compress = false;

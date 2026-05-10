@@ -25,6 +25,7 @@
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
 #include "object-storage.h"
+#include "obstor_prefetch.h"
 #include "compression.h"
 
 #ifndef SEEK_DATA
@@ -261,6 +262,18 @@ struct s3_decomp_cookie {
 	void *tail_buf;		/* last tail_len bytes of the object */
 	unsigned long tail_start;
 	size_t tail_len;
+	/*
+	 * Optional head cache, populated by obstor_prefetch_init's parallel
+	 * preload wave. Lets decomp_read_cb serve the decompressor's first-
+	 * frame reads from memory, which on cross-region restores eliminates
+	 * one ~600 ms Range GET per task. NULL when head wasn't preloaded.
+	 *
+	 * Backing memory is owned by g_tail_cache (see obstor_prefetch.c);
+	 * the cookie just borrows the pointer for the lifetime of the
+	 * page_read.
+	 */
+	const void *head_buf;
+	size_t head_len;
 };
 
 /*
@@ -289,7 +302,12 @@ static inline uint32_t read_le32(const uint8_t *p)
  * a seekable-format pages-*.img. Returns the number of bytes to cache
  * (measured from the end of the file) on success, 0 on any parse error.
  * Reads only the 9-byte footer from S3.
+ *
+ * Currently unused on the fast path: init_s3_compression now derives the
+ * same value from the in-memory probe buffer (see fetch_tail). Retained
+ * for the rare cold-path fallback when the speculative tail is too small.
  */
+__attribute__((unused))
 static size_t s3_seek_table_size(const char *object_key, unsigned long total_size)
 {
 	uint8_t footer[ZSTD_SEEK_FOOTER_LEN];
@@ -339,6 +357,17 @@ static int s3_decomp_read_cb(void *cookie, off_t offset, size_t length, void *ou
 	}
 
 	/*
+	 * Head cache hit: requested range sits inside the prefetched head
+	 * buffer (offsets 0..head_len). The decompressor's first-frame
+	 * reads land here, replacing per-task Range GETs with a memcpy.
+	 */
+	if (c->head_buf && c->head_len > 0 &&
+	    uoff + length <= (unsigned long)c->head_len) {
+		memcpy(out, (const char *)c->head_buf + uoff, length);
+		return 0;
+	}
+
+	/*
 	 * Miss (i.e. a compressed frame body somewhere earlier in the file).
 	 * Range GET once; short reads past EOF get zero-padded because the
 	 * seekable decoder may overshoot the last frame.
@@ -354,67 +383,142 @@ static int s3_decomp_read_cb(void *cookie, off_t offset, size_t length, void *ou
 }
 
 /*
+ * Speculative tail fetch size for compressed-image probe. Sized to fit
+ * the seek table for typical workloads in a single small response so the
+ * round trip is dominated by RTT, not body download:
+ *
+ *   - zstd seekable entries are 8 or 12 bytes per frame (with checksum)
+ *   - our IOV-aligned dump produces ~one frame per write_pages call,
+ *     at multi-MB granularity, so seek tables stay small (e.g., mc-1gb
+ *     pages-1.img: 177 B; mc-8gb pages-3.img: ~25 KB region)
+ *   - 32 KiB tail covers ~2.7K frames at 12 B each (i.e. ~10 GB
+ *     compressed at typical IOV granularity) and on cross-region links
+ *     the full body lands in one RTT
+ *
+ * For workloads whose seek table exceeds 32 KiB the path falls back to
+ * one exact-sized Range GET sized to the table — average case stays at
+ * 1 RTT; only the corner pays a second RTT.
+ */
+#define S3_COMPRESSION_PROBE_TAIL_LEN (32UL << 10)
+
+/*
  * Detect zstd seekable format on a pages-*.img stored in object storage
  * and, if present, wire up pr->decompress as the source of truth for
- * every future fetch. The object key must already be constructed; the
- * caller passes in an upper bound for the file size (or 0 to probe for
- * it via a speculative range fetch past a reasonably-sized tail).
+ * every future fetch.
+ *
+ * Single negative-range tail fetch ("Range: bytes=-N") returns:
+ *   - up to 256 KiB from the end of the object,
+ *   - the object's total size via Content-Range,
+ * which together replace the legacy HEAD + 3 small Range GET sequence.
+ * The fetched buffer typically contains the full seek table, so the
+ * cookie's tail_buf can be carved out of it directly with no further
+ * round trip.
  */
 static int init_s3_compression(struct page_read *pr, const char *object_key)
 {
-	uint8_t tail[4];
-	unsigned long tail_got = 0;
+	void *probe_buf = NULL;
+	unsigned long probe_got = 0;
 	unsigned long size = 0;
-	struct s3_decomp_cookie *cookie;
+	struct s3_decomp_cookie *cookie = NULL;
+	uint8_t footer[ZSTD_SEEK_FOOTER_LEN];
+	uint32_t num_frames;
+	uint8_t descriptor, entry_size;
+	size_t needed;
 	int rc;
+	const void *cached_tail = NULL;
+	size_t cached_tail_len = 0;
+	unsigned long cached_total = 0;
 
 	/*
-	 * One HEAD request to learn the total object size, then a single
-	 * Range GET for the trailing 4 magic bytes. Replaces the previous
-	 * O(log N) geometric Range-GET probe.
+	 * Fast path: obstor_prefetch_init may have already pulled this
+	 * pages-*.img tail in parallel before any restore tasks were forked.
+	 * If hit, copy the bytes into our own probe buffer and proceed
+	 * without touching S3 — saves one cross-region RTT per pages file.
 	 */
-	rc = object_storage_head_object(object_key, &size);
-	if (rc == -ENOENT)
-		return 0;
-	if (rc != 0)
-		return 0;
-	if (size < 4)
-		return 0;
+	if (obstor_prefetch_tail_lookup(object_key, &cached_tail,
+					&cached_tail_len, &cached_total) == 0) {
+		probe_buf = xmalloc(cached_tail_len);
+		if (!probe_buf)
+			return -1;
+		memcpy(probe_buf, cached_tail, cached_tail_len);
+		probe_got = (unsigned long)cached_tail_len;
+		size = cached_total;
+		goto have_probe;
+	}
 
-	if (object_storage_fetch_range_short(object_key, (off_t)size - 4, 4,
-					     tail, &tail_got,
-					     OBJSTOR_SRC_FAULT) != 0)
+	probe_buf = xmalloc(S3_COMPRESSION_PROBE_TAIL_LEN);
+	if (!probe_buf)
+		return -1;
+
+	rc = object_storage_fetch_tail(object_key,
+				       S3_COMPRESSION_PROBE_TAIL_LEN,
+				       probe_buf, &probe_got, &size,
+				       OBJSTOR_SRC_FAULT);
+	if (rc == -ENOENT) {
+		xfree(probe_buf);
 		return 0;
-	if (tail_got != 4 || decompress_probe(tail, 4) != 1)
-		return 0;
+	}
+	if (rc != 0 || probe_got < 4 || size < 4)
+		goto not_compressed;
+have_probe:;
+
+	/* Magic check on the last 4 bytes of the tail buffer. */
+	if (decompress_probe((uint8_t *)probe_buf + probe_got - 4, 4) != 1)
+		goto not_compressed;
+
+	/*
+	 * Parse the 9-byte footer (last 9 bytes of the file) to compute
+	 * the seek-table extent, mirroring s3_seek_table_size() but from
+	 * the in-memory probe buffer instead of issuing a fresh GET.
+	 */
+	if (probe_got < ZSTD_SEEK_FOOTER_LEN ||
+	    size < ZSTD_SEEK_FOOTER_LEN + ZSTD_SKIPPABLE_HDR_LEN)
+		goto not_compressed;
+	memcpy(footer, (uint8_t *)probe_buf + probe_got - ZSTD_SEEK_FOOTER_LEN,
+	       ZSTD_SEEK_FOOTER_LEN);
+	num_frames = read_le32(footer);
+	descriptor = footer[4];
+	entry_size = (descriptor & 0x80) ? ZSTD_SEEK_ENTRY_LEN_CS
+					 : ZSTD_SEEK_ENTRY_LEN_BASE;
+	needed = ZSTD_SKIPPABLE_HDR_LEN + (size_t)num_frames * entry_size +
+		 ZSTD_SEEK_FOOTER_LEN;
+	if (needed > S3_COMP_TAIL_MAX || needed > size)
+		goto not_compressed;
 
 	cookie = xzalloc(sizeof(*cookie));
-	if (!cookie)
+	if (!cookie) {
+		xfree(probe_buf);
 		return -1;
+	}
 	snprintf(cookie->object_key, sizeof(cookie->object_key), "%s", object_key);
 	cookie->total_size = size;
-
-	/*
-	 * Cache exactly the seek-table bytes at EOF — enough for
-	 * decompress_create_lazy() to extract the frame directory on the
-	 * init pass. Frame bodies are never read through the tail cache;
-	 * decompress_range() fetches each frame via the callback directly.
-	 */
-	cookie->tail_len = s3_seek_table_size(object_key, size);
-	if (cookie->tail_len == 0) {
-		pr_err("init_s3_compression: seek-table footer parse failed\n");
-		xfree(cookie);
-		return -1;
-	}
-	cookie->tail_start = size - cookie->tail_len;
-	cookie->tail_buf = xmalloc(cookie->tail_len);
+	cookie->tail_len = needed;
+	cookie->tail_start = size - needed;
+	cookie->tail_buf = xmalloc(needed);
 	if (!cookie->tail_buf) {
-		pr_err("init_s3_compression: tail xmalloc(%zu) failed\n", cookie->tail_len);
+		pr_err("init_s3_compression: tail xmalloc(%zu) failed\n", needed);
 		xfree(cookie);
+		xfree(probe_buf);
 		return -1;
 	}
-	{
+
+	if (needed <= probe_got) {
+		/*
+		 * Fast path: speculative tail already covers the full seek
+		 * table. Carve cookie->tail_buf out of probe_buf — no extra
+		 * round trip.
+		 */
+		memcpy(cookie->tail_buf,
+		       (uint8_t *)probe_buf + probe_got - needed, needed);
+	} else {
+		/*
+		 * Rare: seek table larger than our probe window. Issue one
+		 * exact-sized Range GET to fetch the missing prefix.
+		 */
 		unsigned long got = 0;
+		pr_info("init_s3_compression: seek table %zu B > probe %lu B, "
+			"falling back to one extra Range GET\n",
+			needed, probe_got);
 		if (object_storage_fetch_range_short(object_key,
 						     cookie->tail_start,
 						     cookie->tail_len,
@@ -425,12 +529,31 @@ static int init_s3_compression(struct page_read *pr, const char *object_key)
 			       got, cookie->tail_len);
 			xfree(cookie->tail_buf);
 			xfree(cookie);
+			xfree(probe_buf);
 			return -1;
 		}
 	}
 
-	pr_info("page-read: detected compressed S3 pages-*.img %s (total=%lu bytes, cached tail=%zu)\n",
-		object_key, cookie->total_size, cookie->tail_len);
+	xfree(probe_buf);
+	probe_buf = NULL;
+
+	/*
+	 * Borrow a head buffer from the prefetch tail-wave if one was
+	 * preloaded. Lets s3_decomp_read_cb skip the per-task body fetch
+	 * for any read that lands inside [0, head_len). The bytes are
+	 * owned by g_tail_cache, valid for the lifetime of obstor_prefetch.
+	 */
+	{
+		const void *head = NULL;
+		size_t head_len = 0;
+		if (obstor_prefetch_head_lookup(object_key, &head, &head_len) == 0) {
+			cookie->head_buf = head;
+			cookie->head_len = head_len;
+		}
+	}
+
+	pr_info("page-read: detected compressed S3 pages-*.img %s (total=%lu bytes, cached tail=%zu, cached head=%zu)\n",
+		object_key, cookie->total_size, cookie->tail_len, cookie->head_len);
 
 	pr->decompress = decompress_create_lazy(NULL, 0,
 						(off_t)cookie->total_size,
@@ -445,6 +568,15 @@ static int init_s3_compression(struct page_read *pr, const char *object_key)
 	/* Eager prefetch / ra_buf are bypassed in compressed mode — the
 	 * decompressor manages its own read-ahead via the seekable API. */
 
+	return 0;
+
+not_compressed:
+	xfree(probe_buf);
+	if (cookie) {
+		if (cookie->tail_buf)
+			xfree(cookie->tail_buf);
+		xfree(cookie);
+	}
 	return 0;
 }
 
