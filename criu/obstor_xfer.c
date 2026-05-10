@@ -472,7 +472,7 @@ static struct controller_stats controller_stats;
 static pthread_mutex_t controller_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Controller tuning */
-#define PROMOTE_DISTANCE 32          /* Fixed: promote next N IOVs on fault */
+#define PROMOTE_DISTANCE 16          /* Fixed: promote next N IOVs on fault (16 * 4MB = 64MB) */
 
 /* ========== IOV Metadata Functions ========== */
 
