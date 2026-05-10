@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <fcntl.h>
@@ -73,6 +74,13 @@ struct FetchContext {
 	 */
 	char x_cache[64];
 	char x_amz_cf_pop[32];
+	/*
+	 * Content-Range total length parsed from "Content-Range: bytes
+	 * a-b/<total>". Used by tail-fetch (negative range) callers to
+	 * recover the object size from the same response, eliminating a
+	 * separate HEAD round-trip. 0 if the header was absent.
+	 */
+	unsigned long content_range_total;
 };
 
 /*
@@ -654,6 +662,35 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
 	if (value) {
 		_copy_hdr_value(value, total_size - (size_t)(value - buffer),
 				ctx->x_amz_cf_pop, sizeof(ctx->x_amz_cf_pop));
+		return total_size;
+	}
+
+	/*
+	 * Content-Range: bytes <start>-<end>/<total>. Used by tail-fetch
+	 * callers to learn the object's total size without a separate HEAD.
+	 */
+	value = _hdr_match(buffer, total_size, "Content-Range:");
+	if (value) {
+		const char *slash;
+		size_t hdr_remaining = total_size - (size_t)(value - buffer);
+		size_t i;
+		for (i = 0, slash = NULL; i < hdr_remaining; i++) {
+			if (value[i] == '/') {
+				slash = value + i + 1;
+				break;
+			}
+			if (value[i] == '\r' || value[i] == '\n')
+				break;
+		}
+		if (slash) {
+			unsigned long total_len = 0;
+			while (slash < value + hdr_remaining &&
+			       *slash >= '0' && *slash <= '9') {
+				total_len = total_len * 10 + (*slash - '0');
+				slash++;
+			}
+			ctx->content_range_total = total_len;
+		}
 		return total_size;
 	}
 
@@ -1608,6 +1645,11 @@ static size_t _upload_read_callback(char *ptr, size_t size, size_t nmemb, void *
 	return to_copy;
 }
 
+/* Forward declaration for the metadata-bundle accumulator (defined further
+ * down with the manifest helpers). Declared here because object_storage_put_object
+ * mirrors small successful PUTs into the bundle. */
+static int _bundle_accum_add(const char *key, const void *data, unsigned long length);
+
 int object_storage_put_object(const char *object_key, const void *data, unsigned long length)
 {
 	struct object_url_info url_info;
@@ -1694,7 +1736,145 @@ int object_storage_put_object(const char *object_key, const void *data, unsigned
 
 	pr_info("PUT %s succeeded (HTTP %ld)\n", object_key, http_code);
 	free(response.memory);
+
+	/*
+	 * Mirror small successful PUTs into the metadata bundle accumulator
+	 * so a single bundle GET on restore replaces N parallel small GETs.
+	 * Cap each entry at 1 MB (the bundle stays small enough to fit in
+	 * a single response) and skip the bundle/manifest objects themselves.
+	 * Failures here are non-fatal — the dump is still valid and the
+	 * restore can fall through to per-key fetches.
+	 */
+	{
+		const char *base = strrchr(object_key, '/');
+		base = base ? base + 1 : object_key;
+		if (length > 0 && length <= (1UL << 20) &&
+		    strcmp(base, "manifest.txt") != 0 &&
+		    strcmp(base, "metadata.tar") != 0)
+			(void)_bundle_accum_add(object_key, data, length);
+	}
+
 	return 0;
+}
+
+/*
+ * =================================================================================
+ * Async PUT pool — for back-to-back small uploads (image files, etc.)
+ *
+ * Many CRIU image files (core-*, fs-*, ids-*, mm-*, fdinfo-*, ...) get
+ * written and uploaded back-to-back at the end of dump. Synchronously
+ * PUTting each one cross-region serializes ~30 × ~150 ms RTTs, costing
+ * ~5 s of wall time. The async pool collapses that to roughly
+ * ceil(N / workers) × RTT by overlapping uploads.
+ * =================================================================================
+ */
+#define ASYNC_PUT_WORKERS	4
+
+struct put_work_item {
+	char *key;
+	void *data;	/* owned by the queue; worker frees after PUT */
+	unsigned long length;
+	struct put_work_item *next;
+};
+
+static struct put_work_item *g_put_q_head;
+static struct put_work_item *g_put_q_tail;
+static pthread_mutex_t g_put_q_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_put_q_avail = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_put_q_drain = PTHREAD_COND_INITIALIZER;
+static pthread_t g_put_workers[ASYNC_PUT_WORKERS];
+static bool g_put_workers_started = false;
+static bool g_put_shutdown = false;
+static int g_put_inflight;
+
+static void *_put_worker_thread(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		struct put_work_item *item;
+
+		pthread_mutex_lock(&g_put_q_lock);
+		while (!g_put_q_head && !g_put_shutdown)
+			pthread_cond_wait(&g_put_q_avail, &g_put_q_lock);
+		if (!g_put_q_head && g_put_shutdown) {
+			pthread_mutex_unlock(&g_put_q_lock);
+			break;
+		}
+		item = g_put_q_head;
+		g_put_q_head = item->next;
+		if (!g_put_q_head)
+			g_put_q_tail = NULL;
+		pthread_mutex_unlock(&g_put_q_lock);
+
+		(void)object_storage_put_object(item->key, item->data, item->length);
+		free(item->key);
+		free(item->data);
+		free(item);
+
+		pthread_mutex_lock(&g_put_q_lock);
+		g_put_inflight--;
+		if (g_put_inflight == 0)
+			pthread_cond_broadcast(&g_put_q_drain);
+		pthread_mutex_unlock(&g_put_q_lock);
+	}
+	return NULL;
+}
+
+int object_storage_put_object_async(const char *object_key, void *data,
+				    unsigned long length)
+{
+	struct put_work_item *item;
+
+	if (!object_key || !data || length == 0)
+		return -1;
+
+	pthread_mutex_lock(&g_put_q_lock);
+	if (!g_put_workers_started) {
+		int i;
+		g_put_shutdown = false;
+		for (i = 0; i < ASYNC_PUT_WORKERS; i++) {
+			if (pthread_create(&g_put_workers[i], NULL,
+					   _put_worker_thread, NULL) != 0) {
+				pr_warn("async-put: spawn worker[%d] failed\n", i);
+				/* Continue with whatever workers we got. */
+				break;
+			}
+		}
+		g_put_workers_started = true;
+	}
+	pthread_mutex_unlock(&g_put_q_lock);
+
+	item = malloc(sizeof(*item));
+	if (!item)
+		return -1;
+	item->key = strdup(object_key);
+	if (!item->key) {
+		free(item);
+		return -1;
+	}
+	item->data = data;
+	item->length = length;
+	item->next = NULL;
+
+	pthread_mutex_lock(&g_put_q_lock);
+	if (g_put_q_tail)
+		g_put_q_tail->next = item;
+	else
+		g_put_q_head = item;
+	g_put_q_tail = item;
+	g_put_inflight++;
+	pthread_cond_signal(&g_put_q_avail);
+	pthread_mutex_unlock(&g_put_q_lock);
+
+	return 0;
+}
+
+void object_storage_drain_uploads(void)
+{
+	pthread_mutex_lock(&g_put_q_lock);
+	while (g_put_inflight > 0)
+		pthread_cond_wait(&g_put_q_drain, &g_put_q_lock);
+	pthread_mutex_unlock(&g_put_q_lock);
 }
 
 /*
@@ -2021,11 +2201,23 @@ static int _upload_sockopt_cb(void *clientp, curl_socket_t sockfd,
 			      curlsocktype purpose)
 {
 	int sndbuf = 4 * 1024 * 1024;
-	int rcvbuf = 2 * 1024 * 1024;
+	int on = 1;
 	(void)clientp;
 	(void)purpose;
 	setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-	setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+	/*
+	 * SO_RCVBUF previously forced to 2 MB which capped per-stream
+	 * cross-region throughput at 2MB/RTT (~15 MB/s @ 134ms RTT, but
+	 * actually observed 0.68 MB/s due to compounding effects).
+	 * Removed: kernel auto-tunes up to net.ipv4.tcp_rmem max
+	 * (default 6 MB on stock Linux, far better at long RTTs).
+	 *
+	 * TCP_QUICKACK: disable Linux's delayed-ACK (~40 ms). Faster ACKs
+	 * let the sender's cwnd ramp up sooner, which materially helps the
+	 * long-RTT case where each missed ACK opportunity costs an RTT of
+	 * window growth.
+	 */
+	setsockopt(sockfd, IPPROTO_TCP, TCP_QUICKACK, &on, sizeof(on));
 	return CURL_SOCKOPT_OK;
 }
 
@@ -2051,10 +2243,19 @@ static int _upload_sockopt_cb(void *clientp, curl_socket_t sockfd,
  */
 static CURLcode _upload_ssl_ctx_cb(CURL *curl, void *sslctx, void *parm)
 {
-	SSL_CTX *ctx = sslctx;
 	(void)curl;
+	(void)sslctx;
 	(void)parm;
-	SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
+	/*
+	 * SSL_OP_ENABLE_KTLS was set here previously to offload AES record
+	 * encryption to the kernel. Investigated under prefetch-worker-perf:
+	 * with kTLS attached, libcurl never reused the connection across
+	 * sequential curl_easy_perform calls on the same easy handle (every
+	 * fetch reopened TCP+TLS, observed reused=NO 100% on cross-region
+	 * HTTPS while a kTLS-disabled standalone test on the same instance
+	 * reused 4/5). Disabling kTLS to recover keep-alive; revisit if
+	 * upload-side throughput regresses.
+	 */
 	return CURLE_OK;
 }
 
@@ -3131,6 +3332,513 @@ int object_storage_get_object(const char *object_key, void **out_data, unsigned 
 
 /*
  * =================================================================================
+ * Manifest helpers — replace post-dump LIST round-trip on restore.
+ *
+ * Format (manifest_v1, plain text, "\n" line endings):
+ *   manifest_v1
+ *   <key_relative_to_prefix>\t<size_bytes>
+ *   ...
+ * =================================================================================
+ */
+#define MANIFEST_FILE_NAME	"manifest.txt"
+#define MANIFEST_HEADER		"manifest_v1\n"
+
+/*
+ * Metadata bundle — concatenation of every small PUT into a single
+ * <prefix>/metadata.tar so the restore-side prefetch needs one GET, not
+ * 30+. Format:
+ *   "OBSTOR_BUNDLE_v1\n"
+ *   per entry:  "<key>\t<size>\n" then <size> bytes of raw body.
+ */
+#define BUNDLE_FILE_NAME	"metadata.tar"
+#define BUNDLE_HEADER		"OBSTOR_BUNDLE_v1\n"
+#define BUNDLE_MAX_TOTAL_BYTES	(64UL << 20)	/* fail-safe cap */
+#define BUNDLE_MAX_ENTRY_BYTES	(1UL << 20)	/* skip files >= 1 MB */
+
+struct bundle_entry {
+	char *key;
+	void *data;
+	unsigned long length;
+	struct bundle_entry *next;
+};
+
+static struct bundle_entry *g_bundle_head;
+static unsigned long g_bundle_total_bytes;
+static pthread_mutex_t g_bundle_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int _bundle_accum_add(const char *key, const void *data, unsigned long length)
+{
+	struct bundle_entry *e;
+
+	if (!key || !data || length == 0)
+		return 0;
+	if (length > BUNDLE_MAX_ENTRY_BYTES)
+		return 0;
+
+	pthread_mutex_lock(&g_bundle_lock);
+	if (g_bundle_total_bytes + length > BUNDLE_MAX_TOTAL_BYTES) {
+		pthread_mutex_unlock(&g_bundle_lock);
+		pr_debug("bundle: skipping '%s' (%lu B), would exceed %lu MB cap\n",
+			 key, length, BUNDLE_MAX_TOTAL_BYTES >> 20);
+		return 0;
+	}
+	pthread_mutex_unlock(&g_bundle_lock);
+
+	e = malloc(sizeof(*e));
+	if (!e)
+		return -1;
+	e->key = strdup(key);
+	if (!e->key) {
+		free(e);
+		return -1;
+	}
+	e->data = malloc(length);
+	if (!e->data) {
+		free(e->key);
+		free(e);
+		return -1;
+	}
+	memcpy(e->data, data, length);
+	e->length = length;
+
+	pthread_mutex_lock(&g_bundle_lock);
+	e->next = g_bundle_head;
+	g_bundle_head = e;
+	g_bundle_total_bytes += length;
+	pthread_mutex_unlock(&g_bundle_lock);
+
+	return 0;
+}
+
+int object_storage_write_manifest(void)
+{
+	char **keys = NULL;
+	unsigned long *sizes = NULL;
+	size_t nkeys = 0, i;
+	const char *prefix;
+	char *buf = NULL;
+	size_t cap = 0, used = 0;
+	int rc = -1;
+
+	if (!opts.enable_object_storage)
+		return 0;
+
+	prefix = opts.object_storage_object_prefix ? opts.object_storage_object_prefix : "";
+
+	/*
+	 * One LIST at end-of-dump to enumerate everything we just uploaded.
+	 * Acceptable cost on the dump side — dump latency is not gated on
+	 * round trips the way restore latency is, and avoiding a tracker for
+	 * "files I uploaded" keeps the change local to this helper.
+	 */
+	if (object_storage_list_objects(prefix, &keys, &sizes, &nkeys) != 0) {
+		pr_warn("manifest: LIST '%s' failed; skipping manifest\n", prefix);
+		return -1;
+	}
+
+	cap = 1024 + nkeys * 192;
+	buf = malloc(cap);
+	if (!buf)
+		goto out;
+
+	used = snprintf(buf, cap, "%s", MANIFEST_HEADER);
+
+	for (i = 0; i < nkeys; i++) {
+		const char *full_key = keys[i];
+		const char *rel = full_key;
+		size_t prefix_len = strlen(prefix);
+		size_t base_name_len;
+		int n;
+
+		/* Normalize: store key relative to the prefix to keep manifest
+		 * portable across moves of the prefix root. */
+		if (prefix_len > 0 && strncmp(full_key, prefix, prefix_len) == 0) {
+			rel = full_key + prefix_len;
+			while (*rel == '/')
+				rel++;
+		}
+		base_name_len = strlen(rel);
+		if (base_name_len == 0)
+			continue;
+		/* Self-skip: never list the manifest in itself. */
+		if (strcmp(rel, MANIFEST_FILE_NAME) == 0)
+			continue;
+
+		if (used + base_name_len + 32 >= cap) {
+			size_t new_cap = cap * 2 + base_name_len + 256;
+			char *bigger = realloc(buf, new_cap);
+			if (!bigger)
+				goto out;
+			buf = bigger;
+			cap = new_cap;
+		}
+		n = snprintf(buf + used, cap - used, "%s\t%lu\n", rel, sizes[i]);
+		if (n <= 0)
+			goto out;
+		used += (size_t)n;
+	}
+
+	if (object_storage_put_object(MANIFEST_FILE_NAME, buf, used) != 0) {
+		pr_warn("manifest: PUT '%s/%s' failed\n", prefix, MANIFEST_FILE_NAME);
+		goto out;
+	}
+
+	pr_info("manifest: wrote '%s/%s' (%zu bytes, %zu entries)\n",
+		prefix, MANIFEST_FILE_NAME, used, nkeys);
+	rc = 0;
+
+out:
+	free(buf);
+	for (i = 0; i < nkeys; i++)
+		xfree(keys[i]);
+	free(keys);
+	free(sizes);
+	return rc;
+}
+
+int object_storage_read_manifest(const char *key_prefix, char ***out_keys,
+				 unsigned long **out_sizes, size_t *out_n)
+{
+	void *raw = NULL;
+	unsigned long raw_len = 0;
+	char *cur, *end;
+	char **keys = NULL;
+	unsigned long *sizes = NULL;
+	size_t cap = 0, n = 0;
+	const char *prefix;
+	char normalized[512];
+	int rc;
+
+	if (!out_keys || !out_sizes || !out_n)
+		return -1;
+	*out_keys = NULL;
+	*out_sizes = NULL;
+	*out_n = 0;
+
+	prefix = key_prefix ? key_prefix : "";
+	/* Reuse the prefetch's prefix normalization helper indirectly by
+	 * constructing the same "<normalized_prefix><relative_key>" form
+	 * that object_storage_list_objects emits. */
+	{
+		size_t plen = strlen(prefix);
+		if (plen == 0) {
+			normalized[0] = '\0';
+		} else {
+			const char *start = prefix;
+			size_t copy_len = plen;
+			if (start[0] == '/') {
+				start++;
+				copy_len--;
+			}
+			snprintf(normalized, sizeof(normalized), "%.*s",
+				 (int)copy_len, start);
+			plen = strlen(normalized);
+			if (plen > 0 && normalized[plen - 1] != '/' &&
+			    plen + 1 < sizeof(normalized)) {
+				normalized[plen] = '/';
+				normalized[plen + 1] = '\0';
+			}
+		}
+	}
+
+	rc = object_storage_get_object(MANIFEST_FILE_NAME, &raw, &raw_len);
+	if (rc == -ENOENT)
+		return -ENOENT;
+	if (rc != 0 || !raw || raw_len == 0) {
+		free(raw);
+		return -1;
+	}
+
+	cur = (char *)raw;
+	end = cur + raw_len;
+
+	{
+		size_t hlen = strlen(MANIFEST_HEADER);
+		if ((size_t)raw_len < hlen ||
+		    memcmp(cur, MANIFEST_HEADER, hlen) != 0) {
+			pr_err("manifest: bad header (expected '%s')\n",
+			       MANIFEST_HEADER);
+			free(raw);
+			return -1;
+		}
+		cur += hlen;
+	}
+
+	while (cur < end) {
+		char *line_end = memchr(cur, '\n', (size_t)(end - cur));
+		size_t line_len = line_end ? (size_t)(line_end - cur) : (size_t)(end - cur);
+		char *tab;
+		char rel[512];
+		unsigned long size_val = 0;
+		char full[1024];
+
+		if (line_len == 0) {
+			cur = line_end ? line_end + 1 : end;
+			continue;
+		}
+		tab = memchr(cur, '\t', line_len);
+		if (!tab) {
+			pr_warn("manifest: malformed line (no tab), skipping\n");
+			cur = line_end ? line_end + 1 : end;
+			continue;
+		}
+		{
+			size_t name_len = (size_t)(tab - cur);
+			if (name_len >= sizeof(rel))
+				name_len = sizeof(rel) - 1;
+			memcpy(rel, cur, name_len);
+			rel[name_len] = '\0';
+		}
+		{
+			char *size_start = tab + 1;
+			while (size_start < cur + line_len &&
+			       *size_start >= '0' && *size_start <= '9') {
+				size_val = size_val * 10 + (unsigned long)(*size_start - '0');
+				size_start++;
+			}
+		}
+		cur = line_end ? line_end + 1 : end;
+
+		if (rel[0] == '\0')
+			continue;
+
+		snprintf(full, sizeof(full), "%s%s", normalized, rel);
+
+		if (n == cap) {
+			size_t new_cap = cap ? cap * 2 : 32;
+			char **nk = realloc(keys, new_cap * sizeof(*nk));
+			unsigned long *ns = realloc(sizes, new_cap * sizeof(*ns));
+			if (!nk || !ns) {
+				free(nk ? nk : keys);
+				free(ns ? ns : sizes);
+				free(raw);
+				return -1;
+			}
+			keys = nk;
+			sizes = ns;
+			cap = new_cap;
+		}
+		keys[n] = xstrdup(full);
+		if (!keys[n]) {
+			free(raw);
+			goto err;
+		}
+		sizes[n] = size_val;
+		n++;
+	}
+
+	free(raw);
+
+	*out_keys = keys;
+	*out_sizes = sizes;
+	*out_n = n;
+	pr_info("manifest: parsed %zu entries from %s/%s\n",
+		n, prefix, MANIFEST_FILE_NAME);
+	return 0;
+
+err:
+	{
+		size_t i;
+		for (i = 0; i < n; i++)
+			xfree(keys[i]);
+	}
+	free(keys);
+	free(sizes);
+	return -1;
+}
+
+int object_storage_write_metadata_bundle(void)
+{
+	struct bundle_entry *e;
+	char *buf = NULL;
+	size_t cap = 0, used = 0;
+	const char *prefix;
+	size_t n_entries = 0;
+	int rc = -1;
+
+	if (!opts.enable_object_storage)
+		return 0;
+
+	pthread_mutex_lock(&g_bundle_lock);
+	if (!g_bundle_head) {
+		pthread_mutex_unlock(&g_bundle_lock);
+		pr_info("bundle: nothing accumulated, skipping metadata.tar\n");
+		return 0;
+	}
+
+	cap = g_bundle_total_bytes + 1024 + 256 * 64; /* body + header + per-entry line */
+	buf = malloc(cap);
+	if (!buf) {
+		pthread_mutex_unlock(&g_bundle_lock);
+		return -1;
+	}
+	used = snprintf(buf, cap, "%s", BUNDLE_HEADER);
+
+	for (e = g_bundle_head; e; e = e->next) {
+		size_t key_len = strlen(e->key);
+		size_t need = key_len + 32 + e->length;
+
+		if (used + need > cap) {
+			size_t new_cap = (used + need) * 2;
+			char *bigger = realloc(buf, new_cap);
+			if (!bigger) {
+				free(buf);
+				pthread_mutex_unlock(&g_bundle_lock);
+				return -1;
+			}
+			buf = bigger;
+			cap = new_cap;
+		}
+
+		used += (size_t)snprintf(buf + used, cap - used, "%s\t%lu\n",
+					 e->key, e->length);
+		memcpy(buf + used, e->data, e->length);
+		used += e->length;
+		n_entries++;
+	}
+	pthread_mutex_unlock(&g_bundle_lock);
+
+	prefix = opts.object_storage_object_prefix ? opts.object_storage_object_prefix : "";
+
+	if (object_storage_put_object(BUNDLE_FILE_NAME, buf, used) != 0) {
+		pr_warn("bundle: PUT '%s/%s' failed\n", prefix, BUNDLE_FILE_NAME);
+		goto out;
+	}
+
+	pr_info("bundle: wrote '%s/%s' (%zu bytes, %zu entries)\n",
+		prefix, BUNDLE_FILE_NAME, used, n_entries);
+	rc = 0;
+
+out:
+	free(buf);
+	/* Free accumulator regardless — we've either uploaded or given up. */
+	pthread_mutex_lock(&g_bundle_lock);
+	while (g_bundle_head) {
+		struct bundle_entry *next = g_bundle_head->next;
+		free(g_bundle_head->key);
+		free(g_bundle_head->data);
+		free(g_bundle_head);
+		g_bundle_head = next;
+	}
+	g_bundle_total_bytes = 0;
+	pthread_mutex_unlock(&g_bundle_lock);
+	return rc;
+}
+
+int object_storage_read_metadata_bundle(struct objstor_bundle_entry **out_entries,
+					size_t *out_n)
+{
+	void *raw = NULL;
+	unsigned long raw_len = 0;
+	const char *cur, *end;
+	struct objstor_bundle_entry *entries = NULL;
+	size_t cap = 0, n = 0;
+	int rc;
+	size_t hlen;
+
+	if (!out_entries || !out_n)
+		return -1;
+	*out_entries = NULL;
+	*out_n = 0;
+
+	rc = object_storage_get_object(BUNDLE_FILE_NAME, &raw, &raw_len);
+	if (rc == -ENOENT)
+		return -ENOENT;
+	if (rc != 0 || !raw || raw_len == 0) {
+		free(raw);
+		return -1;
+	}
+
+	hlen = strlen(BUNDLE_HEADER);
+	if (raw_len < hlen || memcmp(raw, BUNDLE_HEADER, hlen) != 0) {
+		pr_err("bundle: bad header\n");
+		free(raw);
+		return -1;
+	}
+	cur = (const char *)raw + hlen;
+	end = (const char *)raw + raw_len;
+
+	while (cur < end) {
+		const char *line_end = memchr(cur, '\n', (size_t)(end - cur));
+		const char *tab;
+		size_t line_len;
+		size_t key_len;
+		unsigned long sz = 0;
+		const char *p;
+
+		if (!line_end) {
+			pr_err("bundle: truncated header at end\n");
+			goto err;
+		}
+		line_len = (size_t)(line_end - cur);
+		tab = memchr(cur, '\t', line_len);
+		if (!tab) {
+			pr_err("bundle: malformed entry header (no tab)\n");
+			goto err;
+		}
+		key_len = (size_t)(tab - cur);
+
+		for (p = tab + 1; p < line_end; p++) {
+			if (*p < '0' || *p > '9') {
+				pr_err("bundle: malformed size in entry\n");
+				goto err;
+			}
+			sz = sz * 10 + (unsigned long)(*p - '0');
+		}
+
+		if ((size_t)(end - (line_end + 1)) < sz) {
+			pr_err("bundle: truncated body (needed %lu, have %zu)\n",
+			       sz, (size_t)(end - (line_end + 1)));
+			goto err;
+		}
+
+		if (n == cap) {
+			size_t new_cap = cap ? cap * 2 : 32;
+			struct objstor_bundle_entry *bigger;
+			bigger = realloc(entries, new_cap * sizeof(*bigger));
+			if (!bigger)
+				goto err;
+			entries = bigger;
+			cap = new_cap;
+		}
+		entries[n].key = malloc(key_len + 1);
+		entries[n].data = sz > 0 ? malloc(sz) : NULL;
+		if (!entries[n].key || (sz > 0 && !entries[n].data)) {
+			free(entries[n].key);
+			free(entries[n].data);
+			goto err;
+		}
+		memcpy(entries[n].key, cur, key_len);
+		entries[n].key[key_len] = '\0';
+		if (sz > 0)
+			memcpy(entries[n].data, line_end + 1, sz);
+		entries[n].length = sz;
+		n++;
+
+		cur = line_end + 1 + sz;
+	}
+
+	free(raw);
+	*out_entries = entries;
+	*out_n = n;
+	pr_info("bundle: parsed %zu entries from %s\n", n, BUNDLE_FILE_NAME);
+	return 0;
+
+err:
+	free(raw);
+	{
+		size_t i;
+		for (i = 0; i < n; i++) {
+			free(entries[i].key);
+			free(entries[i].data);
+		}
+		free(entries);
+	}
+	return -1;
+}
+
+/*
+ * =================================================================================
  * HEAD Object — fetch only the Content-Length, no body.
  *
  * Replaces the geometric Range-GET probe that restore-side compression
@@ -3224,6 +3932,153 @@ int object_storage_head_object(const char *object_key, unsigned long *out_length
 	}
 	*out_length = (unsigned long)content_length;
 	pr_debug("HEAD %s: %lu bytes (HTTP %ld)\n", object_key, *out_length, http_code);
+	return 0;
+}
+
+/*
+ * =================================================================================
+ * Fetch Object Tail — single RTT replacement for the legacy
+ *   HEAD + 3 small Range GETs that compressed-image init used to do.
+ *
+ * Issues a "Range: bytes=-<max_tail>" request which both delivers the
+ * trailing bytes and returns Content-Range: bytes a-b/<total>, so the
+ * caller learns the object size from the same response. For objects
+ * smaller than max_tail, S3 returns the entire object and the caller
+ * sees got == total_size.
+ * =================================================================================
+ */
+int object_storage_fetch_tail(const char *object_key, unsigned long max_tail,
+			      void *buffer, unsigned long *out_got,
+			      unsigned long *out_total_size, const char *source)
+{
+	struct object_url_info url_info;
+	CURL *curl_handle;
+	CURLcode res;
+	long http_code = 0;
+	struct MemoryStruct chunk;
+	struct MemoryStruct error_response;
+	struct FetchContext fetch_ctx;
+	struct curl_slist *headers = NULL;
+	char range_header[32];
+	char range_header_value[64];
+	struct timespec t_start, t_end;
+	double dur_ms;
+
+	if (!object_key || !buffer || max_tail == 0 ||
+	    !out_got || !out_total_size) {
+		pr_err("fetch_tail: NULL parameter\n");
+		return -1;
+	}
+	*out_got = 0;
+	*out_total_size = 0;
+
+	if (opts.express_one_zone) {
+		if (ensure_valid_session() != 0)
+			return -1;
+	}
+
+	if (_construct_object_url(object_key, &url_info) != 0)
+		return -1;
+
+	curl_handle = _get_curl_handle();
+	if (!curl_handle)
+		return -1;
+
+	chunk.memory = buffer;
+	chunk.size = 0;
+	chunk.capacity = max_tail;
+	error_response.memory = malloc(1);
+	error_response.size = 0;
+	error_response.capacity = 0;
+
+	fetch_ctx.data_chunk = &chunk;
+	fetch_ctx.error_chunk = &error_response;
+	fetch_ctx.got_error = 0;
+	fetch_ctx.x_cache[0] = '\0';
+	fetch_ctx.x_amz_cf_pop[0] = '\0';
+	fetch_ctx.content_range_total = 0;
+
+	/*
+	 * libcurl's CURLOPT_RANGE takes "first-last" or "-N" (suffix)
+	 * forms. We use the suffix form to mean "last N bytes". The value
+	 * sent on the wire becomes "Range: bytes=-N", which SigV4 must
+	 * sign verbatim.
+	 */
+	snprintf(range_header, sizeof(range_header), "-%lu", max_tail);
+	snprintf(range_header_value, sizeof(range_header_value),
+		 "bytes=-%lu", max_tail);
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, url_info.url);
+	curl_easy_setopt(curl_handle, CURLOPT_RANGE, range_header);
+	curl_easy_setopt(curl_handle, CURLOPT_NOBODY, 0L);
+	curl_easy_setopt(curl_handle, CURLOPT_FAILONERROR, 0L);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_router_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&fetch_ctx);
+	curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, header_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_HEADERDATA, (void *)&fetch_ctx);
+
+	if (_build_auth_headers("GET", url_info.auth_host,
+				url_info.canonical_uri, NULL,
+				EMPTY_PAYLOAD_HASH, range_header_value,
+				-1, &headers) != 0) {
+		free(error_response.memory);
+		return -1;
+	}
+	if (headers)
+		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+	clock_gettime(CLOCK_MONOTONIC, &t_start);
+	OBJSTOR_FETCH_START_LOG(object_key, 0, max_tail, source);
+	res = curl_easy_perform(curl_handle);
+	clock_gettime(CLOCK_MONOTONIC, &t_end);
+	dur_ms = (t_end.tv_sec - t_start.tv_sec) * 1000.0 +
+		 (t_end.tv_nsec - t_start.tv_nsec) / 1000000.0;
+
+	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+	OBJSTOR_FETCH_DONE_LOG(object_key, 0, chunk.size, dur_ms,
+			       fetch_ctx.x_cache, fetch_ctx.x_amz_cf_pop, source);
+
+	if (headers)
+		curl_slist_free_all(headers);
+	curl_easy_setopt(curl_handle, CURLOPT_RANGE, NULL);
+
+	if (res != CURLE_OK) {
+		pr_err("fetch_tail %s: curl error %s\n",
+		       object_key, curl_easy_strerror(res));
+		free(error_response.memory);
+		return -1;
+	}
+	if (http_code == 404) {
+		free(error_response.memory);
+		return -ENOENT;
+	}
+	/* 206 Partial Content for ranged tail; 200 OK for full small object. */
+	if (http_code != 200 && http_code != 206) {
+		pr_err("fetch_tail %s: HTTP %ld\n", object_key, http_code);
+		free(error_response.memory);
+		return -1;
+	}
+
+	*out_got = chunk.size;
+
+	/*
+	 * Recover total object size: prefer Content-Range (range/full
+	 * responses); if absent (HTTP 200 small-object case), the body
+	 * IS the entire object so total == got.
+	 */
+	if (fetch_ctx.content_range_total > 0)
+		*out_total_size = fetch_ctx.content_range_total;
+	else if (http_code == 200)
+		*out_total_size = chunk.size;
+	else {
+		pr_err("fetch_tail %s: HTTP 206 without parsable Content-Range\n",
+		       object_key);
+		free(error_response.memory);
+		return -1;
+	}
+
+	free(error_response.memory);
 	return 0;
 }
 
@@ -3620,6 +4475,149 @@ int object_storage_fetch_range_short(const char *object_key, unsigned long offse
 				     unsigned long length, void *buffer,
 				     unsigned long *out_got, const char *source);
 
+/*
+ * Multipart-parallel download path for prefetch worker fetches.
+ *
+ * Each worker thread keeps a small pool of curl easy handles bound to a
+ * single CURLM. On each large (>= MULTIPART_DL_THRESHOLD) Range GET, the
+ * helper splits [offset, offset+length) into N_PARTS sub-ranges, drives
+ * them concurrently through curl_multi_perform, and writes directly into
+ * adjacent slices of the caller's buffer.
+ *
+ * Design rationale:
+ *   - AWS S3 caps single-connection throughput around ~2-5 MB/s for
+ *     long-running cross-region ranges (per-connection cwnd stays small).
+ *   - aws s3 cp's default multipart_chunksize=8MB × 10 parallel streams
+ *     achieves ~100 MB/s per file. We mirror that pattern inside one
+ *     prefetch worker.
+ *   - Each sub-handle pins to a different S3 edge IP via CURLOPT_RESOLVE
+ *     so concurrent sub-streams ride independent TCP paths.
+ *   - The pool is per-pthread (TLS) — workers never share handles.
+ *   - For lengths below the threshold, falls through to the single-handle
+ *     path so small fetches do not pay multipart setup overhead.
+ */
+#define MULTIPART_DL_THRESHOLD  (8UL * 1024 * 1024)  /* under this, single-handle */
+#define MULTIPART_DL_PART_SIZE  (8UL * 1024 * 1024)  /* 8 MB per sub-stream — matches aws s3 cp default and CRT's g_default_part_size_fallback */
+#define MULTIPART_DL_MAX_PARTS  4                    /* sub-handles per worker; with 30 prefetch workers this caps total concurrent connections at 120 (vs 480 with 16 sub-handles), restoring connection reuse and per-stream throughput observed in standalone libcurl tests */
+
+/*
+ * Per-sub-handle persistent worker thread state.
+ *
+ * Each sub-handle owns one long-lived pthread for the lifetime of the
+ * pool. The thread is the ONLY user of pool->easy[idx] and thus respects
+ * libcurl's documented constraint that an easy handle stays in a single
+ * thread context. This is essential for HTTPS keep-alive: TLS session
+ * resumption and per-connection state are owned by the thread that did
+ * the original handshake, and previous "ephemeral pthread per fetch"
+ * implementations observed 0 % connection reuse on cross-region HTTPS
+ * (every fetch re-did full TLS handshake, ~5.4 s per sub-stream).
+ */
+struct sub_thread_state {
+	struct thread_dl_pool *pool;   /* back-reference */
+	int idx;                       /* which sub-handle this thread drives */
+	pthread_t tid;
+	pthread_mutex_t lock;
+	pthread_cond_t  work_avail;    /* dispatcher signals worker */
+	pthread_cond_t  work_done;     /* worker signals dispatcher */
+
+	bool has_work;
+	bool done;
+	bool shutdown;
+
+	/* per-fetch arguments — written by dispatcher, read by worker */
+	const char *url;
+	const char *auth_host;
+	const char *auth_canonical_uri;
+	unsigned long part_off;
+	unsigned long part_len;
+	void *buffer_slice;
+	int rc;
+};
+
+struct thread_dl_pool {
+	CURL *easy[MULTIPART_DL_MAX_PARTS];
+	struct curl_slist *headers[MULTIPART_DL_MAX_PARTS];   /* freed/rebuilt per fetch */
+	struct curl_slist *resolve[MULTIPART_DL_MAX_PARTS];   /* set once at init */
+	struct MemoryStruct chunks[MULTIPART_DL_MAX_PARTS];   /* per-fetch state */
+	char range_hdr[MULTIPART_DL_MAX_PARTS][64];
+	struct sub_thread_state subs[MULTIPART_DL_MAX_PARTS];
+	/*
+	 * Shared connection cache across all sub-handles in this pool.
+	 * Mimics aws-c-http connection_manager semantics: any easy handle
+	 * can vend a cached connection regardless of which handle initially
+	 * established it. This is the key bit AWS recommends in
+	 *   docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html
+	 *   "use a pool of HTTP connections and re-use each connection for
+	 *   a series of requests"
+	 * Without share, libcurl's per-handle cache means only the same
+	 * handle can reuse — and under cond-var dispatch, idle gaps cause
+	 * the cached connection to be considered stale.
+	 */
+	CURLSH *share;
+	pthread_mutex_t share_locks[CURL_LOCK_DATA_LAST];
+	bool initialized;
+};
+
+static void _share_lock_cb(CURL *handle, curl_lock_data data,
+			   curl_lock_access access, void *userptr)
+{
+	struct thread_dl_pool *pool = (struct thread_dl_pool *)userptr;
+	(void)handle;
+	(void)access;
+	if (data >= 0 && data < (curl_lock_data)CURL_LOCK_DATA_LAST)
+		pthread_mutex_lock(&pool->share_locks[data]);
+}
+
+static void _share_unlock_cb(CURL *handle, curl_lock_data data, void *userptr)
+{
+	struct thread_dl_pool *pool = (struct thread_dl_pool *)userptr;
+	(void)handle;
+	if (data >= 0 && data < (curl_lock_data)CURL_LOCK_DATA_LAST)
+		pthread_mutex_unlock(&pool->share_locks[data]);
+}
+
+/* Forward decl: pool init creates pthreads pointing at this function. */
+static void *sub_worker_thread_fn(void *vargp);
+
+/*
+ * libcurl debug callback. Prints every TEXT line (info/header/conn) that
+ * libcurl would normally write to stderr in verbose mode. We intercept
+ * to route through pr_info so it lands in criu-lazy-pages.log alongside
+ * our own timing instrumentation, and we tag every line with the pid and
+ * a "subdbg:" prefix for grep-ability.
+ */
+static int _curl_debug_cb(CURL *handle, curl_infotype type,
+			  char *data, size_t size, void *userptr)
+{
+	const char *tag;
+	char buf[1024];
+	size_t n;
+	(void)handle;
+	(void)userptr;
+
+	switch (type) {
+	case CURLINFO_TEXT:        tag = "INFO"; break;
+	case CURLINFO_HEADER_OUT:  tag = "HDR>"; break;
+	case CURLINFO_HEADER_IN:   tag = "HDR<"; break;
+	case CURLINFO_DATA_OUT:    return 0;  /* skip body bytes */
+	case CURLINFO_DATA_IN:     return 0;
+	case CURLINFO_SSL_DATA_OUT: return 0;
+	case CURLINFO_SSL_DATA_IN:  return 0;
+	default:                   tag = "????"; break;
+	}
+
+	n = size > sizeof(buf) - 1 ? sizeof(buf) - 1 : size;
+	memcpy(buf, data, n);
+	buf[n] = '\0';
+	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
+		buf[--n] = '\0';
+	}
+	if (n > 0)
+		pr_info("subdbg: %s %s\n", tag, buf);
+	return 0;
+}
+
+
 int object_storage_fetch_range(const char *object_key, unsigned long offset, unsigned long length, void *buffer,
 			       const char *source)
 {
@@ -3634,6 +4632,359 @@ int object_storage_fetch_range(const char *object_key, unsigned long offset, uns
 		return -1;
 	}
 	return 0;
+}
+
+/* ===========================================================
+ * Multipart-parallel download: per-thread pool implementation
+ * =========================================================== */
+static pthread_key_t g_dl_pool_key;
+static pthread_once_t g_dl_pool_key_once = PTHREAD_ONCE_INIT;
+
+static void dl_pool_destructor(void *p)
+{
+	struct thread_dl_pool *pool = (struct thread_dl_pool *)p;
+	int i;
+	if (!pool)
+		return;
+	if (pool->initialized) {
+		/* Signal shutdown to all sub-threads, then join. */
+		for (i = 0; i < MULTIPART_DL_MAX_PARTS; i++) {
+			struct sub_thread_state *s = &pool->subs[i];
+			pthread_mutex_lock(&s->lock);
+			s->shutdown = true;
+			pthread_cond_signal(&s->work_avail);
+			pthread_mutex_unlock(&s->lock);
+		}
+		for (i = 0; i < MULTIPART_DL_MAX_PARTS; i++) {
+			pthread_join(pool->subs[i].tid, NULL);
+			pthread_mutex_destroy(&pool->subs[i].lock);
+			pthread_cond_destroy(&pool->subs[i].work_avail);
+			pthread_cond_destroy(&pool->subs[i].work_done);
+		}
+	}
+	for (i = 0; i < MULTIPART_DL_MAX_PARTS; i++) {
+		if (pool->headers[i])
+			curl_slist_free_all(pool->headers[i]);
+		if (pool->resolve[i])
+			curl_slist_free_all(pool->resolve[i]);
+		if (pool->easy[i])
+			curl_easy_cleanup(pool->easy[i]);
+	}
+	if (pool->share)
+		curl_share_cleanup(pool->share);
+	for (i = 0; i < CURL_LOCK_DATA_LAST; i++)
+		pthread_mutex_destroy(&pool->share_locks[i]);
+	free(pool);
+}
+
+static void init_dl_pool_key(void)
+{
+	pthread_key_create(&g_dl_pool_key, dl_pool_destructor);
+}
+
+static struct thread_dl_pool *get_thread_dl_pool(void)
+{
+	struct thread_dl_pool *pool;
+	int i;
+
+	pthread_once(&g_dl_pool_key_once, init_dl_pool_key);
+	pool = (struct thread_dl_pool *)pthread_getspecific(g_dl_pool_key);
+	if (pool && pool->initialized)
+		return pool;
+	if (!pool) {
+		pool = (struct thread_dl_pool *)calloc(1, sizeof(*pool));
+		if (!pool) {
+			pr_err("dl_pool: calloc failed\n");
+			return NULL;
+		}
+		pthread_setspecific(g_dl_pool_key, pool);
+	}
+	/* Init share handle + per-data mutexes. Must succeed before easy
+	 * handles are bound to it. */
+	for (i = 0; i < CURL_LOCK_DATA_LAST; i++)
+		pthread_mutex_init(&pool->share_locks[i], NULL);
+	pool->share = curl_share_init();
+	if (!pool->share) {
+		pr_err("dl_pool: curl_share_init failed\n");
+		dl_pool_destructor(pool);
+		pthread_setspecific(g_dl_pool_key, NULL);
+		return NULL;
+	}
+	curl_share_setopt(pool->share, CURLSHOPT_LOCKFUNC, _share_lock_cb);
+	curl_share_setopt(pool->share, CURLSHOPT_UNLOCKFUNC, _share_unlock_cb);
+	curl_share_setopt(pool->share, CURLSHOPT_USERDATA, pool);
+	curl_share_setopt(pool->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+	curl_share_setopt(pool->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+	curl_share_setopt(pool->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+
+	for (i = 0; i < MULTIPART_DL_MAX_PARTS; i++) {
+		pool->easy[i] = curl_easy_init();
+		if (!pool->easy[i]) {
+			pr_err("dl_pool: curl_easy_init[%d] failed\n", i);
+			dl_pool_destructor(pool);
+			pthread_setspecific(g_dl_pool_key, NULL);
+			return NULL;
+		}
+		set_fixed_curl_options(pool->easy[i]);
+		/* Bind to the shared connection / DNS / SSL-session cache so
+		 * any sub-handle can vend a previously-cached connection. */
+		curl_easy_setopt(pool->easy[i], CURLOPT_SHARE, pool->share);
+		/*
+		 * Enable libcurl verbose tracing on sub-handle 0 of every
+		 * pool. This records "Re-using existing connection" /
+		 * "Connection died" / SSL handshake / HTTP exchange details
+		 * which let us see why reuse is or isn't happening. We limit
+		 * to idx=0 to keep the log volume sane.
+		 */
+		if (i == 0) {
+			curl_easy_setopt(pool->easy[i], CURLOPT_VERBOSE, 1L);
+			curl_easy_setopt(pool->easy[i], CURLOPT_DEBUGFUNCTION,
+					 _curl_debug_cb);
+		}
+		/*
+		 * Pin each sub-handle to one resolved endpoint IP (round-robin
+		 * across the host's resolved IP list). 4 sub-handles -> 4
+		 * different IPs. Two purposes:
+		 *   1) Address diversity recommended by S3 perf doc: spread
+		 *      concurrent requests across S3 partitions/edges so we
+		 *      get more aggregate bandwidth than a single edge gives.
+		 *   2) Bundle-key stability under shared connection cache: a
+		 *      pinned handle only matches/reuses its own IP's idle
+		 *      connection in the CURLSH bundle, so back-to-back
+		 *      requests on one sub-handle stick to one socket.
+		 * Generic IP-level mechanism via CURLOPT_RESOLVE — works for
+		 * MinIO and any S3-compatible endpoint, no AWS-specific path.
+		 */
+		pool->resolve[i] = _pin_handle_to_s3_edge(pool->easy[i]);
+
+		/* Initialize sub-thread state and spawn the persistent worker. */
+		pool->subs[i].pool = pool;
+		pool->subs[i].idx = i;
+		pthread_mutex_init(&pool->subs[i].lock, NULL);
+		pthread_cond_init(&pool->subs[i].work_avail, NULL);
+		pthread_cond_init(&pool->subs[i].work_done, NULL);
+		pool->subs[i].has_work = false;
+		pool->subs[i].done = false;
+		pool->subs[i].shutdown = false;
+		if (pthread_create(&pool->subs[i].tid, NULL,
+				   sub_worker_thread_fn, &pool->subs[i]) != 0) {
+			pr_err("dl_pool: pthread_create[%d] failed\n", i);
+			pthread_mutex_destroy(&pool->subs[i].lock);
+			pthread_cond_destroy(&pool->subs[i].work_avail);
+			pthread_cond_destroy(&pool->subs[i].work_done);
+			dl_pool_destructor(pool);
+			pthread_setspecific(g_dl_pool_key, NULL);
+			return NULL;
+		}
+	}
+	pool->initialized = true;
+	return pool;
+}
+
+/*
+ * Drive a single sub-fetch on the per-thread persistent easy handle.
+ * Called only from the sub-thread that owns this handle — never from
+ * the dispatcher or another worker. Reads work parameters from the
+ * sub_thread_state struct that the dispatcher pre-populated.
+ */
+static void _do_sub_fetch(struct thread_dl_pool *pool, int idx,
+			  struct sub_thread_state *s)
+{
+	CURL *e = pool->easy[idx];
+	CURLcode res;
+	long http_code = 0;
+	char range_value[64];
+	double t_connect = 0, t_appconnect = 0;
+	double t_starttransfer = 0, t_total = 0;
+	curl_off_t dl_size = 0;
+	double body_ms, body_mbps = 0.0;
+
+	pool->chunks[idx].memory = s->buffer_slice;
+	pool->chunks[idx].size = 0;
+	pool->chunks[idx].capacity = s->part_len;
+	snprintf(pool->range_hdr[idx], sizeof(pool->range_hdr[idx]),
+		 "%lu-%lu", s->part_off, s->part_off + s->part_len - 1);
+
+	curl_easy_setopt(e, CURLOPT_URL, s->url);
+	curl_easy_setopt(e, CURLOPT_RANGE, pool->range_hdr[idx]);
+	curl_easy_setopt(e, CURLOPT_HTTPGET, 1L);
+	curl_easy_setopt(e, CURLOPT_FAILONERROR, 0L);
+	curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(e, CURLOPT_WRITEDATA, (void *)&pool->chunks[idx]);
+
+	snprintf(range_value, sizeof(range_value), "bytes=%s",
+		 pool->range_hdr[idx]);
+	if (pool->headers[idx]) {
+		curl_slist_free_all(pool->headers[idx]);
+		pool->headers[idx] = NULL;
+	}
+	if (_build_auth_headers("GET", s->auth_host, s->auth_canonical_uri,
+				NULL, EMPTY_PAYLOAD_HASH, range_value,
+				-1, &pool->headers[idx]) != 0) {
+		pr_err("sub_fetch[%d]: auth build failed\n", idx);
+		s->rc = -1;
+		return;
+	}
+	curl_easy_setopt(e, CURLOPT_HTTPHEADER, pool->headers[idx]);
+
+	res = curl_easy_perform(e);
+	curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &http_code);
+	curl_easy_getinfo(e, CURLINFO_CONNECT_TIME, &t_connect);
+	curl_easy_getinfo(e, CURLINFO_APPCONNECT_TIME, &t_appconnect);
+	curl_easy_getinfo(e, CURLINFO_STARTTRANSFER_TIME, &t_starttransfer);
+	curl_easy_getinfo(e, CURLINFO_TOTAL_TIME, &t_total);
+	curl_easy_getinfo(e, CURLINFO_SIZE_DOWNLOAD_T, &dl_size);
+	{
+		long num_connects = -1;
+		curl_off_t conn_id = -1;
+		long local_port = -1;
+		char *primary_ip = NULL;
+		long primary_port = 0;
+		curl_easy_getinfo(e, CURLINFO_NUM_CONNECTS, &num_connects);
+		curl_easy_getinfo(e, CURLINFO_CONN_ID, &conn_id);
+		curl_easy_getinfo(e, CURLINFO_LOCAL_PORT, &local_port);
+		curl_easy_getinfo(e, CURLINFO_PRIMARY_IP, &primary_ip);
+		curl_easy_getinfo(e, CURLINFO_PRIMARY_PORT, &primary_port);
+
+		body_ms = (t_total - t_starttransfer) * 1000.0;
+		if (body_ms > 0)
+			body_mbps = ((double)dl_size / 1024.0 / 1024.0) / (body_ms / 1000.0);
+
+		pr_info("multipart_sub_timing: idx=%d dl=%ld total_ms=%.1f "
+			"connect_ms=%.1f appconnect_ms=%.1f starttransfer_ms=%.1f "
+			"body_ms=%.1f body_mbps=%.2f reused=%s "
+			"num_connects=%ld conn_id=%ld local_port=%ld "
+			"peer=%s:%ld http=%ld\n",
+			idx, (long)dl_size, t_total * 1000.0,
+			t_connect * 1000.0, t_appconnect * 1000.0,
+			t_starttransfer * 1000.0, body_ms, body_mbps,
+			t_connect == 0.0 ? "yes" : "no",
+			num_connects, (long)conn_id, local_port,
+			primary_ip ? primary_ip : "?", primary_port, http_code);
+	}
+
+	if (res != CURLE_OK || http_code >= 400) {
+		pr_err("sub_fetch[%d]: failed: %s (HTTP %ld)\n", idx,
+		       curl_easy_strerror(res), http_code);
+		s->rc = -1;
+	} else {
+		s->rc = 0;
+	}
+}
+
+/*
+ * Persistent sub-handle worker thread. Owns pool->easy[idx] for life.
+ * Loops: wait on cond var → execute one sub-fetch → signal done → repeat.
+ */
+static void *sub_worker_thread_fn(void *vargp)
+{
+	struct sub_thread_state *s = (struct sub_thread_state *)vargp;
+	struct thread_dl_pool *pool = s->pool;
+	int idx = s->idx;
+
+	for (;;) {
+		pthread_mutex_lock(&s->lock);
+		while (!s->has_work && !s->shutdown)
+			pthread_cond_wait(&s->work_avail, &s->lock);
+		if (s->shutdown) {
+			pthread_mutex_unlock(&s->lock);
+			break;
+		}
+		s->has_work = false;
+		pthread_mutex_unlock(&s->lock);
+
+		_do_sub_fetch(pool, idx, s);
+
+		pthread_mutex_lock(&s->lock);
+		s->done = true;
+		pthread_cond_signal(&s->work_done);
+		pthread_mutex_unlock(&s->lock);
+	}
+	return NULL;
+}
+
+/*
+ * Multipart helper. Caller has already constructed `url` (including any
+ * presigned query) and `auth_host` / `auth_canonical_uri` for SigV4.
+ * Returns 0 on full success, -1 on any sub-fetch failure.
+ *
+ * Splits the range across the per-thread pool's persistent sub-handles
+ * (one pthread per sub-handle for life of the worker). Dispatcher fills
+ * each sub-thread's mailbox, signals work_avail, then waits work_done.
+ * The persistent-thread design ensures each easy handle is touched by a
+ * single thread context — required by libcurl for HTTPS keep-alive
+ * (TLS session resumption breaks across thread contexts and we observed
+ * 0 % connection reuse cross-region with ephemeral threads).
+ */
+static int _fetch_range_multipart(const char *url, const char *auth_host,
+				  const char *auth_canonical_uri,
+				  unsigned long offset, unsigned long length,
+				  void *buffer, unsigned long *out_got)
+{
+	struct thread_dl_pool *pool = get_thread_dl_pool();
+	int n = (int)((length + MULTIPART_DL_PART_SIZE - 1) / MULTIPART_DL_PART_SIZE);
+	unsigned long part_size;
+	int i;
+	int n_failed = 0;
+	int n_dispatched = 0;
+	unsigned long got = 0;
+
+	if (n < 1)
+		n = 1;
+	if (n > MULTIPART_DL_MAX_PARTS)
+		n = MULTIPART_DL_MAX_PARTS;
+
+	if (!pool)
+		return -1;
+
+	/* part_size: ceil(length/n). Final part absorbs the tail rounding. */
+	part_size = (length + n - 1) / n;
+
+	/* Dispatch: fill each mailbox + signal work_avail. */
+	for (i = 0; i < n; i++) {
+		unsigned long part_off = offset + (unsigned long)i * part_size;
+		unsigned long part_len;
+		struct sub_thread_state *s = &pool->subs[i];
+
+		if (part_off >= offset + length)
+			break;
+		part_len = part_size;
+		if (part_off + part_len > offset + length)
+			part_len = offset + length - part_off;
+		if (part_len == 0)
+			break;
+
+		pthread_mutex_lock(&s->lock);
+		s->url = url;
+		s->auth_host = auth_host;
+		s->auth_canonical_uri = auth_canonical_uri;
+		s->part_off = part_off;
+		s->part_len = part_len;
+		s->buffer_slice = (char *)buffer + (part_off - offset);
+		s->rc = 0;
+		s->done = false;
+		s->has_work = true;
+		pthread_cond_signal(&s->work_avail);
+		pthread_mutex_unlock(&s->lock);
+		n_dispatched++;
+	}
+
+	/* Wait: each dispatched sub-thread sets done=true and signals. */
+	for (i = 0; i < n_dispatched; i++) {
+		struct sub_thread_state *s = &pool->subs[i];
+		pthread_mutex_lock(&s->lock);
+		while (!s->done)
+			pthread_cond_wait(&s->work_done, &s->lock);
+		if (s->rc != 0)
+			n_failed++;
+		got += pool->chunks[i].size;
+		pthread_mutex_unlock(&s->lock);
+	}
+
+	if (out_got)
+		*out_got = got;
+
+	return n_failed > 0 ? -1 : 0;
 }
 
 int object_storage_fetch_range_short(const char *object_key, unsigned long offset, unsigned long length, void *buffer,
@@ -3866,6 +5217,50 @@ int object_storage_fetch_range_short(const char *object_key, unsigned long offse
 		snprintf(range_header_value, sizeof(range_header_value), "bytes=%lu-%lu",
 			 offset, offset + length - 1);
 
+		/*
+		 * Multipart-parallel dispatch: for worker-thread fetches whose
+		 * range exceeds the single-stream's per-connection ceiling,
+		 * split into N concurrent sub-streams across distinct S3 edge
+		 * IPs. Falls through to the existing single-handle path on
+		 * any setup failure so callers always get a result.
+		 */
+		if (!is_main_thread() && length >= MULTIPART_DL_THRESHOLD) {
+			unsigned long mp_got = 0;
+			int mp_rc;
+
+			clock_gettime(CLOCK_MONOTONIC, &fetch_start);
+			OBJSTOR_FETCH_START_LOG(object_key, offset, length, source);
+
+			mp_rc = _fetch_range_multipart(url, auth_host,
+						       auth_canonical_uri,
+						       offset, length, buffer,
+						       &mp_got);
+
+			clock_gettime(CLOCK_MONOTONIC, &fetch_end);
+			fetch_duration_ms = (fetch_end.tv_sec - fetch_start.tv_sec) * 1000.0 +
+					    (fetch_end.tv_nsec - fetch_start.tv_nsec) / 1000000.0;
+			OBJSTOR_FETCH_DONE_LOG(object_key, offset, length,
+					       fetch_duration_ms, "", "", source);
+			pr_info("multipart_fetch: src=%s len=%lu got=%lu total_ms=%.1f "
+				"throughput_mbps=%.2f rc=%d\n",
+				source, length, mp_got, fetch_duration_ms,
+				fetch_duration_ms > 0 ? ((double)mp_got / 1024.0 / 1024.0) /
+							 (fetch_duration_ms / 1000.0)
+						      : 0.0,
+				mp_rc);
+
+			if (mp_rc == 0) {
+				if (out_got)
+					*out_got = mp_got;
+				free(error_response.memory);
+				return 0;
+			}
+			/* On failure fall through to the single-handle path so
+			 * the caller still has a chance via the legacy fetch. */
+			pr_warn("multipart fetch failed (rc=%d), falling back to single-handle\n",
+				mp_rc);
+		}
+
 		if (_build_auth_headers("GET", auth_host, auth_canonical_uri, NULL,
 				       EMPTY_PAYLOAD_HASH, range_header_value, -1, &headers) != 0) {
 			free(error_response.memory);
@@ -4031,6 +5426,48 @@ int object_storage_fetch_range_short(const char *object_key, unsigned long offse
 			    (fetch_end.tv_nsec - fetch_start.tv_nsec) / 1000000.0;
 	OBJSTOR_FETCH_DONE_LOG(object_key, offset, length, fetch_duration_ms,
 			       fetch_ctx.x_cache, fetch_ctx.x_amz_cf_pop, source);
+
+	/*
+	 * Per-fetch sub-step timing via libcurl. Distinguishes
+	 *   namelookup  : DNS lookup
+	 *   connect     : TCP handshake (0 if connection reused)
+	 *   appconnect  : TLS handshake (0 if connection reused)
+	 *   pretransfer : authn + setopt path (rarely interesting)
+	 *   starttransfer: time-to-first-byte (server processing + 1 RTT)
+	 *   total       : full fetch wall time
+	 *   body_ms     := total - starttransfer  (pure transfer phase, isolates cwnd effect)
+	 * If connect_ms > 0 → connection NOT reused this call.
+	 * If body_ms throughput is much lower than total throughput → cwnd-stuck issue.
+	 */
+	{
+		double t_namelookup = 0, t_connect = 0, t_appconnect = 0;
+		double t_pretransfer = 0, t_starttransfer = 0, t_total = 0;
+		curl_off_t dl_size = 0, dl_speed = 0;
+		double body_ms, body_mbps = 0.0;
+
+		curl_easy_getinfo(curl_handle, CURLINFO_NAMELOOKUP_TIME, &t_namelookup);
+		curl_easy_getinfo(curl_handle, CURLINFO_CONNECT_TIME, &t_connect);
+		curl_easy_getinfo(curl_handle, CURLINFO_APPCONNECT_TIME, &t_appconnect);
+		curl_easy_getinfo(curl_handle, CURLINFO_PRETRANSFER_TIME, &t_pretransfer);
+		curl_easy_getinfo(curl_handle, CURLINFO_STARTTRANSFER_TIME, &t_starttransfer);
+		curl_easy_getinfo(curl_handle, CURLINFO_TOTAL_TIME, &t_total);
+		curl_easy_getinfo(curl_handle, CURLINFO_SIZE_DOWNLOAD_T, &dl_size);
+		curl_easy_getinfo(curl_handle, CURLINFO_SPEED_DOWNLOAD_T, &dl_speed);
+
+		body_ms = (t_total - t_starttransfer) * 1000.0;
+		if (body_ms > 0)
+			body_mbps = ((double)dl_size / 1024.0 / 1024.0) / (body_ms / 1000.0);
+
+		pr_info("curl_timing: src=%s len=%lu dl=%ld total_ms=%.1f "
+			"namelookup_ms=%.1f connect_ms=%.1f appconnect_ms=%.1f "
+			"pretransfer_ms=%.1f starttransfer_ms=%.1f body_ms=%.1f "
+			"body_mbps=%.2f avg_speed_mbps=%.2f reused=%s\n",
+			source, length, (long)dl_size, t_total * 1000.0,
+			t_namelookup * 1000.0, t_connect * 1000.0, t_appconnect * 1000.0,
+			t_pretransfer * 1000.0, t_starttransfer * 1000.0, body_ms,
+			body_mbps, ((double)dl_speed / 1024.0 / 1024.0),
+			t_connect == 0.0 ? "yes" : "no");
+	}
 
 	pr_debug("Successfully fetched %zu bytes (range %s) from %s\n", chunk.size, range_header, url);
 

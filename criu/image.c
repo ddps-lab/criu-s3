@@ -873,7 +873,7 @@ void close_image(struct cr_img *img)
 					unsigned long rd;
 
 					lseek(fd, 0, SEEK_SET);
-					buf = xmalloc(file_size);
+					buf = malloc(file_size);
 					if (buf) {
 						rd = 0;
 						while (rd < (unsigned long)file_size) {
@@ -883,10 +883,28 @@ void close_image(struct cr_img *img)
 								break;
 							rd += nr;
 						}
-						if (rd == (unsigned long)file_size)
-							object_storage_put_object(
-								img->path, buf, file_size);
-						xfree(buf);
+						if (rd == (unsigned long)file_size) {
+							/*
+							 * Hand the buffer to the async-put
+							 * pool: workers PUT in parallel and
+							 * free the data. cr_dump_finish
+							 * drains the pool before writing
+							 * manifest+bundle to ensure all
+							 * uploads have landed.
+							 */
+							if (object_storage_put_object_async(
+								    img->path, buf,
+								    file_size) != 0) {
+								/* Enqueue failed (OOM); fall back
+								 * to sync PUT and free locally. */
+								object_storage_put_object(
+									img->path, buf,
+									file_size);
+								free(buf);
+							}
+						} else {
+							free(buf);
+						}
 					}
 				}
 				close(fd);

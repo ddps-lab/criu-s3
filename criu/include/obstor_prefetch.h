@@ -73,4 +73,36 @@ bool obstor_prefetch_is_authoritative(void);
  */
 void obstor_prefetch_fini(void);
 
+/*
+ * Tail cache for compressed pages-*.img files.
+ *
+ * A typical lazy-prefetch restore opens N compressed pages-*.img files
+ * back-to-back inside per-task prepare_mappings(). Each open issues a
+ * Range GET for the trailing seek-table region; cross-region these
+ * sequential 1-RTT fetches accumulate (mc-1gb: 3 tasks × ~600 ms TLS
+ * handshake = ~1.8 s).
+ *
+ * obstor_prefetch_init populates this cache by issuing all the tail
+ * GETs in parallel (one wave, one TLS handshake per worker) so the
+ * per-task init_s3_compression call is a memory hit instead of a fresh
+ * round-trip.
+ *
+ * On hit: *out_tail / *out_tail_len point to cache-owned bytes (DO NOT
+ * free; valid until obstor_prefetch_fini), *out_total_size is the file's
+ * total length, returns 0.
+ * On miss / not-compressed / authoritative empty: returns -1.
+ */
+int obstor_prefetch_tail_lookup(const char *full_key,
+				const void **out_tail, size_t *out_tail_len,
+				unsigned long *out_total_size);
+
+/*
+ * Companion lookup for the prefetched head region. Pre-populated by the
+ * same wave that does the tail preload. Lets s3_decomp_read_cb serve
+ * the decompressor's frame-body reads at offset 0..head_len from memory
+ * instead of issuing a fresh per-task Range GET. Returns -1 on miss.
+ */
+int obstor_prefetch_head_lookup(const char *full_key,
+				const void **out_head, size_t *out_head_len);
+
 #endif /* __CR_OBSTOR_PREFETCH_H__ */

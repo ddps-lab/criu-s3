@@ -1013,6 +1013,17 @@ static void *prefetch_worker(void *arg)
 {
 	int worker_id = (int)(long)arg;
 	struct obstor_batch batch;
+	/*
+	 * Per-worker step-timing accumulators. Tracks where each loop
+	 * iteration spends its wall time so we can identify the dominant
+	 * stage (queue wait / dequeue / alloc / fetch / install / free).
+	 * Aggregated and printed at worker exit so post-run analysis can
+	 * compare bytes_fetched vs fetch_ns to derive per-stream throughput.
+	 */
+	uint64_t qwait_ns = 0, dequeue_ns = 0, xmalloc_ns = 0;
+	uint64_t fetch_ns = 0, install_ns = 0, free_ns = 0;
+	uint64_t iters = 0, fetched_bytes = 0, installed_iovs = 0;
+	struct timespec t_a, t_b;
 
 	pr_debug("Worker %d started\n", worker_id);
 
@@ -1028,6 +1039,7 @@ static void *prefetch_worker(void *arg)
 		unsigned long offset_in_buf;
 
 		/* Wait for work or timeout */
+		clock_gettime(CLOCK_MONOTONIC, &t_a);
 		pthread_mutex_lock(&queue_lock);
 		while (workers_running &&
 		       list_empty(&queue_high) &&
@@ -1038,16 +1050,24 @@ static void *prefetch_worker(void *arg)
 			pthread_cond_timedwait(&queue_cond, &queue_lock, &ts);
 		}
 		pthread_mutex_unlock(&queue_lock);
+		clock_gettime(CLOCK_MONOTONIC, &t_b);
+		qwait_ns += (uint64_t)(t_b.tv_sec - t_a.tv_sec) * 1000000000ULL +
+			    (t_b.tv_nsec - t_a.tv_nsec);
 
 		if (!workers_running)
 			break;
 
 		/* Atomic batch dequeue: head + adjacent contiguous IOVs */
+		clock_gettime(CLOCK_MONOTONIC, &t_a);
 		n = dequeue_batch(&batch, opts.prefetch_batch_bytes);
+		clock_gettime(CLOCK_MONOTONIC, &t_b);
+		dequeue_ns += (uint64_t)(t_b.tv_sec - t_a.tv_sec) * 1000000000ULL +
+			      (t_b.tv_nsec - t_a.tv_nsec);
 		if (n == 0)
 			continue;
 
 		head = batch.reqs[0];
+		iters++;
 
 		PREFETCH_WORKER_START_LOG(worker_id, head->iov_index);
 		pr_debug("obstor_xfer: Worker %d: batch of %d IOVs (%lu bytes), "
@@ -1055,7 +1075,11 @@ static void *prefetch_worker(void *arg)
 			 worker_id, n, batch.total_bytes,
 			 head->iov_index, head->iov_start);
 
+		clock_gettime(CLOCK_MONOTONIC, &t_a);
 		data = xmalloc(batch.total_bytes);
+		clock_gettime(CLOCK_MONOTONIC, &t_b);
+		xmalloc_ns += (uint64_t)(t_b.tv_sec - t_a.tv_sec) * 1000000000ULL +
+			      (t_b.tv_nsec - t_a.tv_nsec);
 		if (!data) {
 			pr_err("Worker %d: Failed to allocate %lu byte batch buffer\n",
 			       worker_id, batch.total_bytes);
@@ -1076,6 +1100,7 @@ static void *prefetch_worker(void *arg)
 				 worker_id, object_key, batch.base_offset, batch.total_bytes, n);
 
 			ce = xfer_obtain_compress_entry(batch.pages_img_id, object_key);
+			clock_gettime(CLOCK_MONOTONIC, &t_a);
 			if (ce && ce->is_compressed) {
 				/*
 				 * Compressed mode: batch.base_offset is an
@@ -1111,6 +1136,11 @@ static void *prefetch_worker(void *arg)
 					       worker_id, object_key, ret);
 				}
 			}
+			clock_gettime(CLOCK_MONOTONIC, &t_b);
+			fetch_ns += (uint64_t)(t_b.tv_sec - t_a.tv_sec) * 1000000000ULL +
+				    (t_b.tv_nsec - t_a.tv_nsec);
+			if (ret == 0)
+				fetched_bytes += batch.total_bytes;
 		}
 
 		/* Stats: count this as one batch (always, even on failure) */
@@ -1124,12 +1154,17 @@ static void *prefetch_worker(void *arg)
 
 		if (ret == 0) {
 			offset_in_buf = 0;
+			clock_gettime(CLOCK_MONOTONIC, &t_a);
 			for (i = 0; i < n; i++) {
 				struct prefetch_request *r = batch.reqs[i];
 				unsigned long slice_size = r->iov_end - r->iov_start;
 				worker_install_one(worker_id, r, (char *)data + offset_in_buf, slice_size);
 				offset_in_buf += slice_size;
 			}
+			clock_gettime(CLOCK_MONOTONIC, &t_b);
+			install_ns += (uint64_t)(t_b.tv_sec - t_a.tv_sec) * 1000000000ULL +
+				      (t_b.tv_nsec - t_a.tv_nsec);
+			installed_iovs += (uint64_t)n;
 		} else {
 			/* Whole batch fetch failed: revert each iov's state so
 			 * the main-loop fallback handles them, and wake any
@@ -1150,13 +1185,28 @@ static void *prefetch_worker(void *arg)
 		}
 
 release_batch:
+		clock_gettime(CLOCK_MONOTONIC, &t_a);
 		if (data) {
 			xfree(data);
 			data = NULL;
 		}
 		for (i = 0; i < n; i++)
 			xfree(batch.reqs[i]);
+		clock_gettime(CLOCK_MONOTONIC, &t_b);
+		free_ns += (uint64_t)(t_b.tv_sec - t_a.tv_sec) * 1000000000ULL +
+			   (t_b.tv_nsec - t_a.tv_nsec);
 	}
+
+	pr_info("worker_step_stats: worker=%d iters=%lu fetched_bytes=%lu installed_iovs=%lu "
+		"qwait_ms=%.1f dequeue_ms=%.1f xmalloc_ms=%.1f fetch_ms=%.1f "
+		"install_ms=%.1f free_ms=%.1f fetch_mbps=%.2f\n",
+		worker_id,
+		(unsigned long)iters,
+		(unsigned long)fetched_bytes,
+		(unsigned long)installed_iovs,
+		qwait_ns / 1e6, dequeue_ns / 1e6, xmalloc_ns / 1e6,
+		fetch_ns / 1e6, install_ns / 1e6, free_ns / 1e6,
+		fetch_ns > 0 ? (fetched_bytes / 1024.0 / 1024.0) / (fetch_ns / 1e9) : 0.0);
 
 	pr_debug("Worker %d exiting\n", worker_id);
 	return NULL;
