@@ -203,6 +203,15 @@ void object_storage_drain_uploads(void);
 int object_storage_get_object(const char *object_key, void **out_data, unsigned long *out_length);
 
 /*
+ * Like object_storage_get_object() but bypasses the prefetch-cache
+ * authoritative-miss short-circuit. Use for objects uploaded after CRIU's
+ * manifest is sealed (e.g., hot-iovs.json appended by the workload runner
+ * post-dump), where the manifest cannot mark them as existing. The
+ * cache-hit fast path is still honored.
+ */
+int object_storage_get_object_force(const char *object_key, void **out_data, unsigned long *out_length);
+
+/*
  * HEAD an object: one round-trip to get Content-Length without the body.
  *
  * Used by restore-side compression detection to discover the compressed

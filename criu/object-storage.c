@@ -3222,7 +3222,7 @@ int object_storage_multipart_abort(const char *object_key, const char *upload_id
  * =================================================================================
  */
 
-int object_storage_get_object(const char *object_key, void **out_data, unsigned long *out_length)
+static int do_get_object(const char *object_key, void **out_data, unsigned long *out_length, bool bypass_cache)
 {
 	struct object_url_info url_info;
 	struct MemoryStruct chunk;
@@ -3250,6 +3250,11 @@ int object_storage_get_object(const char *object_key, void **out_data, unsigned 
 	 * cross-region 404. Most visibly this kills the per-page_read GET of
 	 * "parent-prefix" on full dumps (called from open_page_xfer,
 	 * try_open_parent_at, get_parent_inventory).
+	 *
+	 * bypass_cache=true skips the authoritative-miss short-circuit for
+	 * objects that may be uploaded after CRIU's manifest is sealed (e.g.
+	 * hot-iovs.json appended by the workload runner post-dump). The
+	 * cache-hit fast path is still consulted — if it's cached, we use it.
 	 */
 	if (obstor_prefetch_lookup(object_key, &cache_data, &cache_len) == 0) {
 		void *copy = malloc(cache_len);
@@ -3262,7 +3267,7 @@ int object_storage_get_object(const char *object_key, void **out_data, unsigned 
 			 (unsigned long)cache_len);
 		return 0;
 	}
-	if (obstor_prefetch_is_authoritative()) {
+	if (!bypass_cache && obstor_prefetch_is_authoritative()) {
 		pr_debug("GET %s: skipped (prefetch cache authoritative miss)\n",
 			 object_key);
 		return -ENOENT;
@@ -3328,6 +3333,16 @@ int object_storage_get_object(const char *object_key, void **out_data, unsigned 
 	*out_data = chunk.memory;
 	*out_length = chunk.size;
 	return 0;
+}
+
+int object_storage_get_object(const char *object_key, void **out_data, unsigned long *out_length)
+{
+	return do_get_object(object_key, out_data, out_length, false);
+}
+
+int object_storage_get_object_force(const char *object_key, void **out_data, unsigned long *out_length)
+{
+	return do_get_object(object_key, out_data, out_length, true);
 }
 
 /*
