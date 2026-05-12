@@ -1449,10 +1449,18 @@ static int load_hot_iov_metadata(void)
 		close(fd);
 	}
 
-	/* S3 fallback */
+	/* S3 fallback.
+	 *
+	 * hot-iovs.json is uploaded by the workload runner *after* CRIU writes
+	 * the manifest, so the prefetch cache treats it as an authoritative
+	 * miss. Use the _force variant to bypass that short-circuit and let
+	 * a real S3 GET decide whether the file exists. opts.hot_vma_seed is
+	 * the gate — if seeding is disabled, this function is never called,
+	 * so we don't waste a 404 round-trip on semi-sync/async-only modes.
+	 */
 	if (!data && opts.enable_object_storage) {
 		void *s3_data = NULL;
-		int ret = object_storage_get_object("hot-iovs.json", &s3_data, &data_len);
+		int ret = object_storage_get_object_force("hot-iovs.json", &s3_data, &data_len);
 		if (ret == 0 && s3_data && data_len > 0) {
 			data = xmalloc(data_len + 1);
 			if (data) {
