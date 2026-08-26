@@ -2101,8 +2101,19 @@ struct upload_sg_ctx {
 	size_t total_read; /* bytes already fed to libcurl */
 };
 
+/*
+ * Transient part-upload failures are retried with exponential backoff.
+ * On smaller EC2 instances a long full-speed upload exhausts the ENA
+ * network allowance (bw/pps/conntrack); new connections then fail with
+ * "SSL connect error" / empty replies for a moment (seen 2026-08-26,
+ * m5.xlarge, ~50s into a final dump). The allowance is a token bucket,
+ * so a short backoff and a fresh signed request recover.
+ */
+#define UPLOAD_PART_MAX_RETRIES 3
+
 struct upload_pool_slot {
 	CURL *handle;
+	int retries;                /* per-part transient-failure retries */
 	int part_num;               /* 1-based */
 	void *data;                 /* contiguous body — owned by pool (xfree on reset) */
 	size_t len;                 /* contiguous body length */
@@ -2409,6 +2420,65 @@ static void _slot_reset(struct upload_pool_slot *s)
 	}
 	s->part_num = 0;
 	s->in_flight = 0;
+	s->retries = 0;
+}
+
+static int _slot_prepare_put_common(struct upload_pool *p,
+				    struct upload_pool_slot *s,
+				    int part_num,
+				    void *data, size_t len,
+				    struct upload_sg_chunk *chunks,
+				    int n_chunks, size_t total_len);
+
+/*
+ * Re-arm a slot for a retry of the same part: drop per-attempt state
+ * (headers carry x-amz-date, so the request must be re-signed) while
+ * keeping the body buffers, then re-prepare and re-add to the multi.
+ * On failure the body is freed here; the caller marks the part failed.
+ */
+static int _slot_retry(struct upload_pool *p, struct upload_pool_slot *s)
+{
+	void *data = s->data;
+	size_t len = s->len;
+	struct upload_sg_chunk *chunks = s->sg_chunks;
+	int n_chunks = s->sg_n_chunks;
+	size_t total_len = s->sg_ctx.total_len;
+	int part_num = s->part_num;
+	int i;
+
+	if (s->resolve_list) {
+		curl_slist_free_all(s->resolve_list);
+		s->resolve_list = NULL;
+	}
+	if (s->headers) {
+		curl_slist_free_all(s->headers);
+		s->headers = NULL;
+	}
+	free(s->response.memory); s->response.memory = NULL;
+	s->response.size = 0; s->response.capacity = 0;
+	free(s->header.memory); s->header.memory = NULL;
+	s->header.size = 0; s->header.capacity = 0;
+	free(s->full_url); s->full_url = NULL;
+	/* detach the body so a prepare-failure _slot_reset can't double-free */
+	s->data = NULL; s->len = 0;
+	s->sg_chunks = NULL; s->sg_n_chunks = 0;
+
+	if (_slot_prepare_put_common(p, s, part_num, data, len,
+				     chunks, n_chunks, total_len) != 0) {
+		if (data)
+			free(data);
+		if (chunks) {
+			for (i = 0; i < n_chunks; i++) {
+				if (chunks[i].data)
+					free(chunks[i].data);
+			}
+			free(chunks);
+		}
+		return -1;
+	}
+	if (curl_multi_add_handle(p->multi, s->handle) != CURLM_OK)
+		return -1;
+	return 0;
 }
 
 /*
@@ -2625,9 +2695,25 @@ static int _pool_drain_completions(struct upload_pool *p)
 		curl_multi_remove_handle(p->multi, msg->easy_handle);
 
 		if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
-			pr_err("upload_pool: part %d failed curl=%s http=%ld\n",
-			       s->part_num, curl_easy_strerror(res), http_code);
-			p->failed_part_num = s->part_num;
+			if (s->retries < UPLOAD_PART_MAX_RETRIES) {
+				int part = s->part_num;
+				unsigned int backoff_ms;
+
+				backoff_ms = 200u << s->retries;
+				s->retries++;
+				pr_warn("upload_pool: part %d failed curl=%s http=%ld — retry %d/%d after %ums\n",
+					part, curl_easy_strerror(res), http_code,
+					s->retries, UPLOAD_PART_MAX_RETRIES, backoff_ms);
+				usleep(backoff_ms * 1000);
+				if (_slot_retry(p, s) == 0)
+					continue; /* re-armed; keep in_flight */
+				pr_err("upload_pool: part %d retry re-arm failed\n", part);
+				p->failed_part_num = part;
+			} else {
+				pr_err("upload_pool: part %d failed curl=%s http=%ld (retries exhausted)\n",
+				       s->part_num, curl_easy_strerror(res), http_code);
+				p->failed_part_num = s->part_num;
+			}
 		} else if (_parse_etag_header(s->header.memory, etag, sizeof(etag)) != 0) {
 			pr_err("upload_pool: part %d missing ETag\n", s->part_num);
 			p->failed_part_num = s->part_num;
