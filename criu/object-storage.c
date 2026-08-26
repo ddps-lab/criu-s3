@@ -2478,6 +2478,15 @@ static int _slot_retry(struct upload_pool *p, struct upload_pool_slot *s)
 	}
 	if (curl_multi_add_handle(p->multi, s->handle) != CURLM_OK)
 		return -1;
+	/*
+	 * Kick the event loop so still_running reflects the re-added
+	 * handle immediately. Without this, upload_pool_wait's
+	 * still_running-based exit fired before the retry ever ran and
+	 * its defensive cleanup dropped the slot (2026-08-26,
+	 * "empty etags" on 2-part files whose parts both retried).
+	 */
+	curl_multi_socket_action(p->multi, CURL_SOCKET_TIMEOUT, 0,
+				 &p->still_running);
 	return 0;
 }
 
@@ -3091,7 +3100,27 @@ int upload_pool_wait(struct upload_pool *pool, int *failed_part_num)
 				 &pool->still_running);
 	_pool_drain_completions(pool);
 
-	while (pool->still_running > 0 && !pool->failed_part_num) {
+	/*
+	 * Exit on "no slot in flight", not on curl's still_running alone:
+	 * a retried part is re-added between drain and the next pump, and
+	 * judging by still_running raced that window (2026-08-26).
+	 */
+	for (;;) {
+		int busy = 0;
+
+		if (pool->failed_part_num)
+			break;
+		for (i = 0; i < pool->max_slots; i++) {
+			if (pool->slots[i].in_flight) {
+				busy = 1;
+				break;
+			}
+		}
+		if (!busy)
+			break;
+		if (pool->still_running == 0)
+			curl_multi_socket_action(pool->multi, CURL_SOCKET_TIMEOUT,
+						 0, &pool->still_running);
 		if (_pool_pump_events(pool, 500) < 0)
 			break;
 	}
