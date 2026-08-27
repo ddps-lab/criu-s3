@@ -1136,22 +1136,36 @@ static int collect_eager_ranges(struct page_read *pr,
  * then falls through to the existing read-ahead / direct fetch paths with
  * no correctness regression.
  */
+static int run_eager_prefetch(struct page_read *pr, struct eager_range *ranges,
+			      int nr_ranges, size_t total_bytes);
+
+/*
+ * Depth of nested open_page_read_at() calls on the current (single
+ * restore) thread; maintained by the open_page_read_at() wrapper below.
+ * 1 = outermost open, >=2 = a chain parent being opened recursively.
+ */
+static int opr_depth;
+
 static int prefetch_eager_ranges(struct page_read *pr)
 {
 	struct eager_range *ranges = NULL;
 	int nr_ranges = 0;
 	size_t total_bytes = 0;
-	char object_key[PATH_MAX];
-	char image_name[64];
-	const char *prefix;
-	int nw, i, created;
-	pthread_t *tids = NULL;
-	struct eager_worker_arg *args = NULL;
-	struct timespec t0, t1;
-	double wall_ms;
 
 	/* Only applies to object-storage page_reads */
 	if (!opts.enable_object_storage || pr->maybe_read_page != maybe_read_page_object_storage)
+		return 0;
+
+	/*
+	 * Chain levels opened as parents during a restore are served by
+	 * preload_parent_chain() after the outermost open completes: it
+	 * prefetches exactly the ranges the child will read — a superset
+	 * of this function's non-lazy PRESENT pick — and needs
+	 * pr->eager_buf unclaimed. Running the small pick here first
+	 * blocked the big preload entirely (verify6j 2026-08-27: a
+	 * 1.28 MB early buf skipped a 1 GB parent preload).
+	 */
+	if (opts.mode == CR_RESTORE && opr_depth >= 2)
 		return 0;
 
 	if (collect_eager_ranges(pr, &ranges, &nr_ranges, &total_bytes) != 0)
@@ -1170,6 +1184,29 @@ static int prefetch_eager_ranges(struct page_read *pr)
 		xfree(ranges);
 		return 0;
 	}
+
+	return run_eager_prefetch(pr, ranges, nr_ranges, total_bytes);
+}
+
+/*
+ * Fetch the given file-coordinate ranges of pr's pages image into a
+ * freshly allocated eager_buf with a small parallel worker pool.
+ * Takes ownership of `ranges` (stored as pr->eager_ranges; freed with
+ * the buffer on any worker failure). Shared by the top-level
+ * PE_PRESENT prefetch above and the parent-chain preload
+ * (preload_parent_chain) below.
+ */
+static int run_eager_prefetch(struct page_read *pr, struct eager_range *ranges,
+			      int nr_ranges, size_t total_bytes)
+{
+	char object_key[PATH_MAX];
+	char image_name[64];
+	const char *prefix;
+	int nw, i, created;
+	pthread_t *tids = NULL;
+	struct eager_worker_arg *args = NULL;
+	struct timespec t0, t1;
+	double wall_ms;
 
 	pr_info("eager prefetch: %d ranges, %lu bytes total\n",
 		nr_ranges, (unsigned long)total_bytes);
@@ -1351,6 +1388,359 @@ static int prefetch_eager_ranges(struct page_read *pr)
 	xfree(args);
 
 	return 0;
+}
+
+/*
+ * Parent-chain eager preload (incremental final restore).
+ *
+ * A final dump taken with --track-mem records unchanged pages as
+ * PE_PARENT holes. Restore fills those synchronously from the parent
+ * page_read — upstream semantics, cheap against local files — but with
+ * object storage each read became one blocking ~2 MB range GET per
+ * compressed frame, fully serialized (verify6h 2026-08-27: 830 MB
+ * parent at ~2.5 MB/s = 7.5 min of downtime). The chain levels are
+ * pre-dumps whose pagemap entries are all PE_LAZY, so the top-level
+ * collect_eager_ranges() finds nothing to prefetch on them.
+ *
+ * After the outermost open_page_read_at() has linked the chain and
+ * loaded every level's pagemap entries, walk the child's PE_PARENT
+ * vaddr ranges down the chain: at each level the intersection with
+ * that level's PRESENT entries becomes eager fetch ranges served by
+ * run_eager_prefetch(); the intersection with the level's own
+ * PE_PARENT entries is pushed one level further down. Memory-only,
+ * S3-direct, no local spill; purely a prefetch — any failure just
+ * falls back to the existing serial path.
+ */
+struct vaddr_range {
+	unsigned long start;
+	unsigned long end;
+};
+
+/* Collect (merged) vaddr ranges of pr's PE_PARENT pagemap entries. */
+static int collect_in_parent_want(struct page_read *pr, struct vaddr_range **out, int *out_n)
+{
+	struct vaddr_range *arr;
+	int cap = 64, n = 0, i;
+
+	*out = NULL;
+	*out_n = 0;
+
+	arr = xmalloc(cap * sizeof(*arr));
+	if (!arr)
+		return -1;
+
+	for (i = 0; i < pr->nr_pmes; i++) {
+		PagemapEntry *pe = pr->pmes[i];
+		unsigned long start, end;
+
+		if (!pagemap_in_parent(pe))
+			continue;
+
+		start = pe->vaddr;
+		end = pe->vaddr + pagemap_len(pe);
+
+		if (n > 0 && arr[n - 1].end == start) {
+			arr[n - 1].end = end;
+			continue;
+		}
+		if (n == cap) {
+			struct vaddr_range *grown;
+			cap *= 2;
+			grown = xrealloc(arr, cap * sizeof(*arr));
+			if (!grown) {
+				xfree(arr);
+				return -1;
+			}
+			arr = grown;
+		}
+		arr[n].start = start;
+		arr[n].end = end;
+		n++;
+	}
+
+	*out = arr;
+	*out_n = n;
+	return 0;
+}
+
+static int vaddr_range_append(struct vaddr_range **arr, int *n, int *cap,
+			      unsigned long start, unsigned long end)
+{
+	if (*n > 0 && (*arr)[*n - 1].end == start) {
+		(*arr)[*n - 1].end = end;
+		return 0;
+	}
+	if (*n == *cap) {
+		struct vaddr_range *grown;
+		*cap *= 2;
+		grown = xrealloc(*arr, *cap * sizeof(**arr));
+		if (!grown)
+			return -1;
+		*arr = grown;
+	}
+	(*arr)[*n].start = start;
+	(*arr)[*n].end = end;
+	(*n)++;
+	return 0;
+}
+
+/*
+ * Split `want` (vaddr ranges the child must read from this level)
+ * against pr's pagemap: intersections with PRESENT entries become
+ * eager fetch ranges in pages-image file coordinates (slack-merged,
+ * like collect_eager_ranges); intersections with this level's own
+ * PE_PARENT entries become the next level's want list. Both pmes and
+ * want are vaddr-sorted, so one linear pass suffices.
+ */
+static int collect_ranges_for_want(struct page_read *pr,
+				   const struct vaddr_range *want, int n_want,
+				   struct eager_range **out_ranges, int *out_n,
+				   size_t *out_total,
+				   struct vaddr_range **out_next, int *out_n_next)
+{
+	struct eager_range *er;
+	struct vaddr_range *nx;
+	int er_cap = 64, er_n = 0;
+	int nx_cap = 64, nx_n = 0;
+	size_t total = 0;
+	off_t cur_off = 0;
+	int i, w = 0;
+	const size_t merge_slack = 256 * 1024;
+
+	*out_ranges = NULL;
+	*out_n = 0;
+	*out_total = 0;
+	*out_next = NULL;
+	*out_n_next = 0;
+
+	er = xmalloc(er_cap * sizeof(*er));
+	nx = xmalloc(nx_cap * sizeof(*nx));
+	if (!er || !nx) {
+		if (er)
+			xfree(er);
+		if (nx)
+			xfree(nx);
+		return -1;
+	}
+
+	for (i = 0; i < pr->nr_pmes; i++) {
+		PagemapEntry *pe = pr->pmes[i];
+		unsigned long pstart = pe->vaddr;
+		unsigned long pend = pe->vaddr + pagemap_len(pe);
+		bool present = pagemap_present(pe);
+		bool inpar = pagemap_in_parent(pe);
+		int wj;
+
+		if (w < n_want && (present || inpar)) {
+			/* skip want ranges wholly before this entry */
+			while (w < n_want && want[w].end <= pstart)
+				w++;
+
+			for (wj = w; wj < n_want && want[wj].start < pend; wj++) {
+				unsigned long a = want[wj].start > pstart ? want[wj].start : pstart;
+				unsigned long b = want[wj].end < pend ? want[wj].end : pend;
+
+				if (a >= b)
+					continue;
+				if (present) {
+					off_t fo = cur_off + (off_t)(a - pstart);
+					size_t l = b - a;
+
+					if (er_n > 0 &&
+					    fo - (er[er_n - 1].file_offset + (off_t)er[er_n - 1].len) <=
+						    (off_t)merge_slack) {
+						er[er_n - 1].len = (size_t)(fo - er[er_n - 1].file_offset) + l;
+						continue;
+					}
+					if (er_n == er_cap) {
+						struct eager_range *grown;
+						er_cap *= 2;
+						grown = xrealloc(er, er_cap * sizeof(*er));
+						if (!grown)
+							goto err;
+						er = grown;
+					}
+					er[er_n].file_offset = fo;
+					er[er_n].len = l;
+					er[er_n].buf_offset = 0;
+					er_n++;
+				} else {
+					if (vaddr_range_append(&nx, &nx_n, &nx_cap, a, b))
+						goto err;
+				}
+			}
+		}
+
+		if (present)
+			cur_off += pagemap_len(pe);
+	}
+
+	for (i = 0; i < er_n; i++) {
+		er[i].buf_offset = total;
+		total += er[i].len;
+	}
+
+	*out_ranges = er;
+	*out_n = er_n;
+	*out_total = total;
+	*out_next = nx;
+	*out_n_next = nx_n;
+	return 0;
+
+err:
+	xfree(er);
+	xfree(nx);
+	return -1;
+}
+
+/*
+ * Re-slice eager ranges into at-most-`chunk`-byte pieces so the fetch
+ * worker pool (which hands out whole ranges) gets real parallelism even
+ * when slack-merging produced one huge region. Returns a new array with
+ * packed buf_offsets (same total), or NULL on alloc failure (caller
+ * keeps the original array).
+ */
+static struct eager_range *split_ranges_chunked(const struct eager_range *er, int n,
+						size_t chunk, int *out_n)
+{
+	struct eager_range *arr;
+	int total_chunks = 0;
+	int i, k = 0;
+	size_t repack = 0;
+
+	for (i = 0; i < n; i++)
+		total_chunks += (int)((er[i].len + chunk - 1) / chunk);
+
+	arr = xmalloc(total_chunks * sizeof(*arr));
+	if (!arr)
+		return NULL;
+
+	for (i = 0; i < n; i++) {
+		size_t done = 0;
+
+		while (done < er[i].len) {
+			size_t l = er[i].len - done;
+
+			if (l > chunk)
+				l = chunk;
+			arr[k].file_offset = er[i].file_offset + (off_t)done;
+			arr[k].len = l;
+			arr[k].buf_offset = repack;
+			repack += l;
+			done += l;
+			k++;
+		}
+	}
+
+	*out_n = k;
+	return arr;
+}
+
+static void preload_parent_chain(struct page_read *top)
+{
+	struct vaddr_range *want = NULL;
+	int n_want = 0;
+	struct page_read *pr;
+	int level = 0;
+	size_t max_bytes;
+	const char *env;
+
+	if (collect_in_parent_want(top, &want, &n_want))
+		return;
+	if (n_want == 0) {
+		xfree(want);
+		return;
+	}
+
+	max_bytes = 1024UL << 20; /* per-level cap, default 1 GB */
+	env = getenv("CRIU_PARENT_EAGER_MAX_MB");
+	if (env) {
+		long mb = atol(env);
+		if (mb >= 0)
+			max_bytes = (size_t)mb << 20;
+	}
+
+	for (pr = top->parent; pr && n_want > 0; pr = pr->parent) {
+		struct eager_range *er = NULL;
+		int n_er = 0;
+		size_t total = 0;
+		struct vaddr_range *nx = NULL;
+		int n_nx = 0;
+
+		level++;
+		if (collect_ranges_for_want(pr, want, n_want, &er, &n_er, &total, &nx, &n_nx))
+			break;
+		xfree(want);
+		want = nx;
+		n_want = n_nx;
+
+		if (total > max_bytes) {
+			/*
+			 * Byte-precise truncation: ranges here are often ONE
+			 * huge slack-merged region (a whole redis heap), so
+			 * per-range truncation would drop everything
+			 * (observed 1.57 GB single range vs 1 GB cap →
+			 * 1->0 ranges). Keep a partial last range instead.
+			 */
+			size_t acc = 0;
+			size_t repack = 0;
+			int k, q;
+
+			for (k = 0; k < n_er; k++) {
+				if (acc + er[k].len > max_bytes) {
+					size_t room = max_bytes - acc;
+
+					if (room >= (1UL << 20)) {
+						er[k].len = room;
+						acc += room;
+						k++;
+					}
+					break;
+				}
+				acc += er[k].len;
+			}
+			pr_warn("parent eager: level %d truncated %d->%d ranges "
+				"(%lu->%lu bytes, cap %lu) — tail stays on the serial path\n",
+				level, n_er, k, (unsigned long)total, (unsigned long)acc,
+				(unsigned long)max_bytes);
+			n_er = k;
+			total = acc;
+			for (q = 0; q < n_er; q++) {
+				er[q].buf_offset = repack;
+				repack += er[q].len;
+			}
+		}
+
+		if (n_er == 0 || total < (256UL * 1024) ||
+		    pr->maybe_read_page != maybe_read_page_object_storage ||
+		    pr->eager_buf) {
+			xfree(er);
+			continue;
+		}
+
+		/*
+		 * The worker pool distributes work per range, so one huge
+		 * merged range would run on a single thread. Split into
+		 * fixed chunks to actually get parallel streams.
+		 */
+		{
+			struct eager_range *chunked;
+			int n_chunked = 0;
+
+			chunked = split_ranges_chunked(er, n_er, 32UL << 20, &n_chunked);
+			if (chunked) {
+				xfree(er);
+				er = chunked;
+				n_er = n_chunked;
+			}
+		}
+
+		pr_info("parent eager: level %d: %d ranges, %lu bytes\n",
+			level, n_er, (unsigned long)total);
+		run_eager_prefetch(pr, er, n_er, total);
+	}
+	if (want)
+		xfree(want);
 }
 
 /*
@@ -2044,7 +2434,7 @@ free_pagemaps:
 	return -1;
 }
 
-int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int pr_flags)
+static int open_page_read_at_impl(int dfd, unsigned long img_id, struct page_read *pr, int pr_flags)
 {
 	int flags, i_typ;
 	static unsigned ids = 1;
@@ -2265,6 +2655,26 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		 pr->parent ? pr->parent->id : 0);
 
 	return 1;
+}
+
+int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int pr_flags)
+{
+	int ret;
+
+	opr_depth++;
+	ret = open_page_read_at_impl(dfd, img_id, pr, pr_flags);
+	opr_depth--;
+
+	/*
+	 * Parent-chain preload: restore process only — the lazy-pages
+	 * daemon never reads PE_PARENT pages (restore fills them before
+	 * any fault can arrive), and dump/pre-dump only need pagemaps.
+	 */
+	if (ret > 0 && opr_depth == 0 && pr->parent &&
+	    opts.enable_object_storage && opts.mode == CR_RESTORE)
+		preload_parent_chain(pr);
+
+	return ret;
 }
 
 int open_page_read(unsigned long img_id, struct page_read *pr, int pr_flags)
