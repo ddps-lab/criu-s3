@@ -849,6 +849,10 @@ static int write_pages_object_storage(struct page_xfer *xfer, int p, unsigned lo
 		void *buf;
 		unsigned long got = 0;
 
+		/* Backpressure gate: defer the staging allocation until the
+		 * pipeline has room, so pending raw+compressed buffers stay
+		 * bounded even when the upload is slower than the dump. */
+		compress_pipeline_reserve(xfer->object_storage.compress_pipe, len);
 		buf = xmalloc(len);
 		if (!buf)
 			return -1;

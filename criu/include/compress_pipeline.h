@@ -54,6 +54,10 @@ struct compress_pipeline *compress_pipeline_create(const char *object_key,
  * pipeline. The pipeline xfree()s it (on success, after compression;
  * on failure, before returning -1). Caller must NOT free it.
  */
+/* Block until the pipeline has room for len more raw bytes, then account
+ * them. Call BEFORE allocating the staging buffer for an IOV. */
+void compress_pipeline_reserve(struct compress_pipeline *p, size_t len);
+
 int compress_pipeline_submit(struct compress_pipeline *p,
 			     void *data, size_t len);
 

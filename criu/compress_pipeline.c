@@ -358,6 +358,24 @@ struct compress_pipeline {
 	int err;
 
 	/*
+	 * Backpressure: cap the raw bytes admitted into the pipeline but not
+	 * yet consumed by the writer. Without this cap a slow upload lets
+	 * compressed frames and queued raw IOVs accumulate without bound;
+	 * on a node whose workload holds ~75% of memory this drives
+	 * MemAvailable to zero and the dump stalls in reclaim (measured
+	 * 2026-08-28: 21GB state on a 32GB node timed out at >600s with
+	 * memory PSI 9%, vs 46s for 10GB). The gate lives at
+	 * compress_pipeline_reserve() BEFORE the caller stages the IOV, so
+	 * the staging allocation itself is deferred, and is released when
+	 * the writer hands the frame to the upload pool (upload-side memory
+	 * is already bounded by the pool's slot count).
+	 */
+	pthread_mutex_t bp_lock;
+	pthread_cond_t bp_cond;
+	unsigned long long bp_pending;
+	unsigned long long bp_max;
+
+	/*
 	 * Accumulated compress-side stats. Protected by stat_lock (workers run
 	 * in parallel). Logged once in compress_pipeline_destroy so we can
 	 * see for a whole dump how many frames were produced, the aggregate
@@ -388,6 +406,9 @@ static void pipe_set_error(struct compress_pipeline *p, int err)
 	if (!p->err)
 		p->err = err;
 	pthread_mutex_unlock(&p->err_lock);
+	pthread_mutex_lock(&p->bp_lock);
+	pthread_cond_broadcast(&p->bp_cond);
+	pthread_mutex_unlock(&p->bp_lock);
 }
 
 int compress_pipeline_error(struct compress_pipeline *p)
@@ -397,6 +418,30 @@ int compress_pipeline_error(struct compress_pipeline *p)
 	e = p->err;
 	pthread_mutex_unlock(&p->err_lock);
 	return e;
+}
+
+/* ----- Backpressure gate ----- */
+
+void compress_pipeline_reserve(struct compress_pipeline *p, size_t len)
+{
+	pthread_mutex_lock(&p->bp_lock);
+	while (p->bp_pending > 0 &&
+	       p->bp_pending + (unsigned long long)len > p->bp_max &&
+	       !compress_pipeline_error(p))
+		pthread_cond_wait(&p->bp_cond, &p->bp_lock);
+	p->bp_pending += (unsigned long long)len;
+	pthread_mutex_unlock(&p->bp_lock);
+}
+
+static void bp_release(struct compress_pipeline *p, size_t len)
+{
+	pthread_mutex_lock(&p->bp_lock);
+	if (p->bp_pending >= (unsigned long long)len)
+		p->bp_pending -= (unsigned long long)len;
+	else
+		p->bp_pending = 0;
+	pthread_cond_broadcast(&p->bp_cond);
+	pthread_mutex_unlock(&p->bp_lock);
 }
 
 /* ----- Compress worker ----- */
@@ -599,6 +644,7 @@ static void writer_drain(struct compress_pipeline *p)
 	}
 
 	while ((f = waitlist_pop_in_order(&p->writer_in)) != NULL) {
+		bp_release(p, f->raw_len);
 		if (writer_sg_append(&chunks, &n_chunks, &cap_chunks,
 				     &chunk_sum, f->comp, f->comp_len) < 0) {
 			pipe_set_error(p, -1);
@@ -764,6 +810,16 @@ struct compress_pipeline *compress_pipeline_create(const char *object_key,
 	p->n_upload = m_upload_workers > 0 ? m_upload_workers : 4;
 
 	q_init(&p->compress_in, p->n_compress * 2);
+	pthread_mutex_init(&p->bp_lock, NULL);
+	pthread_cond_init(&p->bp_cond, NULL);
+	p->bp_pending = 0;
+	{
+		const char *env = getenv("CRIU_PIPELINE_MAX_MB");
+		long mb = env ? atol(env) : 0;
+		if (mb <= 0)
+			mb = 512;
+		p->bp_max = (unsigned long long)mb * 1024ULL * 1024ULL;
+	}
 	waitlist_init(&p->writer_in);
 	upq_init(&p->upload_in, p->n_upload * 2);
 	pthread_mutex_init(&p->etags_lock, NULL);
@@ -856,6 +912,7 @@ int compress_pipeline_submit(struct compress_pipeline *p,
 	f->seq = p->n_frames_submitted++;
 
 	if (q_push(&p->compress_in, f) < 0) {
+		bp_release(p, f->raw_len);
 		xfree(f->raw);
 		xfree(f);
 		return -1;
