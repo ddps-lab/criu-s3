@@ -1904,6 +1904,20 @@ err:
 	if (unsuspend_lsm())
 		ret = -1;
 
+	/*
+	 * Same as cr_dump_finish: the raw parallel-upload path defers
+	 * upload_pool_wait + multipart_complete past close_page_xfer.
+	 * The final dump drains this list, but pre-dump never did, so an
+	 * uncompressed pre-dump exited with its pages-*.img multipart
+	 * initiated yet never completed: pagemap landed, pages did not.
+	 * Every later incremental looked fine on the dump side (skip uses
+	 * only the parent pagemap) while restore had nothing to read, and
+	 * since HasPages (agent-side ground-truth check) the chain is
+	 * dropped and the final dump silently degrades to a full dump.
+	 */
+	if (page_xfer_drain_deferred_uploads() < 0)
+		ret = -1;
+
 	if (disconnect_from_page_server())
 		ret = -1;
 
