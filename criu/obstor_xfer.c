@@ -1564,10 +1564,19 @@ int prefetch_prequeue_all_iovs(void *lpi, unsigned int pages_img_id)
 		if (meta->lpi != lpi)
 			continue;
 
-		/* Filter small IOVs (< 256KB) */
+		/*
+		 * No small-IOV filter any more. It predates batching: tiny
+		 * IOVs used to cost one Range GET each, so they were left
+		 * to the fault path. dequeue_batch() now coalesces
+		 * file-contiguous neighbours into one Range GET, so small
+		 * IOVs ride along nearly for free — while filtering them
+		 * dropped 95% of a fragmented workload's IOVs from
+		 * prefetch coverage and turned restore into a fault storm
+		 * (redis 1.2GB: 11,334 IOVs, 10,817 filtered, 19,590
+		 * faults, ~10ms each; 2026-08-29 lazy-pages forensics).
+		 */
 		size = meta->iov_end - meta->iov_start;
-		if (size < 256 * 1024)
-			continue;
+		(void)size;
 
 		/* Create prefetch request */
 		req = xzalloc(sizeof(*req));
