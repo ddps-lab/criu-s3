@@ -2158,6 +2158,7 @@ struct upload_pool_slot {
 	struct curl_slist *headers;
 	struct curl_slist *resolve_list; /* CURLOPT_RESOLVE entry pinning host->ip */
 	int in_flight;              /* 1 = added to multi, 0 = free */
+	int64_t retry_at_ms;        /* >0: parked for retry until this CLOCK_MONOTONIC ms */
 	char *full_url;             /* heap-allocated per request */
 };
 
@@ -2707,6 +2708,51 @@ static int _slot_prepare_put_sg(struct upload_pool *p, struct upload_pool_slot *
 					chunks, n_chunks, total_len);
 }
 
+static int64_t _now_mono_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/*
+ * Re-arm parked retry slots whose backoff deadline has passed. Returns
+ * ms until the nearest still-parked retry, or -1 if none are parked.
+ * Replaces the old usleep()-based inline retry: a blocking backoff in
+ * the completion loop stalled EVERY in-flight connection for up to
+ * 800ms — exactly when throttling clusters failures. Parking keeps the
+ * other transfers pumping through the backoff window.
+ */
+static long _pool_fire_due_retries(struct upload_pool *p)
+{
+	int64_t now = _now_mono_ms();
+	long nearest = -1;
+	int i;
+
+	for (i = 0; i < p->max_slots; i++) {
+		struct upload_pool_slot *s = &p->slots[i];
+		int64_t left;
+
+		if (!s->in_flight || s->retry_at_ms == 0)
+			continue;
+		left = s->retry_at_ms - now;
+		if (left <= 0) {
+			int part = s->part_num;
+
+			s->retry_at_ms = 0;
+			if (_slot_retry(p, s) != 0) {
+				pr_err("upload_pool: part %d retry re-arm failed\n", part);
+				p->failed_part_num = part;
+				_slot_reset(s);
+			}
+		} else if (nearest < 0 || left < nearest) {
+			nearest = (long)left;
+		}
+	}
+	return nearest;
+}
+
 /* Process any completed transfers. Returns number of slots freed. */
 static int _pool_drain_completions(struct upload_pool *p)
 {
@@ -2737,19 +2783,18 @@ static int _pool_drain_completions(struct upload_pool *p)
 
 		if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
 			if (s->retries < UPLOAD_PART_MAX_RETRIES) {
-				int part = s->part_num;
 				unsigned int backoff_ms;
 
 				backoff_ms = 200u << s->retries;
 				s->retries++;
-				pr_warn("upload_pool: part %d failed curl=%s http=%ld — retry %d/%d after %ums\n",
-					part, curl_easy_strerror(res), http_code,
+				pr_warn("upload_pool: part %d failed curl=%s http=%ld — retry %d/%d in %ums (parked)\n",
+					s->part_num, curl_easy_strerror(res), http_code,
 					s->retries, UPLOAD_PART_MAX_RETRIES, backoff_ms);
-				usleep(backoff_ms * 1000);
-				if (_slot_retry(p, s) == 0)
-					continue; /* re-armed; keep in_flight */
-				pr_err("upload_pool: part %d retry re-arm failed\n", part);
-				p->failed_part_num = part;
+				/* No usleep: park the slot; the event loop re-arms
+				 * it via _pool_fire_due_retries() while every other
+				 * in-flight transfer keeps flowing. */
+				s->retry_at_ms = _now_mono_ms() + backoff_ms;
+				continue; /* stays in_flight, off-multi, parked */
 			} else {
 				pr_err("upload_pool: part %d failed curl=%s http=%ld (retries exhausted)\n",
 				       s->part_num, curl_easy_strerror(res), http_code);
@@ -2832,6 +2877,11 @@ static int _pool_pump_events(struct upload_pool *p, int max_wait_ms)
 	int nevents;
 	int i;
 	long wait_ms;
+	long retry_in;
+
+	/* Re-arm any parked retries that are due; the nearest still-parked
+	 * deadline caps the epoll wait so a due retry never oversleeps. */
+	retry_in = _pool_fire_due_retries(p);
 
 	/*
 	 * Pick the shorter of curl's requested timer and the caller's max.
@@ -2841,6 +2891,8 @@ static int _pool_pump_events(struct upload_pool *p, int max_wait_ms)
 	wait_ms = (p->curl_timeout_ms < 0) ? max_wait_ms
 		: (p->curl_timeout_ms < max_wait_ms ? p->curl_timeout_ms
 						    : max_wait_ms);
+	if (retry_in >= 0 && retry_in < wait_ms)
+		wait_ms = retry_in;
 	if (wait_ms < 0)
 		wait_ms = 0;
 
