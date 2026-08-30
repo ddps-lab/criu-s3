@@ -324,6 +324,17 @@ static void early_vprint(const char *format, unsigned int loglevel, va_list para
 
 	/* Save loglevel */
 
+	/*
+	 * The early buffer is a fixed 1 KiB. Object-storage mode logs
+	 * before log_init (open_image_dir uploads the parent-prefix
+	 * marker and prints the PUT URL), which can exhaust it; the
+	 * unsigned size arithmetic below then wraps and FORTIFY aborts
+	 * the process ("buffer overflow detected" in early_vprint).
+	 * Drop messages that no longer fit instead.
+	 */
+	if (early_log_buf_off + sizeof(*hdr) + 64 > sizeof(early_log_buffer))
+		return;
+
 	hdr = (void *)early_log_buffer + early_log_buf_off;
 	hdr->level = loglevel;
 	/* Skip the log entry size */
