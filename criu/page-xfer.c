@@ -1730,6 +1730,61 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
  *	 0 - if a parent image doesn't exist
  *	-1 - in error cases
  */
+/*
+ * Object-storage upload mode keeps no local pagemap images: every
+ * metadata image is memfd-backed and uploaded on close (see
+ * do_open_image), so the parent directory never contains
+ * pagemap-<pid>.img and a local stat always misses. That made every
+ * chained pre-dump run with has_parent=false, i.e. a full copy of the
+ * address space on each generation (skipped-from-parent stayed 0 while
+ * the final dump, which resolves its parent through open_page_xfer,
+ * skipped correctly). Resolve the parent the same way the final dump
+ * does: read the parent-prefix marker uploaded by open_parent and HEAD
+ * the pagemap under that prefix.
+ *
+ * Returns 1 when the parent pagemap exists, 0 when it does not or the
+ * lookup cannot be completed (a full pre-dump is the safe fallback),
+ * -1 on allocation failure.
+ */
+static int check_parent_object_storage_xfer(const char *path)
+{
+	void *pp_data = NULL;
+	unsigned long pp_len = 0, obj_len = 0;
+	char *parent_prefix, *saved_prefix;
+	int ret;
+
+	ret = object_storage_get_object("parent-prefix", &pp_data, &pp_len);
+	if (ret != 0 || !pp_data || pp_len == 0) {
+		pr_info("page-xfer: no parent-prefix marker in object storage, pre-dump without parent\n");
+		if (pp_data)
+			free(pp_data);
+		return 0;
+	}
+
+	parent_prefix = xmalloc(pp_len + 1);
+	if (!parent_prefix) {
+		free(pp_data);
+		return -1;
+	}
+	memcpy(parent_prefix, pp_data, pp_len);
+	parent_prefix[pp_len] = '\0';
+	free(pp_data);
+
+	saved_prefix = opts.object_storage_object_prefix;
+	opts.object_storage_object_prefix = parent_prefix;
+	ret = object_storage_head_object(path, &obj_len);
+	opts.object_storage_object_prefix = saved_prefix;
+
+	if (ret == 0)
+		pr_info("page-xfer: parent %s found under prefix %s (%lu bytes)\n", path, parent_prefix, obj_len);
+	else
+		pr_info("page-xfer: parent %s absent under prefix %s (ret=%d), pre-dump without parent\n", path,
+			parent_prefix, ret);
+	xfree(parent_prefix);
+
+	return ret == 0 ? 1 : 0;
+}
+
 int check_parent_local_xfer(int fd_type, unsigned long img_id)
 {
 	char path[PATH_MAX];
@@ -1747,6 +1802,11 @@ int check_parent_local_xfer(int fd_type, unsigned long img_id)
 
 	snprintf(path, sizeof(path), imgset_template[fd_type].fmt, img_id);
 	ret = fstatat(pfd, path, &st, 0);
+	if (ret == -1 && errno == ENOENT && opts.object_storage_upload) {
+		ret = check_parent_object_storage_xfer(path);
+		close(pfd);
+		return ret;
+	}
 	if (ret == -1 && errno != ENOENT) {
 		pr_perror("Unable to stat %s", path);
 		close(pfd);
