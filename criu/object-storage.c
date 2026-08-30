@@ -1908,30 +1908,62 @@ int object_storage_multipart_init(const char *object_key, char *upload_id, size_
 	if (!curl_handle)
 		return -1;
 
-	response.memory = malloc(1);
-	response.size = 0;
-	response.capacity = 0;
+	response.memory = NULL;
 
-	curl_easy_setopt(curl_handle, CURLOPT_URL, full_url);
-	curl_easy_setopt(curl_handle, CURLOPT_POST, 1L);
-	curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, 0L);
-	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
-	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &response);
+	/*
+	 * Retry transient failures with exponential backoff. Unlike part
+	 * PUTs (which the upload pool already retries), init had a single
+	 * shot: one DNS hiccup ("Couldn't resolve host name", 2026-08-29
+	 * dataproc-m5.8xlarge) failed pages-N.img outright and took the
+	 * whole final dump down. Auth headers carry x-amz-date, so every
+	 * attempt must re-sign. Hard 4xx (except 429) fail immediately.
+	 */
+	{
+		int attempt;
 
-	/* SigV4: POST with empty body, query_string = "uploads=" */
-	if (_build_auth_headers("POST", url_info.auth_host, url_info.canonical_uri,
-			       "uploads=", EMPTY_PAYLOAD_HASH, NULL, 0, &headers) != 0) {
-		free(response.memory);
-		return -1;
+		for (attempt = 0; attempt < 3; attempt++) {
+			if (attempt > 0) {
+				pr_warn("Multipart init retry %d/2 for %s after %ums\n",
+					attempt, object_key, 200u << (attempt - 1));
+				usleep((200u << (attempt - 1)) * 1000);
+			}
+
+			free(response.memory);
+			response.memory = malloc(1);
+			response.size = 0;
+			response.capacity = 0;
+			http_code = 0;
+
+			curl_easy_setopt(curl_handle, CURLOPT_URL, full_url);
+			curl_easy_setopt(curl_handle, CURLOPT_POST, 1L);
+			curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, 0L);
+			curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
+			curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &response);
+
+			/* SigV4: POST with empty body, query_string = "uploads=" */
+			headers = NULL;
+			if (_build_auth_headers("POST", url_info.auth_host, url_info.canonical_uri,
+					       "uploads=", EMPTY_PAYLOAD_HASH, NULL, 0, &headers) != 0) {
+				free(response.memory);
+				return -1;
+			}
+			if (headers)
+				curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+
+			res = curl_easy_perform(curl_handle);
+			curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+			if (headers)
+				curl_slist_free_all(headers);
+
+			if (res == CURLE_OK && http_code >= 200 && http_code < 300)
+				break;
+
+			/* non-retryable: clean 4xx from S3 (auth, bucket...), not 429 */
+			if (res == CURLE_OK && http_code >= 400 && http_code < 500 && http_code != 429)
+				break;
+		}
 	}
-	if (headers)
-		curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
-
-	res = curl_easy_perform(curl_handle);
-	curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
-
-	if (headers)
-		curl_slist_free_all(headers);
 
 	if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
 		pr_err("Multipart init failed: curl=%s http=%ld body=%.*s\n",
