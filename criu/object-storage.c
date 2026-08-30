@@ -904,6 +904,9 @@ static void cleanup_all_curl_resources(void)
 	struct curl_handle_entry *entry = g_curl_handles;
 	struct curl_handle_entry *next;
 
+	/* Workers must be gone before any libcurl teardown. */
+	object_storage_stop_put_workers();
+
 	/* Clean up all handles in the list */
 	while (entry) {
 		next = entry->next;
@@ -1784,6 +1787,7 @@ static pthread_cond_t g_put_q_avail = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_put_q_drain = PTHREAD_COND_INITIALIZER;
 static pthread_t g_put_workers[ASYNC_PUT_WORKERS];
 static bool g_put_workers_started = false;
+static int g_put_n_workers;         /* how many actually spawned (join bound) */
 static bool g_put_shutdown = false;
 static int g_put_inflight;
 
@@ -1832,6 +1836,7 @@ int object_storage_put_object_async(const char *object_key, void *data,
 	if (!g_put_workers_started) {
 		int i;
 		g_put_shutdown = false;
+		g_put_n_workers = 0;
 		for (i = 0; i < ASYNC_PUT_WORKERS; i++) {
 			if (pthread_create(&g_put_workers[i], NULL,
 					   _put_worker_thread, NULL) != 0) {
@@ -1839,6 +1844,7 @@ int object_storage_put_object_async(const char *object_key, void *data,
 				/* Continue with whatever workers we got. */
 				break;
 			}
+			g_put_n_workers++;
 		}
 		g_put_workers_started = true;
 	}
@@ -1874,6 +1880,53 @@ void object_storage_drain_uploads(void)
 	pthread_mutex_lock(&g_put_q_lock);
 	while (g_put_inflight > 0)
 		pthread_cond_wait(&g_put_q_drain, &g_put_q_lock);
+	pthread_mutex_unlock(&g_put_q_lock);
+}
+
+/*
+ * Stop and join the async-PUT workers. Without this, a dump that FAILS
+ * (early return past the success-only drain) exits main() while workers
+ * still hold in-flight PUTs; the worker then calls into libcurl/OpenSSL
+ * mid-process-teardown and crashes (observed 2026-08-30: "segfault at 0
+ * ip 0" right after "Created new thread-local CURL handle"). Queued but
+ * unstarted items are discarded — on the failure path their objects are
+ * dead weight anyway; the success path drains the queue first, so
+ * nothing is lost there. Safe to call twice; lazy re-spawn re-arms.
+ */
+void object_storage_stop_put_workers(void)
+{
+	struct put_work_item *item, *next;
+	int i, n;
+
+	pthread_mutex_lock(&g_put_q_lock);
+	if (!g_put_workers_started) {
+		pthread_mutex_unlock(&g_put_q_lock);
+		return;
+	}
+	g_put_shutdown = true;
+	pthread_cond_broadcast(&g_put_q_avail);
+	n = g_put_n_workers;
+	pthread_mutex_unlock(&g_put_q_lock);
+
+	for (i = 0; i < n; i++)
+		pthread_join(g_put_workers[i], NULL);
+
+	pthread_mutex_lock(&g_put_q_lock);
+	item = g_put_q_head;
+	while (item) {
+		next = item->next;
+		free(item->key);
+		free(item->data);
+		free(item);
+		item = next;
+	}
+	g_put_q_head = NULL;
+	g_put_q_tail = NULL;
+	g_put_inflight = 0;
+	pthread_cond_broadcast(&g_put_q_drain);
+	g_put_workers_started = false;
+	g_put_n_workers = 0;
+	g_put_shutdown = false;
 	pthread_mutex_unlock(&g_put_q_lock);
 }
 
@@ -2454,6 +2507,7 @@ static void _slot_reset(struct upload_pool_slot *s)
 	s->part_num = 0;
 	s->in_flight = 0;
 	s->retries = 0;
+	s->retry_at_ms = 0;
 }
 
 static int _slot_prepare_put_common(struct upload_pool *p,

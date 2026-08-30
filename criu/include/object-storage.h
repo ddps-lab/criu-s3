@@ -190,6 +190,10 @@ int object_storage_put_object_async(const char *object_key, void *data,
  * Cheap when nothing is in flight.
  */
 void object_storage_drain_uploads(void);
+/* Stop + join async-PUT workers; discards queued-but-unstarted items.
+ * MUST run before process exit on every dump path (success AND failure):
+ * a worker alive at exit() races libcurl/OpenSSL teardown and segfaults. */
+void object_storage_stop_put_workers(void);
 
 /*
  * Fetch an entire object from object storage (for metadata files with unknown size)

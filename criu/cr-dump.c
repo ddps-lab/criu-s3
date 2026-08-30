@@ -1953,6 +1953,16 @@ err:
 				(void)object_storage_write_metadata_bundle();
 		}
 	}
+
+	/*
+	 * Success or failure, the async-PUT workers must be joined before
+	 * we return toward exit(): on the failure path (early bail past
+	 * the success-only drain above) a live worker races process
+	 * teardown inside libcurl/OpenSSL and segfaults.
+	 */
+	if (opts.enable_object_storage && opts.object_storage_upload)
+		object_storage_stop_put_workers();
+
 	return ret;
 }
 
@@ -2193,6 +2203,12 @@ static int cr_dump_finish(int ret)
 				(void)object_storage_write_metadata_bundle();
 		}
 	}
+
+	/* Same as cr_pre_dump_finish: join async-PUT workers on BOTH the
+	 * success and failure paths before returning toward exit(). */
+	if (opts.enable_object_storage && opts.object_storage_upload)
+		object_storage_stop_put_workers();
+
 	return post_dump_ret ?: (ret != 0);
 }
 
