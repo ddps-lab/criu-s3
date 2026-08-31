@@ -1486,8 +1486,20 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 		goto err;
 
 	if (item->pid->state == TASK_STOPPED) {
-		pr_warn("Stopped tasks are not supported\n");
-		return 0;
+		/*
+		 * A caller-frozen task (--resume-stopped) is stopped only for
+		 * the collection window and woken right after page collection,
+		 * so the stopped-state semantics need not be preserved and the
+		 * regular pre-dump path (parasite infect works on stopped
+		 * tasks, as in the full dump) applies. Without that flag keep
+		 * the historical behaviour of skipping the task.
+		 */
+		if (opts.resume_stopped) {
+			pr_info("Pre-dumping stopped task %d (--resume-stopped)\n", pid);
+		} else {
+			pr_warn("Stopped tasks are not supported\n");
+			return 0;
+		}
 	}
 
 	if (item->pid->state == TASK_DEAD)
