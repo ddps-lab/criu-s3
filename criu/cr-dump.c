@@ -1849,6 +1849,16 @@ static int cr_pre_dump_finish(int status)
 
 	pstree_switch_state(root_item, TASK_ALIVE);
 
+	/*
+	 * The caller froze the root with SIGSTOP so its dirty set could not
+	 * move between the tracker snapshot and our page collection. Page
+	 * collection is over: wake it now so the stop covers exactly that
+	 * window and not the upload that follows.
+	 */
+	if (opts.resume_stopped && root_item)
+		if (kill(root_item->pid->real, SIGCONT))
+			pr_perror("resume-stopped: SIGCONT %d", root_item->pid->real);
+
 	timing_stop(TIME_FROZEN);
 
 	if (status < 0) {

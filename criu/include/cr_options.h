@@ -301,6 +301,13 @@ struct cr_options {
 	 * VMA merges re-taint wholesale on slab-style allocators.
 	 */
 	struct list_head dirty_ranges;
+	/*
+	 * --resume-stopped (pre-dump only): the caller SIGSTOPped the tree
+	 * root to freeze its dirty set before invoking us; send SIGCONT as
+	 * soon as page collection is done so the stop lasts only as long as
+	 * the collection, not the upload.
+	 */
+	bool resume_stopped;
 };
 
 extern struct cr_options opts;

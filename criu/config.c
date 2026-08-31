@@ -766,6 +766,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "exclude-file", required_argument, 0, 1113 },
 		{ "no-parent-range", required_argument, 0, 1114 },
 		{ "dirty-file", required_argument, 0, 1127 },
+		{ "resume-stopped", no_argument, 0, 1128 },
 		{ "object-storage-path-style", no_argument, NULL, 1115 },
 		{ "object-storage-upload", no_argument, NULL, 1116 },
 		{ "no-semi-sync-iov", no_argument, NULL, 1117 },
@@ -1224,6 +1225,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			fclose(f);
 			break;
 		}
+		case 1128:
+			opts.resume_stopped = true;
+			break;
 		case 1115:
 			opts.object_storage_path_style = true;
 			break;
