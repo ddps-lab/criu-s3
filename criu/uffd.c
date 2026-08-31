@@ -819,6 +819,20 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 			/* Calculate actual file offset using seek_pagemap */
 			lpi->pr.reset(&lpi->pr);
 			if (lpi->pr.seek_pagemap(&lpi->pr, iov->img_start) > 0) {
+				/*
+				 * A PE_PARENT entry has no bytes in THIS
+				 * image: its pi_off points at the next
+				 * present entry's data, so registering it
+				 * here would make a prefetch worker install
+				 * the wrong bytes (or, compressed, fail and
+				 * fall back to a fault). The parent-chain
+				 * registration below owns these ranges with
+				 * their true (level, offset).
+				 */
+				if (lpi->pr.pe && pagemap_in_parent(lpi->pr.pe)) {
+					num_iovs--;
+					continue;
+				}
 				iov_array[i].file_offset = lpi->pr.pi_off;
 			} else {
 				lp_err(lpi, "Failed to seek pagemap for IOV at vaddr 0x%lx\n",
@@ -841,6 +855,13 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 			}
 			lp_debug(lpi, "AFTER seek: total IOVs in list = %d (was %d)\n", j, num_iovs);
 		}
+
+		/* Parent-chain queue registration (obstor_register_parent_chain)
+		 * is disabled for now: the 2026-08-29 attempt made a 12-deep
+		 * chain WORSE (480s vs 288s service gap) and its forensics
+		 * were inconclusive. PE_PARENT vaddrs are excluded from the
+		 * top-level registration above (their pi_off would be wrong),
+		 * so they fall to the fault path as before. */
 
 		/* Initialize prefetch IOV metadata */
 		ret = prefetch_init_iovs(lpi, lpi->pr.pages_img_id, iov_array, num_iovs);

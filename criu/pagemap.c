@@ -16,6 +16,7 @@
 #include "cr_options.h"
 #include "servicefd.h"
 #include "pagemap.h"
+#include "obstor_xfer.h"
 #include "restorer.h"
 #include "rst-malloc.h"
 #include "page-xfer.h"
@@ -1636,6 +1637,130 @@ static struct eager_range *split_ranges_chunked(const struct eager_range *er, in
 	return arr;
 }
 
+/*
+ * Register every parent-resident vaddr range of `top`'s chain with the
+ * async-prefetch controller, so the lazy-pages daemon batches parent
+ * pages instead of serving them fault-by-fault. Walks the chain exactly
+ * like preload_parent_chain(): at each level the intersection of the
+ * still-wanted ranges with that level's PRESENT entries is registered
+ * with that level's absolute object prefix (object storage has no
+ * relative parent link) and its pages_img_id tagged with the level;
+ * the intersection with the level's own PE_PARENT entries moves one
+ * level further down. No merging here — the controller's dequeue batch
+ * coalesces contiguous registrations into single Range GETs.
+ */
+int obstor_register_parent_chain(struct page_read *top, void *lpi)
+{
+	struct vaddr_range *want = NULL;
+	int n_want = 0;
+	struct page_read *pr;
+	int level = 0;
+	int registered = 0;
+
+	if (!top || !top->parent)
+		return 0;
+	if (collect_in_parent_want(top, &want, &n_want))
+		return -1;
+	if (n_want == 0) {
+		xfree(want);
+		return 0;
+	}
+
+	for (pr = top->parent; pr && n_want > 0; pr = pr->parent) {
+		struct iov_info *regs = NULL;
+		int reg_cap = 256, reg_n = 0;
+		struct vaddr_range *nx = NULL;
+		int nx_cap = 64, nx_n = 0;
+		off_t cur_off = 0;
+		int i, w = 0;
+		const char *prefix;
+
+		level++;
+		if (level >= 32)
+			break;
+
+		regs = xmalloc(reg_cap * sizeof(*regs));
+		nx = xmalloc(nx_cap * sizeof(*nx));
+		if (!regs || !nx) {
+			if (regs)
+				xfree(regs);
+			if (nx)
+				xfree(nx);
+			break;
+		}
+
+		for (i = 0; i < pr->nr_pmes; i++) {
+			PagemapEntry *pe = pr->pmes[i];
+			unsigned long pstart = pe->vaddr;
+			unsigned long pend = pe->vaddr + pagemap_len(pe);
+			bool present = pagemap_present(pe);
+			bool inpar = pagemap_in_parent(pe);
+			int wj;
+
+			if (w < n_want && (present || inpar)) {
+				while (w < n_want && want[w].end <= pstart)
+					w++;
+
+				for (wj = w; wj < n_want && want[wj].start < pend; wj++) {
+					unsigned long a = want[wj].start > pstart ? want[wj].start : pstart;
+					unsigned long b = want[wj].end < pend ? want[wj].end : pend;
+
+					if (a >= b)
+						continue;
+					if (present) {
+						if (reg_n == reg_cap) {
+							struct iov_info *grown;
+							reg_cap *= 2;
+							grown = xrealloc(regs, reg_cap * sizeof(*regs));
+							if (!grown)
+								goto level_fail;
+							regs = grown;
+						}
+						regs[reg_n].iov_start = a;
+						regs[reg_n].iov_end = b;
+						regs[reg_n].file_offset = cur_off + (off_t)(a - pstart);
+						reg_n++;
+					} else {
+						if (vaddr_range_append(&nx, &nx_n, &nx_cap, a, b))
+							goto level_fail;
+					}
+				}
+			}
+
+			if (present)
+				cur_off += pagemap_len(pe);
+		}
+
+		prefix = pr->object_storage_prefix ? pr->object_storage_prefix :
+			 opts.object_storage_object_prefix;
+		if (reg_n > 0 && prefix &&
+		    obstor_xfer_set_level_prefix(level, prefix) == 0) {
+			unsigned int enc_id = ((unsigned int)level << OBSTOR_IMG_LEVEL_SHIFT) |
+					      (pr->pages_img_id & OBSTOR_IMG_ID_MASK);
+
+			if (prefetch_init_iovs(lpi, enc_id, regs, reg_n) == 0) {
+				registered += reg_n;
+				pr_info("parent-chain register: level %d: %d ranges (img %lu, prefix %s)\n",
+					level, reg_n, pr->img_id, prefix);
+			}
+		}
+		xfree(regs);
+		xfree(want);
+		want = nx;
+		n_want = nx_n;
+		continue;
+
+level_fail:
+		xfree(regs);
+		xfree(nx);
+		break;
+	}
+	if (want)
+		xfree(want);
+	pr_info("parent-chain register: %d parent IOVs registered for batched prefetch\n", registered);
+	return registered;
+}
+
 static void preload_parent_chain(struct page_read *top)
 {
 	struct vaddr_range *want = NULL;
@@ -2666,9 +2791,12 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	opr_depth--;
 
 	/*
-	 * Parent-chain preload: restore process only — the lazy-pages
-	 * daemon never reads PE_PARENT pages (restore fills them before
-	 * any fault can arrive), and dump/pre-dump only need pagemaps.
+	 * Parent-chain preload: restore process only. The lazy-pages
+	 * daemon serves PE_PARENT pages through the async-prefetch
+	 * controller instead: obstor_register_parent_chain() resolves
+	 * every parent-resident vaddr range to its (level, offset) and
+	 * registers it for batched prefetch (see uffd.c) — preloading
+	 * here as well would fetch the same bytes twice.
 	 */
 	if (ret > 0 && opr_depth == 0 && pr->parent &&
 	    opts.enable_object_storage && opts.mode == CR_RESTORE)

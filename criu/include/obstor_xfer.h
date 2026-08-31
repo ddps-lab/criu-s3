@@ -59,6 +59,11 @@ int prefetch_init(int num_workers);
 void prefetch_cleanup(void);
 
 /* Initialize IOV metadata from IOV array */
+/* Parent-chain level encoding inside pages_img_id (see obstor_xfer.c). */
+#define OBSTOR_IMG_LEVEL_SHIFT 24
+#define OBSTOR_IMG_ID_MASK 0x00FFFFFFu
+int obstor_xfer_set_level_prefix(int level, const char *prefix);
+
 int prefetch_init_iovs(void *lpi, unsigned int pages_img_id, struct iov_info *iovs, int num_iovs);
 
 /* Pre-queue all IOVs for controller-based prefetch */

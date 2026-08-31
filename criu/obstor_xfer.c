@@ -116,6 +116,28 @@ static int total_iovs = 0;
 static struct iov_meta **iov_index_map = NULL;  /* Fast index lookup */
 
 /*
+ * Parent-chain levels. Object storage has no notion of CRIU's relative
+ * "parent" symlink: every chain level lives under its own absolute
+ * prefix (its dump's directory in the bucket). IOVs registered for a
+ * parent level carry the level in the top byte of pages_img_id
+ * (OBSTOR_IMG_LEVEL_SHIFT); the worker decodes it and swaps in that
+ * level's absolute prefix when constructing the object key. Level 0
+ * (the final dump itself) keeps using opts.object_storage_object_prefix.
+ */
+#define OBSTOR_MAX_LEVELS 32
+static char obstor_level_prefix[OBSTOR_MAX_LEVELS][512];
+static int obstor_level_prefix_set[OBSTOR_MAX_LEVELS];
+
+int obstor_xfer_set_level_prefix(int level, const char *prefix)
+{
+	if (level <= 0 || level >= OBSTOR_MAX_LEVELS || !prefix)
+		return -1;
+	snprintf(obstor_level_prefix[level], sizeof(obstor_level_prefix[level]), "%s", prefix);
+	obstor_level_prefix_set[level] = 1;
+	return 0;
+}
+
+/*
  * Broadcast whenever a worker transitions any iov to IOV_RESTORED or
  * reverts IOV_FETCHING → IOV_NOT_REQUESTED. Fault handlers that caught
  * an IOV mid-fetch (state == IOV_FETCHING) wait on this cond with a
@@ -610,12 +632,14 @@ int prefetch_init_iovs(void *lpi, unsigned int pages_img_id, struct iov_info *io
 		meta->lpi = lpi;
 		meta->pages_img_id = pages_img_id;
 
-		/* Insert into RB-tree (keyed by iov_start) */
+		/* Insert into RB-tree (keyed by iov_start). A duplicate start
+		 * means another registration pass (e.g. the parent-chain one,
+		 * which registers first with the authoritative level+offset)
+		 * already owns this vaddr — keep that one, skip ours. */
 		if (iov_meta_insert(meta) < 0) {
 			xfree(meta);
-			pthread_mutex_unlock(&iov_meta_lock);
-			pr_err("Failed to insert IOV metadata for index %d\n", global_idx);
-			return -EEXIST;
+			iov_index_map[global_idx] = NULL;
+			continue;
 		}
 
 		/* Add to index map */
@@ -1089,12 +1113,22 @@ static void *prefetch_worker(void *arg)
 		if (opts.enable_object_storage) {
 			struct xfer_compress_entry *ce;
 
-			snprintf(image_name, sizeof(image_name), "pages-%u.img", batch.pages_img_id);
-			if (opts.object_storage_object_prefix && strlen(opts.object_storage_object_prefix) > 0)
-				snprintf(object_key, sizeof(object_key), "%s%s",
-					 opts.object_storage_object_prefix, image_name);
-			else
-				snprintf(object_key, sizeof(object_key), "%s", image_name);
+			{
+				unsigned int lvl = batch.pages_img_id >> OBSTOR_IMG_LEVEL_SHIFT;
+				unsigned int raw_id = batch.pages_img_id & OBSTOR_IMG_ID_MASK;
+				const char *kprefix = NULL;
+
+				snprintf(image_name, sizeof(image_name), "pages-%u.img", raw_id);
+				if (lvl > 0 && lvl < OBSTOR_MAX_LEVELS && obstor_level_prefix_set[lvl])
+					kprefix = obstor_level_prefix[lvl];
+				else if (opts.object_storage_object_prefix &&
+					 strlen(opts.object_storage_object_prefix) > 0)
+					kprefix = opts.object_storage_object_prefix;
+				if (kprefix)
+					snprintf(object_key, sizeof(object_key), "%s%s", kprefix, image_name);
+				else
+					snprintf(object_key, sizeof(object_key), "%s", image_name);
+			}
 
 			pr_debug("obstor_xfer: Worker %d: Fetching %s offset=%lu size=%lu (n=%d)\n",
 				 worker_id, object_key, batch.base_offset, batch.total_bytes, n);

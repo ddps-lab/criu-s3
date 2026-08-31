@@ -177,6 +177,10 @@ struct page_read {
  *  0 -- no images
  *  1 -- opened
  */
+/* Register the parent chain's PE_PARENT-resident ranges with the
+ * async-prefetch controller (lazy-pages daemon path). */
+extern int obstor_register_parent_chain(struct page_read *top, void *lpi);
+
 extern int open_page_read(unsigned long id, struct page_read *, int pr_flags);
 extern int open_page_read_at(int dfd, unsigned long id, struct page_read *pr, int pr_flags);
 
