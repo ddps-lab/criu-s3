@@ -396,7 +396,16 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 			}
 			softdirty = listed;
 		}
-		if (has_parent && page_in_parent(softdirty)) {
+		/*
+		 * A page becomes a PE_PARENT hole only if the parent pagemap
+		 * actually covers it. Without this, a page of a partially
+		 * fresh VMA (a slab-arena merge extension the tracker missed)
+		 * turned into a hole the parent could not satisfy and the
+		 * whole dump fail-stopped; worse, when the parent DID hold an
+		 * older copy the restore silently read stale bytes. Dumping
+		 * the page instead costs bytes, never correctness.
+		 */
+		if (has_parent && page_in_parent(softdirty) && parent_covers(vaddr, vaddr + PAGE_SIZE)) {
 			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
 			st = 0;
 		} else {
