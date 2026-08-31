@@ -94,6 +94,8 @@ static inline bool __page_is_zero(u64 pme)
 static bool dirty_list_active(void);
 static bool dirty_list_covers(unsigned long vaddr);
 static unsigned long dl_missed_pages;
+#define DL_MISS_SAMPLES 8
+static unsigned long dl_missed_sample[DL_MISS_SAMPLES];
 
 static inline bool __page_in_parent(bool dirty)
 {
@@ -247,12 +249,19 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		/*
 		 * The tracker only observes the dump root's address space,
 		 * so the list must never veto pages of other tree members.
+		 * Non-writable VMAs (relro, r-- remaps) are outside any write
+		 * tracker's scope and cannot go stale; leave them on the
+		 * soft-dirty path so the missed counter stays a pure signal
+		 * for real tracker gaps.
 		 */
-		if (has_parent && item == root_item && dirty_list_active()) {
+		if (has_parent && item == root_item && (vma->e->prot & PROT_WRITE) && dirty_list_active()) {
 			bool listed = dirty_list_covers(vaddr);
 
-			if (softdirty && !listed)
+			if (softdirty && !listed) {
+				if (dl_missed_pages < DL_MISS_SAMPLES)
+					dl_missed_sample[dl_missed_pages] = vaddr;
 				dl_missed_pages++;
+			}
 			softdirty = listed;
 		}
 		if (has_parent && page_in_parent(softdirty)) {
@@ -778,9 +787,14 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 
 	timing_stop(TIME_MEMDUMP);
 
-	if (dl_n > 0)
+	if (dl_n > 0) {
+		unsigned long i;
+
 		pr_warn("dirty-list: %lu ranges, %lu soft-dirty pages outside the list (kept as parent holes; nonzero may be VMA-merge re-taint, a large count means a tracker gap)\n",
 			(unsigned long)dl_n, dl_missed_pages);
+		for (i = 0; i < dl_missed_pages && i < DL_MISS_SAMPLES; i++)
+			pr_warn("dirty-list: missed sample %lu: %lx\n", i, dl_missed_sample[i]);
+	}
 
 	/*
 	 * Step 4 -- clean up
