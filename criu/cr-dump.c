@@ -1859,6 +1859,28 @@ static int cr_pre_dump_finish(int status)
 	he.has_pre_dump_mode = true;
 	he.pre_dump_mode = opts.pre_dump_mode;
 
+	/*
+	 * Reset soft-dirty only when page collection succeeded for the
+	 * whole tree, and do it while the tree is still stopped so the
+	 * reset covers exactly the collected state. The old per-task reset
+	 * inside the collection step fired before the transfer stage could
+	 * still fail, so every failed pre-dump erased the bits the retry
+	 * and the final dump depended on (the repeated-failure cascade of
+	 * 2026-08-31). A transfer failure after this point still loses the
+	 * reset, but the agent re-merges its dirty snapshot on failure and
+	 * the parent-coverage gate keeps fresh VMAs whole.
+	 */
+	if (status >= 0) {
+		for_each_pstree_item(item) {
+			if (!dmpi(item)->parasite_ctl)
+				continue;
+			if (do_task_reset_dirty_track(item->pid->real)) {
+				status = -1;
+				break;
+			}
+		}
+	}
+
 	pstree_switch_state(root_item, TASK_ALIVE);
 
 	/*

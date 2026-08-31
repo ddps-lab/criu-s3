@@ -10,6 +10,8 @@
 #include "types.h"
 #include "cr_options.h"
 #include "servicefd.h"
+#include "image.h"
+#include "object-storage.h"
 #include "mem.h"
 #include "parasite-syscall.h"
 #include "parasite.h"
@@ -35,6 +37,121 @@
 
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
+
+/*
+ * Parent pagemap VMA-coverage index, loaded once per task before the VMA
+ * walk. The collection-stage xfer->parent is a sentinel on pre-dumps (the
+ * real parent opens only in cr_pre_dump_finish), so the gate reads the
+ * parent pagemap itself. Any load failure leaves the index empty, which
+ * makes parent_covers() return false and the VMA dump in full — the safe
+ * direction (bytes, never data).
+ */
+struct pcov_range {
+	unsigned long s, e;
+};
+static struct pcov_range *pcov_arr;
+static int pcov_n;
+
+static void parent_coverage_free(void)
+{
+	xfree(pcov_arr);
+	pcov_arr = NULL;
+	pcov_n = 0;
+}
+
+static void parent_coverage_load(unsigned long img_id)
+{
+	struct page_read pr;
+	int pfd, ret, cap;
+	char *parent_prefix = NULL;
+
+	parent_coverage_free();
+
+	if (open_parent(get_service_fd(IMG_FD_OFF), &pfd))
+		return;
+	if (pfd < 0)
+		return;
+
+	if (opts.object_storage_upload) {
+		void *prefix_data = NULL;
+		unsigned long prefix_len = 0;
+
+		if (object_storage_get_object("parent-prefix", &prefix_data, &prefix_len) == 0 &&
+		    prefix_data && prefix_len > 0) {
+			parent_prefix = xmalloc(prefix_len + 1);
+			if (parent_prefix) {
+				memcpy(parent_prefix, prefix_data, prefix_len);
+				parent_prefix[prefix_len] = '\0';
+			}
+		}
+		if (prefix_data)
+			free(prefix_data);
+	}
+
+	if (parent_prefix) {
+		char *saved_prefix = opts.object_storage_object_prefix;
+
+		opts.object_storage_object_prefix = parent_prefix;
+		ret = open_page_read_at(pfd, img_id, &pr, PR_TASK);
+		opts.object_storage_object_prefix = saved_prefix;
+		xfree(parent_prefix);
+	} else {
+		ret = open_page_read_at(pfd, img_id, &pr, PR_TASK);
+	}
+	close(pfd);
+	if (ret <= 0)
+		return;
+
+	cap = 64;
+	pcov_arr = xmalloc(cap * sizeof(*pcov_arr));
+	if (!pcov_arr)
+		goto out_close;
+	while (pr.advance(&pr)) {
+		unsigned long s = pr.pe->vaddr;
+		unsigned long e = s + pagemap_len(pr.pe);
+
+		if (pcov_n > 0 && s <= pcov_arr[pcov_n - 1].e) {
+			if (e > pcov_arr[pcov_n - 1].e)
+				pcov_arr[pcov_n - 1].e = e;
+			continue;
+		}
+		if (pcov_n == cap) {
+			struct pcov_range *na;
+
+			cap *= 2;
+			na = xrealloc(pcov_arr, cap * sizeof(*pcov_arr));
+			if (!na) {
+				parent_coverage_free();
+				goto out_close;
+			}
+			pcov_arr = na;
+		}
+		pcov_arr[pcov_n].s = s;
+		pcov_arr[pcov_n].e = e;
+		pcov_n++;
+	}
+	pr_info("parent-coverage: %d ranges loaded for img %lu\n", pcov_n, img_id);
+out_close:
+	pr.close(&pr);
+}
+
+/* Does the parent pagemap overlap [start,end) at all? */
+static bool parent_covers(unsigned long start, unsigned long end)
+{
+	int lo = 0, hi = pcov_n - 1;
+
+	while (lo <= hi) {
+		int m = lo + (hi - lo) / 2;
+
+		if (pcov_arr[m].e <= start)
+			lo = m + 1;
+		else if (pcov_arr[m].s >= end)
+			hi = m - 1;
+		else
+			return true;
+	}
+	return false;
+}
 
 static int task_reset_dirty_track(int pid)
 {
@@ -93,6 +210,7 @@ static inline bool __page_is_zero(u64 pme)
 /* --dirty-file helpers, defined next to the exclude-range helpers below. */
 static bool dirty_list_active(void);
 static bool dirty_list_covers(unsigned long vaddr);
+static bool dirty_list_touches(unsigned long start, unsigned long end);
 static unsigned long dl_missed_pages;
 #define DL_MISS_SAMPLES 8
 static unsigned long dl_missed_sample[DL_MISS_SAMPLES];
@@ -202,9 +320,23 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 	unsigned long pages[3] = {};
 	unsigned long vaddr;
 	bool dump_all_pages;
+	bool dl_gate;
 	int ret = 0;
 
 	dump_all_pages = should_dump_entire_vma(vma->e);
+
+	/*
+	 * Apply the dirty-list veto only to VMAs the list actually touches:
+	 * those are the regions the tracker demonstrably observes (including
+	 * the VMA-merge re-taint targets the list exists for). A writable
+	 * VMA the list does not touch at all is a tracker blind spot — a
+	 * .data/.bss page written after the parent dump landed exactly
+	 * there, its soft-dirty write became a stale parent hole, and the
+	 * restored process read the parent's old bytes with no error
+	 * (2026-08-31). For such VMAs trust soft-dirty unfiltered.
+	 */
+	dl_gate = item == root_item && (vma->e->prot & PROT_WRITE) && dirty_list_active() &&
+		  dirty_list_touches(vma->e->start, vma->e->end);
 
 	/*
 	 * Compressed dumps: force the next page_pipe iov to start fresh at
@@ -254,7 +386,7 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		 * soft-dirty path so the missed counter stays a pure signal
 		 * for real tracker gaps.
 		 */
-		if (has_parent && item == root_item && (vma->e->prot & PROT_WRITE) && dirty_list_active()) {
+		if (has_parent && dl_gate) {
 			bool listed = dirty_list_covers(vaddr);
 
 			if (softdirty && !listed) {
@@ -360,6 +492,24 @@ static bool dirty_list_covers(unsigned long vaddr)
 			hi = m - 1;
 		else if (vaddr >= dl_arr[m].e)
 			lo = m + 1;
+		else
+			return true;
+	}
+	return false;
+}
+
+/* Does any list range overlap [start,end)? */
+static bool dirty_list_touches(unsigned long start, unsigned long end)
+{
+	int lo = 0, hi = dl_n - 1;
+
+	while (lo <= hi) {
+		int m = lo + (hi - lo) / 2;
+
+		if (dl_arr[m].e <= start)
+			lo = m + 1;
+		else if (dl_arr[m].s >= end)
+			hi = m - 1;
 		else
 			return true;
 	}
@@ -660,6 +810,22 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 		has_parent = false;
 	}
 
+	/*
+	 * A VMA the parent pagemap does not cover at all appeared after the
+	 * parent dump (a fresh mmap during a load phase). Any page of it
+	 * that is not soft-dirty (or that a dirty list does not cover)
+	 * would be written as a PE_PARENT hole, and the parent-hole check
+	 * would fail-stop the whole dump — observed as a 54GB fresh xgboost
+	 * arena killing the final dump. Dump such a VMA in full instead:
+	 * correctness never depends on the tracker having seen the mapping.
+	 * A wrong answer here only costs bytes (full dump), never data.
+	 */
+	if (has_parent && !parent_covers(vma->e->start, vma->e->end)) {
+		pr_info("VMA [%lx-%lx] absent from parent pagemap: dumping in full\n",
+			(unsigned long)vma->e->start, (unsigned long)vma->e->end);
+		has_parent = false;
+	}
+
 	if (pmc_get_map(pmc, vma))
 		return -1;
 
@@ -756,6 +922,8 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	 */
 	args->off = 0;
 	has_parent = !!xfer.parent && !possible_pid_reuse;
+	if (has_parent)
+		parent_coverage_load(vpid(item));
 	if (mdc->parent_ie)
 		parent_predump_mode = mdc->parent_ie->pre_dump_mode;
 
@@ -798,11 +966,18 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 
 	/*
 	 * Step 4 -- clean up
+	 *
+	 * On a pre-dump the reset moves to cr_pre_dump_finish, AFTER the
+	 * whole tree collected successfully and while it is still stopped:
+	 * resetting here, before the transfer stage could still fail,
+	 * erased the soft-dirty bits every retry and the final dump
+	 * depended on (the repeated-failure cascade of 2026-08-31).
 	 */
-
-	ret = task_reset_dirty_track(item->pid->real);
-	if (ret)
-		goto out_xfer;
+	if (!mdc->pre_dump) {
+		ret = task_reset_dirty_track(item->pid->real);
+		if (ret)
+			goto out_xfer;
+	}
 
 	if (!list_empty(&opts.exclude_ranges) || !list_empty(&opts.no_parent_ranges))
 		save_hot_vma_metadata(opts.imgs_dir);
@@ -817,6 +992,7 @@ out_pp:
 	else
 		dmpi(item)->mem_pp = pp;
 out:
+	parent_coverage_free();
 	pmc_fini(&pmc);
 	pr_info("----------------------------------------\n");
 	return exit_code;
