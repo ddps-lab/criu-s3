@@ -294,6 +294,13 @@ struct cr_options {
 	struct list_head exclude_ranges;
 	/* No-parent ranges: dump normally but without parent reference */
 	struct list_head no_parent_ranges;
+	/*
+	 * --dirty-file (pre-dump only): authoritative dirty set from an
+	 * external tracker (uffd-wp/PAGEMAP_SCAN). When present and a parent
+	 * exists, page selection uses this set instead of soft-dirty, which
+	 * VMA merges re-taint wholesale on slab-style allocators.
+	 */
+	struct list_head dirty_ranges;
 };
 
 extern struct cr_options opts;

@@ -614,6 +614,8 @@ usage:
 	       "Hot VMA options (for dump/pre-dump):\n"
 	       "  --exclude-range START:END     exclude address range from pre-dump (hex)\n"
 	       "  --no-parent-range START:END   skip parent for this range (hex)\n"
+	       "  --dirty-file FILE             pre-dump: dump only pages in these ranges ('start end' hex per line),\n"
+	       "                                trusting an external dirty tracker instead of soft-dirty\n"
 	       "\n"
 	       "Configuration file options:\n"
 	       "  --config FILEPATH     pass a specific configuration file\n"

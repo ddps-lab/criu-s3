@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -88,6 +89,11 @@ static inline bool __page_is_zero(u64 pme)
 {
 	return (pme & PME_PFRAME_MASK) == kdat.zero_page_pfn;
 }
+
+/* --dirty-file helpers, defined next to the exclude-range helpers below. */
+static bool dirty_list_active(void);
+static bool dirty_list_covers(unsigned long vaddr);
+static unsigned long dl_missed_pages;
 
 static inline bool __page_in_parent(bool dirty)
 {
@@ -238,6 +244,17 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		 * page. The latter would be checked in page-xfer.
 		 */
 
+		/*
+		 * The tracker only observes the dump root's address space,
+		 * so the list must never veto pages of other tree members.
+		 */
+		if (has_parent && item == root_item && dirty_list_active()) {
+			bool listed = dirty_list_covers(vaddr);
+
+			if (softdirty && !listed)
+				dl_missed_pages++;
+			softdirty = listed;
+		}
 		if (has_parent && page_in_parent(softdirty)) {
 			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
 			st = 0;
@@ -266,6 +283,78 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 
 	pr_info("Pagemap generated: %lu pages (%lu lazy) %lu holes\n", pages[2] + pages[1], pages[1], pages[0]);
 	return ret;
+}
+
+/*
+ * --dirty-file support (pre-dump only). The ranges come from an external
+ * tracker (uffd-wp + PAGEMAP_SCAN in the migration agent) that is immune
+ * to the VMA-merge soft-dirty re-taint: merging adjacent anon mappings
+ * sets VM_SOFTDIRTY on the merged VMA, so /proc pagemap reports every
+ * page dirty and slab-style allocators (memcached, torch) lose
+ * incrementality entirely. When the list is present and a parent chain
+ * exists, page selection trusts the list; pages that soft-dirty flags
+ * but the list does not are counted and reported so a tracker gap is
+ * loud instead of silent.
+ */
+static struct dl_ent {
+	unsigned long s, e;
+} *dl_arr;
+static int dl_n = -1;
+
+static int dl_cmp(const void *a, const void *b)
+{
+	const struct dl_ent *x = a, *y = b;
+
+	if (x->s < y->s)
+		return -1;
+	return x->s > y->s;
+}
+
+static void dirty_list_prepare(void)
+{
+	struct exclude_range *er;
+	int n = 0, i = 0;
+
+	if (dl_n >= 0)
+		return;
+	dl_n = 0;
+	list_for_each_entry(er, &opts.dirty_ranges, list)
+		n++;
+	if (!n)
+		return;
+	dl_arr = xmalloc(n * sizeof(*dl_arr));
+	if (!dl_arr) /* stay inactive: soft-dirty fallback is only slower */
+		return;
+	list_for_each_entry(er, &opts.dirty_ranges, list) {
+		dl_arr[i].s = er->start;
+		dl_arr[i].e = er->end;
+		i++;
+	}
+	qsort(dl_arr, n, sizeof(*dl_arr), dl_cmp);
+	dl_n = n;
+}
+
+static inline bool dirty_list_active(void)
+{
+	dirty_list_prepare();
+	return dl_n > 0;
+}
+
+static bool dirty_list_covers(unsigned long vaddr)
+{
+	int lo = 0, hi = dl_n - 1;
+
+	while (lo <= hi) {
+		int m = lo + (hi - lo) / 2;
+
+		if (vaddr < dl_arr[m].s)
+			hi = m - 1;
+		else if (vaddr >= dl_arr[m].e)
+			lo = m + 1;
+		else
+			return true;
+	}
+	return false;
 }
 
 static bool vma_in_exclude_list(unsigned long vma_start, unsigned long vma_end)
@@ -688,6 +777,10 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		goto out_xfer;
 
 	timing_stop(TIME_MEMDUMP);
+
+	if (dl_n > 0)
+		pr_warn("dirty-list: %lu ranges, %lu soft-dirty pages outside the list (kept as parent holes; nonzero may be VMA-merge re-taint, a large count means a tracker gap)\n",
+			(unsigned long)dl_n, dl_missed_pages);
 
 	/*
 	 * Step 4 -- clean up

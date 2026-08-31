@@ -478,6 +478,7 @@ void init_opts(void)
 	/* Initialize exclude ranges */
 	INIT_LIST_HEAD(&opts.exclude_ranges);
 	INIT_LIST_HEAD(&opts.no_parent_ranges);
+	INIT_LIST_HEAD(&opts.dirty_ranges);
 }
 
 bool deprecated_ok(char *what)
@@ -764,6 +765,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "exclude-range", required_argument, 0, 1112 },
 		{ "exclude-file", required_argument, 0, 1113 },
 		{ "no-parent-range", required_argument, 0, 1114 },
+		{ "dirty-file", required_argument, 0, 1127 },
 		{ "object-storage-path-style", no_argument, NULL, 1115 },
 		{ "object-storage-upload", no_argument, NULL, 1116 },
 		{ "no-semi-sync-iov", no_argument, NULL, 1117 },
@@ -1200,6 +1202,26 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 				return 1;
 			}
 			list_add_tail(&er->list, &opts.no_parent_ranges);
+			break;
+		}
+		case 1127: {
+			unsigned long s, e;
+			FILE *f = fopen(optarg, "r");
+			if (!f) {
+				pr_perror("Can't open dirty file %s", optarg);
+				return 1;
+			}
+			while (fscanf(f, "%lx %lx", &s, &e) == 2) {
+				struct exclude_range *er = xzalloc(sizeof(*er));
+				if (!er) {
+					fclose(f);
+					return 1;
+				}
+				er->start = s;
+				er->end = e;
+				list_add_tail(&er->list, &opts.dirty_ranges);
+			}
+			fclose(f);
 			break;
 		}
 		case 1115:
