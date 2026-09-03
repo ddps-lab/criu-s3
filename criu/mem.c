@@ -211,6 +211,27 @@ static inline bool __page_is_zero(u64 pme)
 static bool dirty_list_active(void);
 static bool dirty_list_covers(unsigned long vaddr);
 static bool dirty_list_touches(unsigned long start, unsigned long end);
+
+/*
+ * --exclude-file / --no-parent-file at page granularity. The lists carry
+ * 4MB hot chunks; a VMA that merely overlaps one used to be skipped (or
+ * dumped without parent) as a whole, which for slab-arena workloads
+ * turned a 4MB hot chunk into a 1GB VMA left out of every pre-dump and
+ * re-sent in full by the final dump (memcached, 2026-09-03). Now only a
+ * VMA fully inside a range keeps the VMA-level treatment; an overlapping
+ * VMA walks its pages and applies the range test page by page.
+ */
+struct vaddr_range {
+	unsigned long s, e;
+};
+static struct vaddr_range *ex_arr, *np_arr;
+static int ex_n = -1, np_n = -1;
+static bool page_ex_gate, page_np_gate;
+static unsigned long hot_pages_skipped;
+static void range_list_prepare(struct list_head *src, struct vaddr_range **arr, int *n);
+static bool range_list_covers(struct vaddr_range *arr, int n, unsigned long vaddr);
+static bool range_list_touches(struct vaddr_range *arr, int n, unsigned long start, unsigned long end);
+static bool range_list_contains(struct vaddr_range *arr, int n, unsigned long start, unsigned long end);
 static unsigned long dl_missed_pages;
 #define DL_MISS_SAMPLES 8
 static unsigned long dl_missed_sample[DL_MISS_SAMPLES];
@@ -368,6 +389,18 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 			continue;
 		}
 
+		/*
+		 * Hot page inside an overlapping VMA: leave it out of this
+		 * pre-dump. It stays dirty in the tracker's seed, so a later
+		 * pre-dump lists it again, and the final dump forces it via
+		 * the no-parent backstop (or dumps it because no parent
+		 * covers it).
+		 */
+		if (page_ex_gate && range_list_covers(ex_arr, ex_n, vaddr)) {
+			hot_pages_skipped++;
+			continue;
+		}
+
 		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
 			ppb_flags |= PPB_LAZY;
 
@@ -405,6 +438,10 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		 * older copy the restore silently read stale bytes. Dumping
 		 * the page instead costs bytes, never correctness.
 		 */
+		/* No-parent page inside an overlapping VMA: never a parent hole. */
+		if (page_np_gate && range_list_covers(np_arr, np_n, vaddr))
+			softdirty = true;
+
 		if (has_parent && page_in_parent(softdirty) && parent_covers(vaddr, vaddr + PAGE_SIZE)) {
 			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
 			st = 0;
@@ -525,6 +562,92 @@ static bool dirty_list_touches(unsigned long start, unsigned long end)
 	return false;
 }
 
+static int vr_cmp(const void *a, const void *b)
+{
+	const struct vaddr_range *x = a, *y = b;
+
+	if (x->s == y->s)
+		return 0;
+	return x->s > y->s ? 1 : -1;
+}
+
+static void range_list_prepare(struct list_head *src, struct vaddr_range **arr, int *n)
+{
+	struct exclude_range *er;
+	int cnt = 0, i = 0;
+
+	if (*n >= 0)
+		return;
+	*n = 0;
+	list_for_each_entry(er, src, list)
+		cnt++;
+	if (!cnt)
+		return;
+	*arr = xmalloc(cnt * sizeof(**arr));
+	if (!*arr)
+		return;
+	list_for_each_entry(er, src, list) {
+		(*arr)[i].s = er->start;
+		(*arr)[i].e = er->end;
+		i++;
+	}
+	qsort(*arr, cnt, sizeof(**arr), vr_cmp);
+	*n = cnt;
+}
+
+static bool range_list_covers(struct vaddr_range *arr, int n, unsigned long vaddr)
+{
+	int lo = 0, hi = n - 1;
+
+	while (lo <= hi) {
+		int m = lo + (hi - lo) / 2;
+
+		if (vaddr < arr[m].s)
+			hi = m - 1;
+		else if (vaddr >= arr[m].e)
+			lo = m + 1;
+		else
+			return true;
+	}
+	return false;
+}
+
+/* Does any range overlap [start,end)? */
+static bool range_list_touches(struct vaddr_range *arr, int n, unsigned long start, unsigned long end)
+{
+	int lo = 0, hi = n - 1;
+
+	while (lo <= hi) {
+		int m = lo + (hi - lo) / 2;
+
+		if (arr[m].e <= start)
+			lo = m + 1;
+		else if (arr[m].s >= end)
+			hi = m - 1;
+		else
+			return true;
+	}
+	return false;
+}
+
+/* Is [start,end) fully inside a single range? */
+static bool range_list_contains(struct vaddr_range *arr, int n, unsigned long start, unsigned long end)
+{
+	int lo = 0, hi = n - 1;
+
+	while (lo <= hi) {
+		int m = lo + (hi - lo) / 2;
+
+		if (start < arr[m].s)
+			hi = m - 1;
+		else if (start >= arr[m].e)
+			lo = m + 1;
+		else
+			return end <= arr[m].e;
+	}
+	return false;
+}
+
 static bool vma_in_exclude_list(unsigned long vma_start, unsigned long vma_end)
 {
 	struct exclude_range *er;
@@ -533,20 +656,6 @@ static bool vma_in_exclude_list(unsigned long vma_start, unsigned long vma_end)
 		return false;
 
 	list_for_each_entry(er, &opts.exclude_ranges, list) {
-		if (vma_start < er->end && vma_end > er->start)
-			return true;
-	}
-	return false;
-}
-
-static bool vma_in_no_parent_list(unsigned long vma_start, unsigned long vma_end)
-{
-	struct exclude_range *er;
-
-	if (list_empty(&opts.no_parent_ranges))
-		return false;
-
-	list_for_each_entry(er, &opts.no_parent_ranges, list) {
 		if (vma_start < er->end && vma_end > er->start)
 			return true;
 	}
@@ -802,21 +911,37 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 		has_parent = false;
 	}
 
-	/* Hot VMA handling: skip during pre-dump, full dump without parent on final dump */
-	if (vma_in_exclude_list(vma->e->start, vma->e->end)) {
+	/*
+	 * Hot ranges: a VMA fully inside an exclude range is skipped during
+	 * pre-dump and dumped without parent at the final dump. A VMA that
+	 * only overlaps one keeps its cold pages on the normal path and
+	 * excludes (pre-dump) or forces (final) the hot pages one by one in
+	 * generate_iovs. Same split for the no-parent list.
+	 */
+	page_ex_gate = false;
+	page_np_gate = false;
+	range_list_prepare(&opts.exclude_ranges, &ex_arr, &ex_n);
+	range_list_prepare(&opts.no_parent_ranges, &np_arr, &np_n);
+	if (ex_n > 0 && range_list_contains(ex_arr, ex_n, vma->e->start, vma->e->end)) {
 		if (pre_dump) {
 			pr_info("Skipping hot VMA [%lx-%lx] during pre-dump\n",
 				(unsigned long)vma->e->start, (unsigned long)vma->e->end);
 			return 0;
 		}
 		has_parent = false;
+	} else if (ex_n > 0 && range_list_touches(ex_arr, ex_n, vma->e->start, vma->e->end)) {
+		if (pre_dump)
+			page_ex_gate = true;
+		else
+			page_np_gate = true; /* final: hot pages never rely on the parent */
 	}
 
-	/* No-parent VMA: dump normally but without parent reference */
-	if (vma_in_no_parent_list(vma->e->start, vma->e->end)) {
+	if (np_n > 0 && range_list_contains(np_arr, np_n, vma->e->start, vma->e->end)) {
 		pr_info("No-parent VMA [%lx-%lx]: dumping without parent reference\n",
 			(unsigned long)vma->e->start, (unsigned long)vma->e->end);
 		has_parent = false;
+	} else if (np_n > 0 && range_list_touches(np_arr, np_n, vma->e->start, vma->e->end)) {
+		page_np_gate = true;
 	}
 
 	/*
@@ -963,6 +1088,9 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		goto out_xfer;
 
 	timing_stop(TIME_MEMDUMP);
+
+	if (hot_pages_skipped)
+		pr_info("hot ranges: %lu pages left out of this pre-dump page by page\n", hot_pages_skipped);
 
 	if (dl_n > 0) {
 		unsigned long i;
